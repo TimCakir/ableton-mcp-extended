@@ -241,6 +241,14 @@ class AbletonMCP(ControlSurface):
                     params.get("device_index", None),
                     params.get("scene_index", None),
                     params.get("filter", ""))
+            elif command_type == "get_clip_notes":
+                response["result"] = self._get_clip_notes(
+                    params.get("track_index", 0),
+                    params.get("clip_index", 0),
+                    params.get("from_time", 0.0),
+                    params.get("time_span", None),
+                    params.get("from_pitch", 0),
+                    params.get("pitch_span", 128))
             elif command_type == "get_meters":
                 response["result"] = self._get_meters()
             elif command_type == "get_modulation_targets":
@@ -269,6 +277,11 @@ class AbletonMCP(ControlSurface):
                                  "write_clip_automation",
                                  "set_clip_launch", "set_clip_follow_action",
                                  "manage_warp_markers",
+                                 "modify_clip_notes", "manage_clip_region",
+                                 "set_wavetable_oscillator", "duplicate_device",
+                                 "undo_step", "transport_action",
+                                 "set_mixer_extras", "set_view_detail",
+                                 "set_scene_signature",
                                  "call_lom", "set_device_sidechain",
                                  "set_device_modulation", "move_device",
                                  "manage_rack", "control_looper",
@@ -337,6 +350,71 @@ class AbletonMCP(ControlSurface):
                                 params.get("color_index", None),
                                 params.get("quantize_to", None),
                                 params.get("quantize_amount", 1.0))
+                        elif command_type == "modify_clip_notes":
+                            result = self._modify_clip_notes(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("transpose", 0),
+                                params.get("velocity_scale", None),
+                                params.get("velocity_set", None),
+                                params.get("humanize_ms", None),
+                                params.get("probability", None),
+                                params.get("from_time", 0.0),
+                                params.get("time_span", None),
+                                params.get("from_pitch", 0),
+                                params.get("pitch_span", 128))
+                        elif command_type == "manage_clip_region":
+                            result = self._manage_clip_region(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("action", "info"),
+                                params.get("region_start", None),
+                                params.get("region_end", None),
+                                params.get("destination_time", None),
+                                params.get("start_marker", None),
+                                params.get("end_marker", None))
+                        elif command_type == "set_wavetable_oscillator":
+                            result = self._set_wavetable_oscillator(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("oscillator", 1),
+                                params.get("category", None),
+                                params.get("wavetable", None),
+                                params.get("effect_mode", None),
+                                params.get("unison_mode", None),
+                                params.get("unison_voices", None),
+                                params.get("mono_poly", None),
+                                params.get("poly_voices", None))
+                        elif command_type == "duplicate_device":
+                            result = self._duplicate_device(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0))
+                        elif command_type == "undo_step":
+                            result = self._undo_step(params.get("action", "begin"))
+                        elif command_type == "transport_action":
+                            result = self._transport_action(
+                                params.get("action", "stop_all_clips"),
+                                params.get("value", None))
+                        elif command_type == "set_mixer_extras":
+                            result = self._set_mixer_extras(
+                                params.get("track_index", 0),
+                                params.get("track_activator", None),
+                                params.get("panning_mode", None),
+                                params.get("left_split_stereo", None),
+                                params.get("right_split_stereo", None),
+                                params.get("cue_volume", None))
+                        elif command_type == "set_view_detail":
+                            result = self._set_view_detail(
+                                params.get("track_index", None),
+                                params.get("clip_index", None),
+                                params.get("device_index", None),
+                                params.get("draw_mode", None))
+                        elif command_type == "set_scene_signature":
+                            result = self._set_scene_signature(
+                                params.get("scene_index", 0),
+                                params.get("numerator", None),
+                                params.get("denominator", None),
+                                params.get("enabled", None))
                         elif command_type == "call_lom":
                             result = self._call_lom(
                                 params.get("path", "song"),
@@ -2386,6 +2464,416 @@ class AbletonMCP(ControlSurface):
                     "changed": changed}
         except Exception as e:
             self.log_message("Error setting clip properties: " + str(e))
+            raise
+
+    # Reading and editing existing notes
+
+    def _clip_at(self, track_index, clip_index):
+        track = self._track_at(track_index)
+        if clip_index < 0 or clip_index >= len(track.clip_slots):
+            raise IndexError("Clip slot {0} out of range".format(clip_index))
+        slot = track.clip_slots[clip_index]
+        if not slot.has_clip:
+            raise ValueError("No clip at slot {0} on '{1}'".format(
+                clip_index, track.name))
+        return track, slot.clip
+
+    def _serialise_notes(self, note_objects):
+        out = []
+        for n in note_objects:
+            entry = {}
+            for attr in ("pitch", "start_time", "duration", "velocity", "mute",
+                         "probability", "velocity_deviation", "release_velocity",
+                         "note_id"):
+                try:
+                    val = getattr(n, attr)
+                    entry[attr] = round(val, 5) if isinstance(val, float) else val
+                except Exception:
+                    pass
+            out.append(entry)
+        return out
+
+    def _get_clip_notes(self, track_index, clip_index, from_time=0.0,
+                        time_span=None, from_pitch=0, pitch_span=128):
+        """Read the notes in a MIDI clip.
+
+        Without this, material can only be written, never inspected — so an
+        existing part cannot be analysed, transposed or edited, only
+        replaced. Returns pitch, timing, velocity and probability per note.
+        """
+        try:
+            track, clip = self._clip_at(track_index, clip_index)
+            if not clip.is_midi_clip:
+                raise ValueError("'{0}' is an audio clip".format(clip.name))
+            span = float(time_span) if time_span is not None else float(clip.length)
+            notes = clip.get_notes_extended(
+                int(from_pitch), int(pitch_span), float(from_time), span)
+            serialised = self._serialise_notes(notes)
+            pitches = [n["pitch"] for n in serialised if "pitch" in n]
+            return {"clip_name": clip.name, "track_name": track.name,
+                    "length": clip.length, "note_count": len(serialised),
+                    "pitch_range": [min(pitches), max(pitches)] if pitches else None,
+                    "notes": serialised}
+        except Exception as e:
+            self.log_message("Error reading clip notes: " + str(e))
+            raise
+
+    def _modify_clip_notes(self, track_index, clip_index, transpose=0,
+                           velocity_scale=None, velocity_set=None,
+                           humanize_ms=None, probability=None,
+                           from_time=0.0, time_span=None,
+                           from_pitch=0, pitch_span=128):
+        """Transform notes already in a clip, in place.
+
+        Reads the selected notes, applies the requested changes, and writes
+        them back by note id so nothing else in the clip is disturbed.
+        Humanisation is deterministic (a fixed pattern of small offsets)
+        rather than random, so repeated calls do not drift.
+        """
+        try:
+            track, clip = self._clip_at(track_index, clip_index)
+            if not clip.is_midi_clip:
+                raise ValueError("'{0}' is an audio clip".format(clip.name))
+            span = float(time_span) if time_span is not None else float(clip.length)
+            notes = list(clip.get_notes_extended(
+                int(from_pitch), int(pitch_span), float(from_time), span))
+            if not notes:
+                return {"clip_name": clip.name, "modified": 0}
+
+            # Deterministic offsets in beats, derived from tempo.
+            beats_per_ms = self._song.tempo / 60000.0
+            offsets = [0.0, 0.6, -0.4, 0.9, -0.7, 0.3, -0.2, 0.8]
+
+            for i, n in enumerate(notes):
+                if transpose:
+                    n.pitch = max(0, min(127, int(n.pitch) + int(transpose)))
+                if velocity_set is not None:
+                    n.velocity = max(1.0, min(127.0, float(velocity_set)))
+                elif velocity_scale is not None:
+                    n.velocity = max(1.0, min(
+                        127.0, float(n.velocity) * float(velocity_scale)))
+                if humanize_ms:
+                    shift = offsets[i % len(offsets)] * float(humanize_ms) * beats_per_ms
+                    n.start_time = max(0.0, float(n.start_time) + shift)
+                if probability is not None:
+                    try:
+                        n.probability = max(0.0, min(1.0, float(probability)))
+                    except Exception:
+                        pass
+
+            clip.apply_note_modifications(tuple(notes))
+            return {"clip_name": clip.name, "track_name": track.name,
+                    "modified": len(notes),
+                    "applied": {"transpose": transpose,
+                                "velocity_scale": velocity_scale,
+                                "velocity_set": velocity_set,
+                                "humanize_ms": humanize_ms,
+                                "probability": probability}}
+        except Exception as e:
+            self.log_message("Error modifying clip notes: " + str(e))
+            raise
+
+    def _manage_clip_region(self, track_index, clip_index, action="info",
+                            region_start=None, region_end=None,
+                            destination_time=None, start_marker=None,
+                            end_marker=None):
+        """Duplicate, crop or re-mark a clip region — arrangement building blocks."""
+        try:
+            track, clip = self._clip_at(track_index, clip_index)
+            result = {"clip_name": clip.name, "action": action}
+
+            if start_marker is not None:
+                clip.start_marker = float(start_marker)
+                result["start_marker"] = clip.start_marker
+            if end_marker is not None:
+                clip.end_marker = float(end_marker)
+                result["end_marker"] = clip.end_marker
+
+            if action == "duplicate_loop":
+                # Doubles the loop length, copying its contents — the standard
+                # way to grow a 4-bar idea into 8 bars.
+                clip.duplicate_loop()
+                result["new_loop_end"] = clip.loop_end
+            elif action == "duplicate_region":
+                if region_start is None or region_end is None or \
+                        destination_time is None:
+                    raise ValueError(
+                        "duplicate_region needs region_start, region_end "
+                        "and destination_time")
+                clip.duplicate_region(float(region_start), float(region_end),
+                                      float(destination_time))
+                result["duplicated"] = [float(region_start), float(region_end),
+                                        float(destination_time)]
+            elif action == "crop":
+                clip.crop()
+                result["cropped_length"] = clip.length
+            elif action != "info":
+                raise ValueError(
+                    "action must be info, duplicate_loop, duplicate_region or crop")
+
+            for attr in ("length", "loop_start", "loop_end",
+                         "start_marker", "end_marker"):
+                try:
+                    result[attr] = getattr(clip, attr)
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            self.log_message("Error managing clip region: " + str(e))
+            raise
+
+    def _set_wavetable_oscillator(self, track_index, device_index, oscillator=1,
+                                  category=None, wavetable=None,
+                                  effect_mode=None, unison_mode=None,
+                                  unison_voices=None, mono_poly=None,
+                                  poly_voices=None):
+        """Choose Wavetable's actual wavetables and voicing.
+
+        Selecting the wavetable is the single biggest tonal decision in the
+        instrument, and it is exposed by name — no need to click through the
+        UI list.
+        """
+        try:
+            track = self._track_at(track_index)
+            device = track.devices[device_index]
+            osc = 1 if int(oscillator) not in (1, 2) else int(oscillator)
+            cat_attr = "oscillator_{0}_wavetable_category".format(osc)
+            idx_attr = "oscillator_{0}_wavetable_index".format(osc)
+            list_attr = "oscillator_{0}_wavetables".format(osc)
+            eff_attr = "oscillator_{0}_effect_mode".format(osc)
+
+            if not hasattr(device, cat_attr):
+                raise ValueError(
+                    "'{0}' is not a Wavetable device".format(device.name))
+
+            changed = {}
+            categories = []
+            try:
+                categories = [str(c) for c in device.oscillator_wavetable_categories]
+            except Exception:
+                pass
+
+            if category is not None:
+                if isinstance(category, str):
+                    wanted = category.strip().lower()
+                    match = None
+                    for i, c in enumerate(categories):
+                        if c.strip().lower() == wanted:
+                            match = i
+                            break
+                    if match is None:
+                        for i, c in enumerate(categories):
+                            if wanted in c.strip().lower():
+                                match = i
+                                break
+                    if match is None:
+                        raise ValueError(
+                            "Category '{0}' not found. Available: {1}".format(
+                                category, ", ".join(categories)))
+                    setattr(device, cat_attr, match)
+                else:
+                    setattr(device, cat_attr, int(category))
+                changed["category"] = categories[getattr(device, cat_attr)] \
+                    if categories else getattr(device, cat_attr)
+
+            tables = []
+            try:
+                tables = [str(t) for t in getattr(device, list_attr)]
+            except Exception:
+                pass
+
+            if wavetable is not None:
+                if isinstance(wavetable, str):
+                    wanted = wavetable.strip().lower()
+                    match = None
+                    for i, t in enumerate(tables):
+                        if t.strip().lower() == wanted:
+                            match = i
+                            break
+                    if match is None:
+                        for i, t in enumerate(tables):
+                            if wanted in t.strip().lower():
+                                match = i
+                                break
+                    if match is None:
+                        raise ValueError(
+                            "Wavetable '{0}' not found in this category. "
+                            "Available: {1}".format(wavetable, ", ".join(tables)))
+                    setattr(device, idx_attr, match)
+                else:
+                    setattr(device, idx_attr, int(wavetable))
+                changed["wavetable"] = tables[getattr(device, idx_attr)] \
+                    if tables else getattr(device, idx_attr)
+
+            for attr, val in ((eff_attr, effect_mode),
+                              ("unison_mode", unison_mode),
+                              ("unison_voice_count", unison_voices),
+                              ("mono_poly", mono_poly),
+                              ("poly_voices", poly_voices)):
+                if val is None:
+                    continue
+                if not hasattr(device, attr):
+                    changed[attr] = "<not supported>"
+                    continue
+                setattr(device, attr, int(val))
+                changed[attr] = getattr(device, attr)
+
+            return {"device": device.name, "oscillator": osc,
+                    "categories": categories, "wavetables_in_category": tables,
+                    "changed": changed}
+        except Exception as e:
+            self.log_message("Error setting wavetable oscillator: " + str(e))
+            raise
+
+    def _duplicate_device(self, track_index, device_index):
+        """Duplicate a device in place on its track."""
+        try:
+            track = self._track_at(track_index)
+            track.duplicate_device(int(device_index))
+            return {"track": track.name,
+                    "chain": [d.name for d in track.devices]}
+        except Exception as e:
+            self.log_message("Error duplicating device: " + str(e))
+            raise
+
+    def _undo_step(self, action="begin"):
+        """Group several changes into one undo entry.
+
+        Wrap a multi-step edit in begin/end so a single Cmd-Z reverses the
+        whole thing instead of unpicking it one call at a time.
+        """
+        try:
+            if action == "begin":
+                self._song.begin_undo_step()
+            elif action == "end":
+                self._song.end_undo_step()
+            else:
+                raise ValueError("action must be 'begin' or 'end'")
+            return {"action": action, "done": True}
+        except Exception as e:
+            self.log_message("Error in undo step: " + str(e))
+            raise
+
+    def _transport_action(self, action, value=None):
+        """Transport and session actions that take no persistent state."""
+        try:
+            song = self._song
+            simple = {
+                "stop_all_clips": lambda: song.stop_all_clips(),
+                "tap_tempo": lambda: song.tap_tempo(),
+                "capture_and_insert_scene": lambda: song.capture_and_insert_scene(),
+                "continue_playing": lambda: song.continue_playing(),
+                "play_selection": lambda: song.play_selection(),
+                "trigger_session_record": lambda: song.trigger_session_record(),
+                "jump_to_next_cue": lambda: song.jump_to_next_cue(),
+                "jump_to_prev_cue": lambda: song.jump_to_prev_cue(),
+                "re_enable_automation": lambda: song.re_enable_automation(),
+                "back_to_arranger": lambda: setattr(song, "back_to_arranger", False),
+            }
+            if action == "jump_by":
+                if value is None:
+                    raise ValueError("jump_by needs a value in beats")
+                song.jump_by(float(value))
+                return {"action": action, "beats": float(value),
+                        "current_song_time": song.current_song_time}
+            if action == "scrub_by":
+                if value is None:
+                    raise ValueError("scrub_by needs a value in beats")
+                song.scrub_by(float(value))
+                return {"action": action, "beats": float(value)}
+            if action not in simple:
+                raise ValueError("Unknown action '{0}'. Available: {1}".format(
+                    action, ", ".join(sorted(list(simple.keys()) +
+                                             ["jump_by", "scrub_by"]))))
+            simple[action]()
+            return {"action": action, "done": True,
+                    "is_playing": song.is_playing}
+        except Exception as e:
+            self.log_message("Error in transport action: " + str(e))
+            raise
+
+    def _set_mixer_extras(self, track_index, track_activator=None,
+                          panning_mode=None, left_split_stereo=None,
+                          right_split_stereo=None, cue_volume=None):
+        """Mixer controls beyond volume/pan/sends."""
+        try:
+            track = self._track_at(track_index)
+            mixer = track.mixer_device
+            changed = {}
+
+            def set_param(param, val, label):
+                target = param.min + (param.max - param.min) * \
+                    max(0.0, min(1.0, float(val)))
+                param.value = target
+                changed[label] = str(param)
+
+            if track_activator is not None:
+                mixer.track_activator.value = 1.0 if track_activator else 0.0
+                changed["track_activator"] = mixer.track_activator.value
+            if panning_mode is not None:
+                mixer.panning_mode = int(panning_mode)
+                changed["panning_mode"] = mixer.panning_mode
+            if left_split_stereo is not None:
+                set_param(mixer.left_split_stereo, left_split_stereo,
+                          "left_split_stereo")
+            if right_split_stereo is not None:
+                set_param(mixer.right_split_stereo, right_split_stereo,
+                          "right_split_stereo")
+            if cue_volume is not None:
+                set_param(self._song.master_track.mixer_device.cue_volume,
+                          cue_volume, "cue_volume")
+            return {"track": track.name, "changed": changed}
+        except Exception as e:
+            self.log_message("Error setting mixer extras: " + str(e))
+            raise
+
+    def _set_view_detail(self, track_index=None, clip_index=None,
+                         device_index=None, draw_mode=None):
+        """Focus Live's detail view on a specific clip or device."""
+        try:
+            view = self._song.view
+            focused = {}
+            if track_index is not None:
+                track = self._track_at(track_index)
+                view.selected_track = track
+                focused["track"] = track.name
+                if clip_index is not None:
+                    slot = track.clip_slots[clip_index]
+                    if slot.has_clip:
+                        view.detail_clip = slot.clip
+                        focused["clip"] = slot.clip.name
+                if device_index is not None:
+                    device = track.devices[device_index]
+                    view.select_device(device)
+                    focused["device"] = device.name
+            if draw_mode is not None:
+                view.draw_mode = bool(draw_mode)
+                focused["draw_mode"] = view.draw_mode
+            return {"focused": focused}
+        except Exception as e:
+            self.log_message("Error setting view detail: " + str(e))
+            raise
+
+    def _set_scene_signature(self, scene_index, numerator=None,
+                             denominator=None, enabled=None):
+        """Give a scene its own time signature."""
+        try:
+            if scene_index < 0 or scene_index >= len(self._song.scenes):
+                raise IndexError("Scene index out of range")
+            scene = self._song.scenes[scene_index]
+            changed = {}
+            if numerator is not None:
+                scene.time_signature_numerator = int(numerator)
+                changed["numerator"] = scene.time_signature_numerator
+            if denominator is not None:
+                scene.time_signature_denominator = int(denominator)
+                changed["denominator"] = scene.time_signature_denominator
+            if enabled is not None:
+                scene.time_signature_enabled = bool(enabled)
+                changed["enabled"] = scene.time_signature_enabled
+            return {"scene": scene.name or "(unnamed)", "changed": changed}
+        except Exception as e:
+            self.log_message("Error setting scene signature: " + str(e))
             raise
 
     # Generic Live Object Model access

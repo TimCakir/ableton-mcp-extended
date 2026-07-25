@@ -618,6 +618,394 @@ def call_lom(
 
 
 @mcp.tool()
+def get_clip_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    from_time: float = 0.0,
+    time_span: float | None = None,
+    from_pitch: int = 0,
+    pitch_span: int = 128,
+) -> str:
+    """Read the notes in a MIDI clip — pitch, timing, velocity, probability.
+
+    Essential before editing anything that already exists: a part recorded
+    by a player can be analysed and transformed instead of overwritten.
+
+    Parameters:
+    - track_index / clip_index: 1-based.
+    - from_time / time_span: Beat window. Defaults to the whole clip.
+    - from_pitch / pitch_span: MIDI note window. Defaults to all notes.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        payload: dict = {
+            "track_index": ti, "clip_index": ci, "from_time": from_time,
+            "from_pitch": from_pitch, "pitch_span": pitch_span,
+        }
+        if time_span is not None:
+            payload["time_span"] = time_span
+        r = ableton.send_command("get_clip_notes", payload)
+        notes = r.get("notes") or []
+        header = (
+            f"'{r.get('clip_name')}' on '{r.get('track_name')}' — "
+            f"{r.get('note_count')} notes, {r.get('length')} beats, "
+            f"pitch range {r.get('pitch_range')}"
+        )
+        lines = [header, ""]
+        for n in notes[:200]:
+            prob = n.get("probability")
+            prob_s = f" p={prob}" if prob is not None and prob < 1 else ""
+            lines.append(
+                f"  {n.get('start_time')}: pitch {n.get('pitch')} "
+                f"dur {n.get('duration')} vel {n.get('velocity')}{prob_s}"
+            )
+        if len(notes) > 200:
+            lines.append(f"  … {len(notes) - 200} more")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error reading clip notes: {str(e)}")
+        return f"Error reading clip notes: {str(e)}"
+
+
+@mcp.tool()
+def modify_clip_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    transpose: int = 0,
+    velocity_scale: float | None = None,
+    velocity_set: float | None = None,
+    humanize_ms: float | None = None,
+    probability: float | None = None,
+    from_time: float = 0.0,
+    time_span: float | None = None,
+    from_pitch: int = 0,
+    pitch_span: int = 128,
+) -> str:
+    """Transform notes already in a clip, in place, without rewriting it.
+
+    Notes are read, changed and written back by id, so nothing outside the
+    selected window is disturbed. Humanisation is deterministic, so calling
+    it twice does not compound into sloppiness.
+
+    Parameters:
+    - track_index / clip_index: 1-based.
+    - transpose: Semitones, positive or negative.
+    - velocity_scale: Multiply velocities, e.g. 0.8 to soften.
+    - velocity_set: Set all velocities to one value (overrides scale).
+    - humanize_ms: Timing spread in milliseconds.
+    - probability: Set per-note probability, 0.0-1.0.
+    - from_time / time_span / from_pitch / pitch_span: Restrict the window,
+      e.g. pitch 42 only to affect just the hats in a drum clip.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        payload: dict = {
+            "track_index": ti, "clip_index": ci, "transpose": transpose,
+            "from_time": from_time, "from_pitch": from_pitch,
+            "pitch_span": pitch_span,
+        }
+        for key, val in (
+            ("velocity_scale", velocity_scale), ("velocity_set", velocity_set),
+            ("humanize_ms", humanize_ms), ("probability", probability),
+            ("time_span", time_span),
+        ):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("modify_clip_notes", payload)
+        return f"Modified {r.get('modified')} notes in '{r.get('clip_name')}'"
+    except Exception as e:
+        logger.error(f"Error modifying clip notes: {str(e)}")
+        return f"Error modifying clip notes: {str(e)}"
+
+
+@mcp.tool()
+def manage_clip_region(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    action: str = "info",
+    region_start: float | None = None,
+    region_end: float | None = None,
+    destination_time: float | None = None,
+    start_marker: float | None = None,
+    end_marker: float | None = None,
+) -> str:
+    """Duplicate, crop or re-mark a clip region.
+
+    duplicate_loop is how a 4-bar idea becomes 8 bars with its contents
+    copied — the fastest way to grow material for an arrangement.
+
+    Parameters:
+    - track_index / clip_index: 1-based.
+    - action: info, duplicate_loop, duplicate_region, crop.
+    - region_start / region_end / destination_time: Beats, for duplicate_region.
+    - start_marker / end_marker: Move the clip's play markers.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        payload: dict = {"track_index": ti, "clip_index": ci, "action": action}
+        for key, val in (
+            ("region_start", region_start), ("region_end", region_end),
+            ("destination_time", destination_time),
+            ("start_marker", start_marker), ("end_marker", end_marker),
+        ):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("manage_clip_region", payload)
+        return "\n".join(f"{k}: {v}" for k, v in r.items())
+    except Exception as e:
+        logger.error(f"Error managing clip region: {str(e)}")
+        return f"Error managing clip region: {str(e)}"
+
+
+@mcp.tool()
+def set_wavetable_oscillator(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    oscillator: int = 1,
+    category: str | None = None,
+    wavetable: str | None = None,
+    effect_mode: int | None = None,
+    unison_mode: int | None = None,
+    unison_voices: int | None = None,
+    mono_poly: int | None = None,
+    poly_voices: int | None = None,
+) -> str:
+    """Choose Wavetable's actual wavetables and voicing, by name.
+
+    Which wavetable is loaded is the biggest tonal decision in the
+    instrument. Call with no changes to list the available categories and
+    tables.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - oscillator: 1 or 2.
+    - category: Wavetable category name, e.g. "Basics", "Bass".
+    - wavetable: Table name within that category.
+    - effect_mode / unison_mode / unison_voices / mono_poly / poly_voices:
+      Integer modes; mono_poly 0 = mono, 1 = poly.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        payload: dict = {
+            "track_index": ti, "device_index": di, "oscillator": oscillator,
+        }
+        for key, val in (
+            ("category", category), ("wavetable", wavetable),
+            ("effect_mode", effect_mode), ("unison_mode", unison_mode),
+            ("unison_voices", unison_voices), ("mono_poly", mono_poly),
+            ("poly_voices", poly_voices),
+        ):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("set_wavetable_oscillator", payload)
+        lines = [f"'{r.get('device')}' oscillator {r.get('oscillator')}"]
+        cats = r.get("categories") or []
+        if cats:
+            lines.append("  categories: " + ", ".join(cats))
+        tables = r.get("wavetables_in_category") or []
+        if tables:
+            lines.append("  tables here: " + ", ".join(tables[:40]))
+        changed = r.get("changed") or {}
+        if changed:
+            lines.append("  changed: " + ", ".join(
+                f"{k}={v}" for k, v in changed.items()))
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error setting wavetable oscillator: {str(e)}")
+        return f"Error setting wavetable oscillator: {str(e)}"
+
+
+@mcp.tool()
+def duplicate_device(ctx: Context, track_index: int, device_index: int) -> str:
+    """Duplicate a device in place on its track.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        r = ableton.send_command("duplicate_device", {
+            "track_index": ti, "device_index": di,
+        })
+        return f"'{r.get('track')}' chain: " + " → ".join(r.get("chain") or [])
+    except Exception as e:
+        logger.error(f"Error duplicating device: {str(e)}")
+        return f"Error duplicating device: {str(e)}"
+
+
+@mcp.tool()
+def undo_step(ctx: Context, action: str = "begin") -> str:
+    """Group several changes into a single undo entry.
+
+    Call with "begin", make the changes, then call with "end". One Cmd-Z
+    then reverses the whole edit rather than unpicking it call by call.
+
+    Parameters:
+    - action: "begin" or "end".
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command("undo_step", {"action": action})
+        return f"Undo step {r.get('action')}"
+    except Exception as e:
+        logger.error(f"Error in undo step: {str(e)}")
+        return f"Error in undo step: {str(e)}"
+
+
+@mcp.tool()
+def transport_action(
+    ctx: Context, action: str = "stop_all_clips", value: float | None = None
+) -> str:
+    """Fire a transport or session action.
+
+    Parameters:
+    - action: stop_all_clips, tap_tempo, capture_and_insert_scene,
+      continue_playing, play_selection, trigger_session_record,
+      jump_to_next_cue, jump_to_prev_cue, re_enable_automation,
+      back_to_arranger, jump_by, scrub_by.
+    - value: Beats, for jump_by and scrub_by.
+
+    capture_and_insert_scene turns whatever is currently playing into a new
+    scene — the way to keep a live jam that was never written down.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {"action": action}
+        if value is not None:
+            payload["value"] = value
+        r = ableton.send_command("transport_action", payload)
+        return ", ".join(f"{k}={v}" for k, v in r.items())
+    except Exception as e:
+        logger.error(f"Error in transport action: {str(e)}")
+        return f"Error in transport action: {str(e)}"
+
+
+@mcp.tool()
+def set_mixer_extras(
+    ctx: Context,
+    track_index: int,
+    track_activator: bool | None = None,
+    panning_mode: int | None = None,
+    left_split_stereo: float | None = None,
+    right_split_stereo: float | None = None,
+    cue_volume: float | None = None,
+) -> str:
+    """Mixer controls beyond volume, pan and sends.
+
+    Parameters:
+    - track_index: 1-based.
+    - track_activator: Track on/off (the mixer's own activator).
+    - panning_mode: 0 = normal pan, 1 = split stereo pan.
+    - left_split_stereo / right_split_stereo: 0.0-1.0, split stereo mode only.
+    - cue_volume: Master cue level, 0.0-1.0.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        payload: dict = {"track_index": ti}
+        for key, val in (
+            ("track_activator", track_activator), ("panning_mode", panning_mode),
+            ("left_split_stereo", left_split_stereo),
+            ("right_split_stereo", right_split_stereo),
+            ("cue_volume", cue_volume),
+        ):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("set_mixer_extras", payload)
+        changed = r.get("changed") or {}
+        if not changed:
+            return f"No mixer changes requested for '{r.get('track')}'"
+        return f"'{r.get('track')}': " + ", ".join(
+            f"{k}={v}" for k, v in changed.items())
+    except Exception as e:
+        logger.error(f"Error setting mixer extras: {str(e)}")
+        return f"Error setting mixer extras: {str(e)}"
+
+
+@mcp.tool()
+def set_view_detail(
+    ctx: Context,
+    track_index: int | None = None,
+    clip_index: int | None = None,
+    device_index: int | None = None,
+    draw_mode: bool | None = None,
+) -> str:
+    """Focus Live's detail view on a clip or device, so the user sees it.
+
+    Parameters:
+    - track_index / clip_index / device_index: 1-based.
+    - draw_mode: Turn the MIDI editor's draw mode on or off.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {}
+        for key, val in (
+            ("track_index", track_index), ("clip_index", clip_index),
+            ("device_index", device_index),
+        ):
+            if val is not None:
+                payload[key] = _to_zero_based(val, key)
+        if draw_mode is not None:
+            payload["draw_mode"] = draw_mode
+        if not payload:
+            return "Nothing to focus"
+        r = ableton.send_command("set_view_detail", payload)
+        focused = r.get("focused") or {}
+        return "Focused " + ", ".join(f"{k}='{v}'" for k, v in focused.items())
+    except Exception as e:
+        logger.error(f"Error setting view detail: {str(e)}")
+        return f"Error setting view detail: {str(e)}"
+
+
+@mcp.tool()
+def set_scene_signature(
+    ctx: Context,
+    scene_index: int,
+    numerator: int | None = None,
+    denominator: int | None = None,
+    enabled: bool | None = None,
+) -> str:
+    """Give a scene its own time signature, applied when it launches.
+
+    Parameters:
+    - scene_index: 1-based.
+    - numerator / denominator: e.g. 6 and 8 for 6/8.
+    - enabled: Whether the scene overrides the Set's signature.
+    """
+    try:
+        ableton = get_ableton_connection()
+        si = _to_zero_based(scene_index, "scene_index")
+        payload: dict = {"scene_index": si}
+        for key, val in (
+            ("numerator", numerator), ("denominator", denominator),
+            ("enabled", enabled),
+        ):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("set_scene_signature", payload)
+        changed = r.get("changed") or {}
+        return f"Scene '{r.get('scene')}': " + ", ".join(
+            f"{k}={v}" for k, v in changed.items())
+    except Exception as e:
+        logger.error(f"Error setting scene signature: {str(e)}")
+        return f"Error setting scene signature: {str(e)}"
+
+
+@mcp.tool()
 def set_device_sidechain(
     ctx: Context,
     track_index: int,

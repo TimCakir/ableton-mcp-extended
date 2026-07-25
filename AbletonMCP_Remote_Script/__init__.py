@@ -584,11 +584,8 @@ class AbletonMCP(ControlSurface):
     def _get_track_info(self, track_index):
         """Get information about a track"""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            
-            track = self._song.tracks[track_index]
-            
+            track = self._track_at(track_index)
+
             # Get clip slots
             clip_slots = []
             for slot_index, slot in enumerate(track.clip_slots):
@@ -1092,11 +1089,8 @@ class AbletonMCP(ControlSurface):
     def _load_browser_item(self, track_index, item_uri):
         """Load a browser item onto a track by its URI"""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            
-            track = self._song.tracks[track_index]
-            
+            track = self._track_at(track_index)
+
             # Access the application's browser instance instead of creating a new one
             app = self.application()
             
@@ -1920,6 +1914,22 @@ class AbletonMCP(ControlSurface):
 
     # Device helper methods
 
+    def _addressable_tracks(self):
+        """Session tracks followed by return tracks.
+
+        Return tracks are addressed by indices >= len(song.tracks), so a set
+        with 10 session tracks exposes returns A/B/C as indices 10/11/12.
+        """
+        return list(self._song.tracks) + list(self._song.return_tracks)
+
+    def _track_at(self, track_index):
+        """Resolve a 0-based index across session tracks and return tracks."""
+        tracks = self._addressable_tracks()
+        if track_index < 0 or track_index >= len(tracks):
+            raise IndexError("Track index {0} out of range (0-{1})".format(
+                track_index, len(tracks) - 1))
+        return tracks[track_index]
+
     def _resolve_device(self, track_index, device_index, chain_index=None):
         """Resolve a device reference to (track, device) tuple.
 
@@ -1931,11 +1941,7 @@ class AbletonMCP(ControlSurface):
         Returns (track, device) tuple.
         Raises IndexError or ValueError on invalid references.
         """
-        if track_index < 0 or track_index >= len(self._song.tracks):
-            raise IndexError("Track index {0} out of range (0-{1})".format(
-                track_index, len(self._song.tracks) - 1))
-
-        track = self._song.tracks[track_index]
+        track = self._track_at(track_index)
 
         if device_index < 0 or device_index >= len(track.devices):
             raise IndexError("Device index {0} out of range on track '{1}' (0-{2})".format(

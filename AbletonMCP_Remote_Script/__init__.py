@@ -269,7 +269,7 @@ class AbletonMCP(ControlSurface):
                                  "write_clip_automation",
                                  "set_clip_launch", "set_clip_follow_action",
                                  "manage_warp_markers",
-                                 "call_lom",
+                                 "call_lom", "set_device_sidechain",
                                  "set_device_modulation", "move_device",
                                  "manage_rack", "control_looper",
                                  "set_song_scale", "add_notes_extended",
@@ -343,7 +343,14 @@ class AbletonMCP(ControlSurface):
                                 params.get("member", ""),
                                 params.get("args", []),
                                 params.get("set_value", None),
-                                params.get("has_set_value", False))
+                                params.get("has_set_value", False),
+                                params.get("set_from", None))
+                        elif command_type == "set_device_sidechain":
+                            result = self._set_device_sidechain(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("source_track", ""),
+                                params.get("channel", None))
                         elif command_type == "set_device_modulation":
                             result = self._set_device_modulation(
                                 params.get("track_index", 0),
@@ -2418,8 +2425,67 @@ class AbletonMCP(ControlSurface):
                 continue
         return "<{0}>".format(type(value).__name__)
 
+    def _set_device_sidechain(self, track_index, device_index, source_track,
+                              channel=None):
+        """Route a device's sidechain input from another track, by name.
+
+        Live's Compressor, Gate and Auto Filter expose input_routing_type,
+        which IS the sidechain source. (Glue Compressor does not expose
+        routing at all, so it cannot be sidechained through the API.)
+        Assigning it requires a RoutingType object from the device's own
+        available_input_routing_types, not a string.
+        """
+        try:
+            track = self._track_at(track_index)
+            device = track.devices[device_index]
+            if not hasattr(device, "available_input_routing_types"):
+                raise ValueError(
+                    "'{0}' exposes no input routing, so it cannot be "
+                    "sidechained. Live's Compressor, Gate and Auto Filter "
+                    "can; Glue Compressor cannot.".format(device.name))
+
+            options = list(device.available_input_routing_types)
+            wanted = str(source_track).strip().lower()
+            match = None
+            for opt in options:
+                if opt.display_name.strip().lower() == wanted:
+                    match = opt
+                    break
+            if match is None:
+                partial = [o for o in options
+                           if wanted in o.display_name.strip().lower()]
+                if len(partial) == 1:
+                    match = partial[0]
+                elif len(partial) > 1:
+                    raise ValueError("'{0}' is ambiguous: {1}".format(
+                        source_track,
+                        ", ".join(o.display_name for o in partial)))
+            if match is None:
+                raise ValueError("'{0}' not found. Available: {1}".format(
+                    source_track,
+                    ", ".join(o.display_name for o in options)))
+
+            device.input_routing_type = match
+
+            channel_set = None
+            if channel is not None:
+                chans = list(getattr(device, "available_input_routing_channels", []))
+                cwanted = str(channel).strip().lower()
+                for c in chans:
+                    if cwanted in c.display_name.strip().lower():
+                        device.input_routing_channel = c
+                        channel_set = c.display_name
+                        break
+
+            return {"track": track.name, "device": device.name,
+                    "sidechain_source": device.input_routing_type.display_name,
+                    "channel": channel_set}
+        except Exception as e:
+            self.log_message("Error setting sidechain: " + str(e))
+            raise
+
     def _call_lom(self, path, member, args=None, set_value=None,
-                  has_set_value=False):
+                  has_set_value=False, set_from=None):
         """Read a property, set a property, or call a method anywhere in the LOM.
 
         The escape hatch: anything Live exposes is reachable without shipping
@@ -2447,6 +2513,45 @@ class AbletonMCP(ControlSurface):
                 result = attr(*call_args)
                 return {"path": path, "member": member, "called_with": call_args,
                         "returned": self._describe_value(result)}
+
+            if set_from:
+                # Many LOM properties must be assigned an object taken from a
+                # sibling collection (routing types, routing channels,
+                # grooves). A string will be rejected by the C++ layer, so
+                # resolve the value out of that collection by display name.
+                options = list(getattr(obj, set_from))
+                wanted = str(set_value).strip().lower()
+
+                def label(o):
+                    for a in ("display_name", "name"):
+                        try:
+                            return str(getattr(o, a))
+                        except Exception:
+                            continue
+                    return str(o)
+
+                match = None
+                for o in options:
+                    if label(o).strip().lower() == wanted:
+                        match = o
+                        break
+                if match is None:
+                    partial = [o for o in options
+                               if wanted in label(o).strip().lower()]
+                    if len(partial) == 1:
+                        match = partial[0]
+                    elif len(partial) > 1:
+                        raise ValueError("'{0}' is ambiguous in {1}: {2}".format(
+                            set_value, set_from,
+                            ", ".join(label(o) for o in partial)))
+                if match is None:
+                    raise ValueError("'{0}' not found in {1}. Options: {2}".format(
+                        set_value, set_from,
+                        ", ".join(label(o) for o in options)))
+                setattr(obj, member, match)
+                return {"path": path, "member": member,
+                        "set_from": set_from, "resolved": label(match),
+                        "now": self._describe_value(getattr(obj, member))}
 
             if has_set_value:
                 current = attr

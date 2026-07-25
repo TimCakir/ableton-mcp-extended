@@ -572,6 +572,7 @@ def call_lom(
     member: str = "",
     args: list | None = None,
     set_value: float | str | bool | None = None,
+    set_from: str | None = None,
 ) -> str:
     """Read, set, or call anything in Live's object model. The escape hatch.
 
@@ -588,15 +589,24 @@ def call_lom(
     - member: Property or method name. Omit to inspect the object at path.
     - args: Arguments if member is a method.
     - set_value: Value to assign if member is a writable property.
+    - set_from: Name of a sibling collection to resolve set_value out of, by
+      display name. Required for properties that must be assigned an object
+      rather than a string — routing types, routing channels, grooves. Live's
+      C++ layer rejects a plain string for those.
 
     Examples:
       path="tracks.0", member="name"                  → read a track name
       path="tracks.0.devices.0", member="parameters"  → list parameters
       path="song", member="tempo", set_value=124      → set tempo
+      path="tracks.2.devices.1", member="input_routing_type",
+        set_from="available_input_routing_types", set_value="DRUMS"
+                                                      → set a sidechain source
     """
     try:
         ableton = get_ableton_connection()
         payload: dict = {"path": path, "member": member, "args": args or []}
+        if set_from is not None:
+            payload["set_from"] = set_from
         if set_value is not None:
             payload["set_value"] = set_value
             payload["has_set_value"] = True
@@ -605,6 +615,49 @@ def call_lom(
     except Exception as e:
         logger.error(f"Error in call_lom: {str(e)}")
         return f"Error in call_lom: {str(e)}"
+
+
+@mcp.tool()
+def set_device_sidechain(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    source_track: str,
+    channel: str | None = None,
+) -> str:
+    """Route a device's sidechain input from another track, by track name.
+
+    Live's Compressor, Gate and Auto Filter expose input_routing_type, which
+    IS the sidechain source — so classic kick-ducks-bass pumping can be set
+    up entirely from here. Glue Compressor exposes no routing at all and
+    therefore cannot be sidechained through the API; use Compressor instead.
+
+    After routing, enable the device's own sidechain switch and set the
+    threshold with set_device_parameter.
+
+    Parameters:
+    - track_index / device_index: 1-based location of the compressor.
+    - source_track: Name of the track to listen to, e.g. "DRUMS".
+    - channel: Optional input channel, e.g. "Pre FX" or "Post FX".
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        payload: dict = {
+            "track_index": ti, "device_index": di, "source_track": source_track,
+        }
+        if channel is not None:
+            payload["channel"] = channel
+        r = ableton.send_command("set_device_sidechain", payload)
+        extra = f", channel {r.get('channel')}" if r.get("channel") else ""
+        return (
+            f"'{r.get('device')}' on '{r.get('track')}' now sidechained from "
+            f"'{r.get('sidechain_source')}'{extra}"
+        )
+    except Exception as e:
+        logger.error(f"Error setting sidechain: {str(e)}")
+        return f"Error setting sidechain: {str(e)}"
 
 
 @mcp.tool()

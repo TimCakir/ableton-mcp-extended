@@ -228,12 +228,26 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self._get_track_info(track_index)
             elif command_type == "get_session_overview":
                 response["result"] = self._get_session_overview()
+            elif command_type == "get_routing_options":
+                response["result"] = self._get_routing_options(
+                    params.get("track_index", 0))
+            elif command_type == "get_grooves":
+                response["result"] = self._get_grooves()
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "create_audio_track",
                                  "create_return_track", "duplicate_track",
                                  "set_send", "set_track_state",
                                  "create_scene", "set_scene_name", "fire_scene",
                                  "set_clip_properties",
+                                 "set_track_routing", "set_track_monitoring",
+                                 "set_crossfade_assign", "set_crossfader",
+                                 "load_sample_to_drum_pad",
+                                 "set_groove_amount", "apply_clip_groove",
+                                 "set_transport_state", "capture_midi",
+                                 "undo_redo", "set_master_volume",
+                                 "set_track_fold", "select_view_target",
+                                 "delete_scene", "duplicate_scene",
+                                 "set_scene_tempo",
                                  "set_track_name",
                                  "create_clip", "add_notes_to_clip", "set_clip_name",
                                  "set_tempo", "fire_clip", "stop_clip",
@@ -298,6 +312,65 @@ class AbletonMCP(ControlSurface):
                                 params.get("color_index", None),
                                 params.get("quantize_to", None),
                                 params.get("quantize_amount", 1.0))
+                        elif command_type == "set_track_routing":
+                            result = self._set_track_routing(
+                                params.get("track_index", 0),
+                                params.get("input_type", None),
+                                params.get("input_channel", None),
+                                params.get("output_type", None),
+                                params.get("output_channel", None))
+                        elif command_type == "set_track_monitoring":
+                            result = self._set_track_monitoring(
+                                params.get("track_index", 0),
+                                params.get("state", 1))
+                        elif command_type == "set_crossfade_assign":
+                            result = self._set_crossfade_assign(
+                                params.get("track_index", 0),
+                                params.get("assign", 1))
+                        elif command_type == "set_crossfader":
+                            result = self._set_crossfader(params.get("value", 0.5))
+                        elif command_type == "load_sample_to_drum_pad":
+                            result = self._load_sample_to_drum_pad(
+                                params.get("track_index", 0),
+                                params.get("pad_note", 36),
+                                params.get("uri", ""))
+                        elif command_type == "set_groove_amount":
+                            result = self._set_groove_amount(params.get("value", 1.0))
+                        elif command_type == "apply_clip_groove":
+                            result = self._apply_clip_groove(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("groove_name", ""))
+                        elif command_type == "set_transport_state":
+                            result = self._set_transport_state(
+                                params.get("metronome", None),
+                                params.get("loop", None),
+                                params.get("session_record", None),
+                                params.get("record_mode", None),
+                                params.get("punch_in", None),
+                                params.get("punch_out", None))
+                        elif command_type == "capture_midi":
+                            result = self._capture_midi()
+                        elif command_type == "undo_redo":
+                            result = self._undo_redo(params.get("action", "undo"))
+                        elif command_type == "set_master_volume":
+                            result = self._set_master_volume(params.get("volume", 0.85))
+                        elif command_type == "set_track_fold":
+                            result = self._set_track_fold(
+                                params.get("track_index", 0),
+                                params.get("folded", True))
+                        elif command_type == "select_view_target":
+                            result = self._select_view_target(
+                                params.get("track_index", None),
+                                params.get("scene_index", None))
+                        elif command_type == "delete_scene":
+                            result = self._delete_scene(params.get("scene_index", 0))
+                        elif command_type == "duplicate_scene":
+                            result = self._duplicate_scene(params.get("scene_index", 0))
+                        elif command_type == "set_scene_tempo":
+                            result = self._set_scene_tempo(
+                                params.get("scene_index", 0),
+                                params.get("tempo", None))
                         elif command_type == "set_track_name":
                             track_index = params.get("track_index", 0)
                             name = params.get("name", "")
@@ -2208,6 +2281,389 @@ class AbletonMCP(ControlSurface):
                     "changed": changed}
         except Exception as e:
             self.log_message("Error setting clip properties: " + str(e))
+            raise
+
+    # Routing, monitoring and crossfader
+
+    def _get_routing_options(self, track_index):
+        """List the routing types and channels available on a track."""
+        try:
+            track = self._track_at(track_index)
+
+            def names(collection):
+                try:
+                    return [x.display_name for x in collection]
+                except Exception:
+                    return []
+
+            def current(attr):
+                try:
+                    return getattr(track, attr).display_name
+                except Exception:
+                    return None
+
+            monitoring = None
+            try:
+                monitoring = ["In", "Auto", "Off"][track.current_monitoring_state]
+            except Exception:
+                pass
+
+            return {
+                "track_name": track.name,
+                "available_input_types": names(
+                    getattr(track, "available_input_routing_types", [])),
+                "available_input_channels": names(
+                    getattr(track, "available_input_routing_channels", [])),
+                "available_output_types": names(
+                    getattr(track, "available_output_routing_types", [])),
+                "available_output_channels": names(
+                    getattr(track, "available_output_routing_channels", [])),
+                "current_input_type": current("input_routing_type"),
+                "current_input_channel": current("input_routing_channel"),
+                "current_output_type": current("output_routing_type"),
+                "current_output_channel": current("output_routing_channel"),
+                "monitoring_state": monitoring,
+            }
+        except Exception as e:
+            self.log_message("Error getting routing options: " + str(e))
+            raise
+
+    def _set_track_routing(self, track_index, input_type=None,
+                           input_channel=None, output_type=None,
+                           output_channel=None):
+        """Set a track's input/output routing by display name.
+
+        Names are matched case-insensitively; a unique substring is enough.
+        Use get_routing_options first to see what this Set actually offers,
+        since available routings depend on the audio interface and on which
+        tracks exist.
+        """
+        try:
+            track = self._track_at(track_index)
+            changed = {}
+
+            def apply(available_attr, target_attr, wanted):
+                options = list(getattr(track, available_attr, []))
+                if not options:
+                    raise ValueError(
+                        "No options available for {0}".format(available_attr))
+                wanted_lower = str(wanted).lower()
+                match = None
+                for opt in options:
+                    if opt.display_name.lower() == wanted_lower:
+                        match = opt
+                        break
+                if match is None:
+                    partial = [o for o in options
+                               if wanted_lower in o.display_name.lower()]
+                    if len(partial) == 1:
+                        match = partial[0]
+                    elif len(partial) > 1:
+                        raise ValueError(
+                            "'{0}' is ambiguous, matches: {1}".format(
+                                wanted, ", ".join(
+                                    o.display_name for o in partial)))
+                if match is None:
+                    raise ValueError(
+                        "'{0}' not found. Available: {1}".format(
+                            wanted, ", ".join(o.display_name for o in options)))
+                setattr(track, target_attr, match)
+                changed[target_attr] = match.display_name
+
+            if input_type is not None:
+                apply("available_input_routing_types",
+                      "input_routing_type", input_type)
+            if input_channel is not None:
+                apply("available_input_routing_channels",
+                      "input_routing_channel", input_channel)
+            if output_type is not None:
+                apply("available_output_routing_types",
+                      "output_routing_type", output_type)
+            if output_channel is not None:
+                apply("available_output_routing_channels",
+                      "output_routing_channel", output_channel)
+
+            return {"track_name": track.name, "changed": changed}
+        except Exception as e:
+            self.log_message("Error setting track routing: " + str(e))
+            raise
+
+    def _set_track_monitoring(self, track_index, state):
+        """Set input monitoring: 0 = In, 1 = Auto, 2 = Off."""
+        try:
+            track = self._track_at(track_index)
+            state = int(state)
+            if state not in (0, 1, 2):
+                raise ValueError("Monitoring state must be 0 (In), 1 (Auto) or 2 (Off)")
+            track.current_monitoring_state = state
+            return {"track_name": track.name,
+                    "monitoring_state": ["In", "Auto", "Off"][state]}
+        except Exception as e:
+            self.log_message("Error setting monitoring: " + str(e))
+            raise
+
+    def _set_crossfade_assign(self, track_index, assign):
+        """Assign a track to a crossfader side: 0 = A, 1 = None, 2 = B."""
+        try:
+            track = self._track_at(track_index)
+            assign = int(assign)
+            if assign not in (0, 1, 2):
+                raise ValueError("Assign must be 0 (A), 1 (None) or 2 (B)")
+            track.mixer_device.crossfade_assign = assign
+            return {"track_name": track.name,
+                    "crossfade_assign": ["A", "None", "B"][assign]}
+        except Exception as e:
+            self.log_message("Error setting crossfade assign: " + str(e))
+            raise
+
+    def _set_crossfader(self, value):
+        """Set the crossfader position. 0.0 = full A, 0.5 = centre, 1.0 = full B."""
+        try:
+            xf = self._song.master_track.mixer_device.crossfader
+            target = xf.min + (xf.max - xf.min) * max(0.0, min(1.0, value))
+            xf.value = target
+            return {"crossfader": xf.value, "display_value": str(xf)}
+        except Exception as e:
+            self.log_message("Error setting crossfader: " + str(e))
+            raise
+
+    def _set_master_volume(self, volume):
+        """Set the master track fader. 0.85 is unity gain."""
+        try:
+            param = self._song.master_track.mixer_device.volume
+            target = param.min + (param.max - param.min) * max(0.0, min(1.0, volume))
+            param.value = target
+            return {"volume": param.value, "display_value": str(param)}
+        except Exception as e:
+            self.log_message("Error setting master volume: " + str(e))
+            raise
+
+    # Drum pads and samples
+
+    def _load_sample_to_drum_pad(self, track_index, pad_note, uri):
+        """Load a browser item (sample or device) onto one drum rack pad.
+
+        pad_note is the MIDI note of the pad — 36 is C1, the usual kick slot.
+        This is how a custom kit gets built: replace individual pads instead
+        of loading a whole preset kit.
+        """
+        try:
+            track = self._track_at(track_index)
+            drum_rack = None
+            for device in track.devices:
+                if getattr(device, "can_have_drum_pads", False):
+                    drum_rack = device
+                    break
+            if drum_rack is None:
+                raise ValueError(
+                    "No drum rack on track '{0}'".format(track.name))
+
+            pad = None
+            for candidate in drum_rack.drum_pads:
+                if candidate.note == int(pad_note):
+                    pad = candidate
+                    break
+            if pad is None:
+                raise ValueError("No drum pad at note {0}".format(pad_note))
+
+            app = self.application()
+            item = self._find_browser_item_by_uri(app.browser, uri)
+            if not item:
+                raise ValueError("Browser item '{0}' not found".format(uri))
+
+            self._song.view.selected_track = track
+            drum_rack.view.selected_drum_pad = pad
+            app.browser.load_item(item)
+
+            return {"track_name": track.name, "pad_note": int(pad_note),
+                    "pad_name": pad.name, "loaded": item.name}
+        except Exception as e:
+            self.log_message("Error loading sample to drum pad: " + str(e))
+            raise
+
+    # Groove
+
+    def _get_grooves(self):
+        """List grooves in the Set's groove pool."""
+        try:
+            grooves = []
+            try:
+                for i, g in enumerate(self._song.groove_pool.grooves):
+                    grooves.append({"index": i, "name": g.name})
+            except Exception:
+                return {"supported": False, "grooves": [],
+                        "groove_amount": getattr(self._song, "groove_amount", None)}
+            return {"supported": True, "grooves": grooves,
+                    "groove_amount": getattr(self._song, "groove_amount", None)}
+        except Exception as e:
+            self.log_message("Error listing grooves: " + str(e))
+            raise
+
+    def _set_groove_amount(self, value):
+        """Set the global groove amount (0.0-1.0 scaled to Live's range)."""
+        try:
+            self._song.groove_amount = max(0.0, min(1.0, float(value))) * 1.0
+            return {"groove_amount": self._song.groove_amount}
+        except Exception as e:
+            self.log_message("Error setting groove amount: " + str(e))
+            raise
+
+    def _apply_clip_groove(self, track_index, clip_index, groove_name):
+        """Assign a groove from the groove pool to a clip, by name."""
+        try:
+            track = self._track_at(track_index)
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise ValueError("No clip at slot {0}".format(clip_index))
+            clip = slot.clip
+            target = None
+            for g in self._song.groove_pool.grooves:
+                if g.name.lower() == str(groove_name).lower():
+                    target = g
+                    break
+            if target is None:
+                available = [g.name for g in self._song.groove_pool.grooves]
+                raise ValueError(
+                    "Groove '{0}' not found. Available: {1}".format(
+                        groove_name, ", ".join(available) or "(pool is empty)"))
+            clip.groove = target
+            return {"clip_name": clip.name, "groove": target.name}
+        except Exception as e:
+            self.log_message("Error applying groove: " + str(e))
+            raise
+
+    # Transport, capture and undo
+
+    def _set_transport_state(self, metronome=None, loop=None,
+                             session_record=None, record_mode=None,
+                             punch_in=None, punch_out=None):
+        """Set transport toggles. Omitted values are left alone."""
+        try:
+            changed = {}
+            for attr, val in (("metronome", metronome), ("loop", loop),
+                              ("session_record", session_record),
+                              ("record_mode", record_mode),
+                              ("punch_in", punch_in), ("punch_out", punch_out)):
+                if val is not None:
+                    setattr(self._song, attr, bool(val))
+                    changed[attr] = getattr(self._song, attr)
+            return {"changed": changed}
+        except Exception as e:
+            self.log_message("Error setting transport state: " + str(e))
+            raise
+
+    def _capture_midi(self):
+        """Capture recently played MIDI into a clip — Live's Capture button."""
+        try:
+            self._song.capture_midi()
+            return {"captured": True}
+        except Exception as e:
+            self.log_message("Error capturing MIDI: " + str(e))
+            raise
+
+    def _undo_redo(self, action):
+        """Undo or redo the last operation in Live."""
+        try:
+            action = str(action).lower()
+            if action == "undo":
+                if not self._song.can_undo:
+                    return {"action": "undo", "performed": False,
+                            "reason": "nothing to undo"}
+                self._song.undo()
+            elif action == "redo":
+                if not self._song.can_redo:
+                    return {"action": "redo", "performed": False,
+                            "reason": "nothing to redo"}
+                self._song.redo()
+            else:
+                raise ValueError("Action must be 'undo' or 'redo'")
+            return {"action": action, "performed": True}
+        except Exception as e:
+            self.log_message("Error in undo/redo: " + str(e))
+            raise
+
+    # View and scene management
+
+    def _set_track_fold(self, track_index, folded):
+        """Fold or unfold a group track."""
+        try:
+            track = self._track_at(track_index)
+            if not track.is_foldable:
+                raise ValueError(
+                    "Track '{0}' is not a group track".format(track.name))
+            track.fold_state = 1 if folded else 0
+            return {"track_name": track.name, "folded": bool(folded)}
+        except Exception as e:
+            self.log_message("Error folding track: " + str(e))
+            raise
+
+    def _select_view_target(self, track_index=None, scene_index=None):
+        """Select a track and/or scene in Live's UI."""
+        try:
+            selected = {}
+            if track_index is not None:
+                track = self._track_at(track_index)
+                self._song.view.selected_track = track
+                selected["track"] = track.name
+            if scene_index is not None:
+                if scene_index < 0 or scene_index >= len(self._song.scenes):
+                    raise IndexError("Scene index out of range")
+                scene = self._song.scenes[scene_index]
+                self._song.view.selected_scene = scene
+                selected["scene"] = scene.name or "(unnamed)"
+            return {"selected": selected}
+        except Exception as e:
+            self.log_message("Error selecting view target: " + str(e))
+            raise
+
+    def _delete_scene(self, scene_index):
+        """Delete a scene."""
+        try:
+            if len(self._song.scenes) <= 1:
+                raise ValueError("Cannot delete the last remaining scene")
+            if scene_index < 0 or scene_index >= len(self._song.scenes):
+                raise IndexError("Scene index out of range")
+            name = self._song.scenes[scene_index].name
+            self._song.delete_scene(scene_index)
+            return {"deleted": name or "(unnamed)",
+                    "scene_count": len(self._song.scenes)}
+        except Exception as e:
+            self.log_message("Error deleting scene: " + str(e))
+            raise
+
+    def _duplicate_scene(self, scene_index):
+        """Duplicate a scene, including all its clips."""
+        try:
+            if scene_index < 0 or scene_index >= len(self._song.scenes):
+                raise IndexError("Scene index out of range")
+            self._song.duplicate_scene(scene_index)
+            new_index = scene_index + 1
+            return {"index": new_index,
+                    "name": self._song.scenes[new_index].name or "(unnamed)",
+                    "scene_count": len(self._song.scenes)}
+        except Exception as e:
+            self.log_message("Error duplicating scene: " + str(e))
+            raise
+
+    def _set_scene_tempo(self, scene_index, tempo):
+        """Set a per-scene tempo, or disable it by passing tempo = None.
+
+        Launching that scene then changes the Set's tempo — the mechanism for
+        a live set where songs run at different speeds.
+        """
+        try:
+            if scene_index < 0 or scene_index >= len(self._song.scenes):
+                raise IndexError("Scene index out of range")
+            scene = self._song.scenes[scene_index]
+            if tempo is None:
+                scene.tempo_enabled = False
+                return {"index": scene_index, "tempo_enabled": False}
+            scene.tempo = float(tempo)
+            scene.tempo_enabled = True
+            return {"index": scene_index, "tempo": scene.tempo,
+                    "tempo_enabled": True}
+        except Exception as e:
+            self.log_message("Error setting scene tempo: " + str(e))
             raise
 
     # Device helper methods

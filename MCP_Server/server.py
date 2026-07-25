@@ -566,6 +566,461 @@ def get_session_overview(ctx: Context) -> str:
 
 
 @mcp.tool()
+def get_routing_options(ctx: Context, track_index: int) -> str:
+    """List the input/output routing choices available on a track.
+
+    Available routings depend on the audio interface and on which other
+    tracks exist, so always call this before set_track_routing rather than
+    guessing at names.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        r = ableton.send_command("get_routing_options", {"track_index": ti})
+        lines = [f"Routing for '{r.get('track_name')}':", ""]
+        lines.append(f"  input type:     {r.get('current_input_type')}")
+        lines.append(f"  input channel:  {r.get('current_input_channel')}")
+        lines.append(f"  output type:    {r.get('current_output_type')}")
+        lines.append(f"  output channel: {r.get('current_output_channel')}")
+        lines.append(f"  monitoring:     {r.get('monitoring_state')}")
+        for label, key in (
+            ("available input types", "available_input_types"),
+            ("available input channels", "available_input_channels"),
+            ("available output types", "available_output_types"),
+            ("available output channels", "available_output_channels"),
+        ):
+            vals = r.get(key) or []
+            if vals:
+                lines.append(f"\n  {label}: {', '.join(vals)}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting routing options: {str(e)}")
+        return f"Error getting routing options: {str(e)}"
+
+
+@mcp.tool()
+def set_track_routing(
+    ctx: Context,
+    track_index: int,
+    input_type: str | None = None,
+    input_channel: str | None = None,
+    output_type: str | None = None,
+    output_channel: str | None = None,
+) -> str:
+    """Set a track's input and output routing by display name.
+
+    Names match case-insensitively; a unique substring is enough. Use this
+    for resampling, feeding one track from another, sending a track to a
+    specific interface output, or routing an external instrument.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    - input_type / input_channel: e.g. "Ext. In" and "1/2", or another track's name.
+    - output_type / output_channel: e.g. "Master", or an interface output pair.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        payload: dict = {"track_index": ti}
+        for key, val in (
+            ("input_type", input_type), ("input_channel", input_channel),
+            ("output_type", output_type), ("output_channel", output_channel),
+        ):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("set_track_routing", payload)
+        changed = r.get("changed", {})
+        if not changed:
+            return f"No routing changes requested for '{r.get('track_name')}'"
+        detail = ", ".join(f"{k}={v}" for k, v in changed.items())
+        return f"Routed '{r.get('track_name')}': {detail}"
+    except Exception as e:
+        logger.error(f"Error setting track routing: {str(e)}")
+        return f"Error setting track routing: {str(e)}"
+
+
+@mcp.tool()
+def set_track_monitoring(ctx: Context, track_index: int, state: str) -> str:
+    """Set input monitoring on a track.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    - state: "in", "auto" or "off". Use "in" to hear a live input at all
+      times, "auto" to hear it only while armed, "off" for playback only.
+    """
+    try:
+        mapping = {"in": 0, "auto": 1, "off": 2}
+        key = str(state).strip().lower()
+        if key not in mapping:
+            return f"Invalid state '{state}'. Use 'in', 'auto' or 'off'."
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        r = ableton.send_command("set_track_monitoring", {
+            "track_index": ti, "state": mapping[key],
+        })
+        return f"Set '{r.get('track_name')}' monitoring to {r.get('monitoring_state')}"
+    except Exception as e:
+        logger.error(f"Error setting monitoring: {str(e)}")
+        return f"Error setting monitoring: {str(e)}"
+
+
+@mcp.tool()
+def set_crossfade_assign(ctx: Context, track_index: int, assign: str) -> str:
+    """Assign a track to a side of the crossfader.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    - assign: "a", "b" or "none".
+    """
+    try:
+        mapping = {"a": 0, "none": 1, "b": 2}
+        key = str(assign).strip().lower()
+        if key not in mapping:
+            return f"Invalid assign '{assign}'. Use 'a', 'b' or 'none'."
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        r = ableton.send_command("set_crossfade_assign", {
+            "track_index": ti, "assign": mapping[key],
+        })
+        return f"Assigned '{r.get('track_name')}' to crossfader {r.get('crossfade_assign')}"
+    except Exception as e:
+        logger.error(f"Error setting crossfade assign: {str(e)}")
+        return f"Error setting crossfade assign: {str(e)}"
+
+
+@mcp.tool()
+def set_crossfader(ctx: Context, value: float) -> str:
+    """Set the crossfader position.
+
+    Parameters:
+    - value: 0.0 = full A, 0.5 = centre, 1.0 = full B.
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command("set_crossfader", {"value": value})
+        return f"Crossfader set to {r.get('display_value')}"
+    except Exception as e:
+        logger.error(f"Error setting crossfader: {str(e)}")
+        return f"Error setting crossfader: {str(e)}"
+
+
+@mcp.tool()
+def set_master_volume(ctx: Context, volume: float) -> str:
+    """Set the master track fader.
+
+    Parameters:
+    - volume: Normalized 0.0-1.0. 0.85 is unity gain (0 dB).
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command("set_master_volume", {"volume": volume})
+        return f"Master volume set to {r.get('display_value')}"
+    except Exception as e:
+        logger.error(f"Error setting master volume: {str(e)}")
+        return f"Error setting master volume: {str(e)}"
+
+
+@mcp.tool()
+def load_sample_to_drum_pad(
+    ctx: Context, track_index: int, pad_note: int, uri: str
+) -> str:
+    """Load a sample or device onto a single pad of a drum rack.
+
+    This is how a custom kit gets built — swapping individual pads rather
+    than loading a whole preset kit. Find URIs with get_browser_items_at_path.
+
+    Parameters:
+    - track_index: Track with the drum rack (1-based).
+    - pad_note: MIDI note of the pad. 36 = C1 kick, 38 = snare, 42 = closed
+      hat, 46 = open hat.
+    - uri: Browser URI of the sample or device to load.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        r = ableton.send_command("load_sample_to_drum_pad", {
+            "track_index": ti, "pad_note": pad_note, "uri": uri,
+        })
+        return (
+            f"Loaded '{r.get('loaded')}' onto pad {r.get('pad_note')} "
+            f"('{r.get('pad_name')}') of '{r.get('track_name')}'"
+        )
+    except Exception as e:
+        logger.error(f"Error loading sample to drum pad: {str(e)}")
+        return f"Error loading sample to drum pad: {str(e)}"
+
+
+@mcp.tool()
+def get_grooves(ctx: Context) -> str:
+    """List grooves in the Set's groove pool, and the global groove amount.
+
+    The groove pool is empty until grooves are dragged in from the browser
+    or extracted from a clip, so an empty result is normal in a new Set.
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command("get_grooves")
+        grooves = r.get("grooves") or []
+        if not grooves:
+            return (
+                "Groove pool is empty. Drag a groove from the browser, or "
+                "extract one from a clip, then it becomes assignable.\n"
+                f"Global groove amount: {r.get('groove_amount')}"
+            )
+        listing = "\n".join(
+            f"  {g['index'] + 1}. {g['name']}" for g in grooves
+        )
+        return (
+            f"Groove pool ({len(grooves)}):\n{listing}\n\n"
+            f"Global groove amount: {r.get('groove_amount')}"
+        )
+    except Exception as e:
+        logger.error(f"Error getting grooves: {str(e)}")
+        return f"Error getting grooves: {str(e)}"
+
+
+@mcp.tool()
+def set_groove_amount(ctx: Context, value: float) -> str:
+    """Set the global groove amount — how strongly clip grooves are applied.
+
+    Parameters:
+    - value: 0.0-1.0.
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command("set_groove_amount", {"value": value})
+        return f"Global groove amount set to {r.get('groove_amount')}"
+    except Exception as e:
+        logger.error(f"Error setting groove amount: {str(e)}")
+        return f"Error setting groove amount: {str(e)}"
+
+
+@mcp.tool()
+def apply_clip_groove(
+    ctx: Context, track_index: int, clip_index: int, groove_name: str
+) -> str:
+    """Assign a groove from the groove pool to a clip.
+
+    Parameters:
+    - track_index / clip_index: 1-based track and clip slot.
+    - groove_name: Name as listed by get_grooves.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        r = ableton.send_command("apply_clip_groove", {
+            "track_index": ti, "clip_index": ci, "groove_name": groove_name,
+        })
+        return f"Applied groove '{r.get('groove')}' to clip '{r.get('clip_name')}'"
+    except Exception as e:
+        logger.error(f"Error applying groove: {str(e)}")
+        return f"Error applying groove: {str(e)}"
+
+
+@mcp.tool()
+def set_transport_state(
+    ctx: Context,
+    metronome: bool | None = None,
+    loop: bool | None = None,
+    session_record: bool | None = None,
+    record_mode: bool | None = None,
+    punch_in: bool | None = None,
+    punch_out: bool | None = None,
+) -> str:
+    """Set transport toggles. Omitted values are left alone.
+
+    Parameters:
+    - metronome: Click on/off.
+    - loop: Arrangement loop on/off.
+    - session_record: Session record button.
+    - record_mode: Arrangement record arm.
+    - punch_in / punch_out: Punch recording toggles.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {}
+        for key, val in (
+            ("metronome", metronome), ("loop", loop),
+            ("session_record", session_record), ("record_mode", record_mode),
+            ("punch_in", punch_in), ("punch_out", punch_out),
+        ):
+            if val is not None:
+                payload[key] = val
+        if not payload:
+            return "No transport changes requested"
+        r = ableton.send_command("set_transport_state", payload)
+        changed = r.get("changed", {})
+        return "Transport: " + ", ".join(f"{k}={v}" for k, v in changed.items())
+    except Exception as e:
+        logger.error(f"Error setting transport state: {str(e)}")
+        return f"Error setting transport state: {str(e)}"
+
+
+@mcp.tool()
+def capture_midi(ctx: Context) -> str:
+    """Capture recently played MIDI into a clip — Live's Capture button.
+
+    Works even when nothing was armed for recording, so an idea played while
+    noodling can still be recovered.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ableton.send_command("capture_midi")
+        return "Captured recent MIDI into a clip"
+    except Exception as e:
+        logger.error(f"Error capturing MIDI: {str(e)}")
+        return f"Error capturing MIDI: {str(e)}"
+
+
+@mcp.tool()
+def undo_redo(ctx: Context, action: str = "undo") -> str:
+    """Undo or redo the last operation in Live.
+
+    The safety net: any change made through this API can be reversed without
+    touching the keyboard.
+
+    Parameters:
+    - action: "undo" or "redo".
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command("undo_redo", {"action": action})
+        if not r.get("performed"):
+            return f"Nothing to {action} ({r.get('reason')})"
+        return f"Performed {r.get('action')}"
+    except Exception as e:
+        logger.error(f"Error in undo/redo: {str(e)}")
+        return f"Error in undo/redo: {str(e)}"
+
+
+@mcp.tool()
+def set_track_fold(ctx: Context, track_index: int, folded: bool = True) -> str:
+    """Fold or unfold a group track.
+
+    Group tracks cannot be created through the API — Live does not expose
+    that — but existing groups can be folded and unfolded.
+
+    Parameters:
+    - track_index: Group track number (1-based).
+    - folded: True to collapse, False to expand.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        r = ableton.send_command("set_track_fold", {
+            "track_index": ti, "folded": folded,
+        })
+        state = "folded" if r.get("folded") else "unfolded"
+        return f"'{r.get('track_name')}' {state}"
+    except Exception as e:
+        logger.error(f"Error folding track: {str(e)}")
+        return f"Error folding track: {str(e)}"
+
+
+@mcp.tool()
+def select_view_target(
+    ctx: Context, track_index: int | None = None, scene_index: int | None = None
+) -> str:
+    """Select a track and/or scene in Live's UI.
+
+    Useful for showing the user what is being discussed, and required before
+    some browser load operations.
+
+    Parameters:
+    - track_index: Track number (1-based), optional.
+    - scene_index: Scene number (1-based), optional.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {}
+        if track_index is not None:
+            payload["track_index"] = _to_zero_based(track_index, "track_index")
+        if scene_index is not None:
+            payload["scene_index"] = _to_zero_based(scene_index, "scene_index")
+        if not payload:
+            return "Nothing to select"
+        r = ableton.send_command("select_view_target", payload)
+        sel = r.get("selected", {})
+        return "Selected " + ", ".join(f"{k}='{v}'" for k, v in sel.items())
+    except Exception as e:
+        logger.error(f"Error selecting view target: {str(e)}")
+        return f"Error selecting view target: {str(e)}"
+
+
+@mcp.tool()
+def delete_scene(ctx: Context, scene_index: int) -> str:
+    """Delete a scene. Scene indices below it shift up by one.
+
+    Parameters:
+    - scene_index: Scene number (1-based).
+    """
+    try:
+        ableton = get_ableton_connection()
+        si = _to_zero_based(scene_index, "scene_index")
+        r = ableton.send_command("delete_scene", {"scene_index": si})
+        return (
+            f"Deleted scene '{r.get('deleted')}' "
+            f"({r.get('scene_count')} scenes remain)"
+        )
+    except Exception as e:
+        logger.error(f"Error deleting scene: {str(e)}")
+        return f"Error deleting scene: {str(e)}"
+
+
+@mcp.tool()
+def duplicate_scene(ctx: Context, scene_index: int) -> str:
+    """Duplicate a scene with all its clips — the fastest way to build an
+    arrangement from a working loop.
+
+    Parameters:
+    - scene_index: Scene number (1-based).
+    """
+    try:
+        ableton = get_ableton_connection()
+        si = _to_zero_based(scene_index, "scene_index")
+        r = ableton.send_command("duplicate_scene", {"scene_index": si})
+        return (
+            f"Duplicated to scene {r.get('index', 0) + 1} "
+            f"({r.get('scene_count')} scenes total)"
+        )
+    except Exception as e:
+        logger.error(f"Error duplicating scene: {str(e)}")
+        return f"Error duplicating scene: {str(e)}"
+
+
+@mcp.tool()
+def set_scene_tempo(
+    ctx: Context, scene_index: int, tempo: float | None = None
+) -> str:
+    """Give a scene its own tempo, so launching it changes the Set's tempo.
+
+    This is the mechanism for a live set where songs run at different
+    speeds — label scenes as songs and each one arrives at its own BPM.
+
+    Parameters:
+    - scene_index: Scene number (1-based).
+    - tempo: BPM, or omit to disable the scene's tempo override.
+    """
+    try:
+        ableton = get_ableton_connection()
+        si = _to_zero_based(scene_index, "scene_index")
+        payload: dict = {"scene_index": si}
+        if tempo is not None:
+            payload["tempo"] = tempo
+        r = ableton.send_command("set_scene_tempo", payload)
+        if not r.get("tempo_enabled"):
+            return f"Disabled tempo override on scene {scene_index}"
+        return f"Scene {scene_index} will set tempo to {r.get('tempo')} BPM"
+    except Exception as e:
+        logger.error(f"Error setting scene tempo: {str(e)}")
+        return f"Error setting scene tempo: {str(e)}"
+
+
+@mcp.tool()
 def create_audio_track(ctx: Context, index: int = -1) -> str:
     """Create a new audio track.
 

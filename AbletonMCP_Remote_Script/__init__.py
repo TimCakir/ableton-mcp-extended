@@ -233,6 +233,18 @@ class AbletonMCP(ControlSurface):
                     params.get("track_index", 0))
             elif command_type == "get_grooves":
                 response["result"] = self._get_grooves()
+            elif command_type == "inspect_lom":
+                response["result"] = self._inspect_lom(
+                    params.get("target", "song"),
+                    params.get("track_index", None),
+                    params.get("clip_index", None),
+                    params.get("device_index", None),
+                    params.get("scene_index", None),
+                    params.get("filter", ""))
+            elif command_type == "get_clip_automation":
+                response["result"] = self._get_clip_automation(
+                    params.get("track_index", 0),
+                    params.get("clip_index", 0))
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "create_audio_track",
                                  "create_return_track", "duplicate_track",
@@ -248,6 +260,9 @@ class AbletonMCP(ControlSurface):
                                  "set_track_fold", "select_view_target",
                                  "delete_scene", "duplicate_scene",
                                  "set_scene_tempo",
+                                 "write_clip_automation",
+                                 "set_clip_launch", "set_clip_follow_action",
+                                 "manage_warp_markers",
                                  "set_track_name",
                                  "create_clip", "add_notes_to_clip", "set_clip_name",
                                  "set_tempo", "fire_clip", "stop_clip",
@@ -312,6 +327,36 @@ class AbletonMCP(ControlSurface):
                                 params.get("color_index", None),
                                 params.get("quantize_to", None),
                                 params.get("quantize_amount", 1.0))
+                        elif command_type == "write_clip_automation":
+                            result = self._write_clip_automation(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("parameter_name", ""),
+                                params.get("points", []),
+                                params.get("device_index", None),
+                                params.get("clear_first", True))
+                        elif command_type == "set_clip_launch":
+                            result = self._set_clip_launch(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("launch_mode", None),
+                                params.get("launch_quantization", None),
+                                params.get("legato", None),
+                                params.get("velocity_amount", None))
+                        elif command_type == "set_clip_follow_action":
+                            result = self._set_clip_follow_action(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("settings", {}))
+                        elif command_type == "manage_warp_markers":
+                            result = self._manage_warp_markers(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("action", "list"),
+                                params.get("beat_time", None),
+                                params.get("sample_time", None),
+                                params.get("warp_mode", None),
+                                params.get("warping", None))
                         elif command_type == "set_track_routing":
                             result = self._set_track_routing(
                                 params.get("track_index", 0),
@@ -2281,6 +2326,366 @@ class AbletonMCP(ControlSurface):
                     "changed": changed}
         except Exception as e:
             self.log_message("Error setting clip properties: " + str(e))
+            raise
+
+    # Introspection
+
+    def _inspect_lom(self, target="song", track_index=None, clip_index=None,
+                     device_index=None, scene_index=None, name_filter=""):
+        """Report the real API surface of a live object in this Live version.
+
+        The Live Object Model differs between versions and published
+        documentation is incomplete, so the running instance is the only
+        authoritative source. This resolves an object and reports its
+        properties (with current values) and its methods.
+        """
+        try:
+            obj = None
+            label = target
+
+            if target == "song":
+                obj = self._song
+            elif target == "track":
+                obj = self._track_at(track_index or 0)
+                label = "track '{0}'".format(obj.name)
+            elif target == "clip":
+                track = self._track_at(track_index or 0)
+                slot = track.clip_slots[clip_index or 0]
+                if not slot.has_clip:
+                    raise ValueError("No clip at that slot")
+                obj = slot.clip
+                label = "clip '{0}'".format(obj.name)
+            elif target == "clip_slot":
+                track = self._track_at(track_index or 0)
+                obj = track.clip_slots[clip_index or 0]
+                label = "clip_slot"
+            elif target == "device":
+                track = self._track_at(track_index or 0)
+                obj = track.devices[device_index or 0]
+                label = "device '{0}'".format(obj.name)
+            elif target == "scene":
+                obj = self._song.scenes[scene_index or 0]
+                label = "scene"
+            elif target == "mixer":
+                obj = self._track_at(track_index or 0).mixer_device
+                label = "mixer_device"
+            elif target == "master":
+                obj = self._song.master_track
+                label = "master_track"
+            elif target == "view":
+                obj = self._song.view
+                label = "song.view"
+            else:
+                raise ValueError(
+                    "Unknown target '{0}'. Use song, track, clip, clip_slot, "
+                    "device, scene, mixer, master or view.".format(target))
+
+            props = []
+            methods = []
+            for attr in sorted(dir(obj)):
+                if attr.startswith("_"):
+                    continue
+                if name_filter and name_filter.lower() not in attr.lower():
+                    continue
+                try:
+                    value = getattr(obj, attr)
+                except Exception as e:
+                    props.append({"name": attr, "value": "<error: {0}>".format(e)})
+                    continue
+                if callable(value):
+                    methods.append(attr)
+                    continue
+                shown = value
+                try:
+                    if isinstance(value, (int, float, bool, str)) or value is None:
+                        shown = value
+                    elif hasattr(value, "__len__"):
+                        shown = "<{0} items>".format(len(value))
+                    else:
+                        shown = "<{0}>".format(type(value).__name__)
+                except Exception:
+                    shown = "<unreadable>"
+                props.append({"name": attr, "value": shown})
+
+            return {"target": label, "properties": props, "methods": methods}
+        except Exception as e:
+            self.log_message("Error inspecting LOM: " + str(e))
+            raise
+
+    # Automation
+
+    def _resolve_parameter(self, track, parameter_name, device_index=None):
+        """Find an automatable parameter on a track, optionally within a device."""
+        if not parameter_name:
+            raise ValueError("parameter_name is required")
+        target = parameter_name.strip().lower()
+        mixer = track.mixer_device
+
+        if device_index is None:
+            aliases = {
+                "volume": mixer.volume, "track volume": mixer.volume,
+                "pan": mixer.panning, "panning": mixer.panning,
+            }
+            if target in aliases:
+                return aliases[target], "mixer"
+            for send in tuple(mixer.sends):
+                if send.name.strip().lower() == target:
+                    return send, "mixer send"
+
+        devices = tuple(track.devices)
+        if device_index is not None:
+            if device_index < 0 or device_index >= len(devices):
+                raise IndexError("Device index {0} out of range on '{1}'".format(
+                    device_index, track.name))
+            devices = (devices[device_index],)
+
+        exact = []
+        partial = []
+        for device in devices:
+            for p in tuple(device.parameters):
+                pname = p.name.strip().lower()
+                if pname == target:
+                    exact.append((p, device.name))
+                elif target in pname:
+                    partial.append((p, device.name))
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            raise ValueError("'{0}' matches parameters on: {1}".format(
+                parameter_name, ", ".join(d for _, d in exact)))
+        if len(partial) == 1:
+            return partial[0]
+        if len(partial) > 1:
+            raise ValueError("'{0}' is ambiguous: {1}".format(
+                parameter_name,
+                ", ".join("{0} ({1})".format(p.name, d) for p, d in partial[:8])))
+        raise ValueError("Parameter '{0}' not found on '{1}'".format(
+            parameter_name, track.name))
+
+    def _get_clip_automation(self, track_index, clip_index):
+        """Report which parameters already have envelopes on a clip."""
+        try:
+            track = self._track_at(track_index)
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise ValueError("No clip at slot {0}".format(clip_index))
+            clip = slot.clip
+            found = []
+            candidates = [(track.mixer_device.volume, "mixer", "Volume"),
+                          (track.mixer_device.panning, "mixer", "Pan")]
+            for send in tuple(track.mixer_device.sends):
+                candidates.append((send, "mixer", send.name))
+            for device in tuple(track.devices):
+                for p in tuple(device.parameters):
+                    candidates.append((p, device.name, p.name))
+            for param, owner, pname in candidates:
+                try:
+                    env = clip.automation_envelope(param)
+                except Exception:
+                    env = None
+                if env is not None:
+                    found.append({"device": owner, "parameter": pname})
+            return {"clip_name": clip.name,
+                    "has_envelopes": getattr(clip, "has_envelopes", None),
+                    "automated": found}
+        except Exception as e:
+            self.log_message("Error reading clip automation: " + str(e))
+            raise
+
+    def _write_clip_automation(self, track_index, clip_index, parameter_name,
+                               points, device_index=None, clear_first=True):
+        """Write real automation points into a clip envelope.
+
+        points is a list of {time, value, length} where time and length are
+        in beats from the clip start and value is normalized 0.0-1.0.
+        Consecutive points with no gap produce a stepped envelope; supply
+        many small steps to approximate a ramp.
+        """
+        try:
+            track = self._track_at(track_index)
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise ValueError("No clip at slot {0}".format(clip_index))
+            clip = slot.clip
+
+            param, owner = self._resolve_parameter(
+                track, parameter_name, device_index)
+
+            env = None
+            try:
+                env = clip.automation_envelope(param)
+            except Exception:
+                env = None
+            if env is None:
+                env = clip.create_automation_envelope(param)
+            if env is None:
+                raise ValueError(
+                    "Could not create an envelope for '{0}'".format(param.name))
+
+            if clear_first:
+                try:
+                    env.clear()
+                except Exception:
+                    pass
+
+            written = 0
+            pmin, pmax = param.min, param.max
+            for point in points:
+                time = float(point.get("time", 0.0))
+                length = float(point.get("length", 0.0))
+                raw = float(point.get("value", 0.0))
+                value = pmin + (pmax - pmin) * max(0.0, min(1.0, raw))
+                env.insert_step(time, length, value)
+                written += 1
+
+            return {"clip_name": clip.name, "parameter": param.name,
+                    "device": owner, "points_written": written,
+                    "range": [pmin, pmax]}
+        except Exception as e:
+            self.log_message("Error writing clip automation: " + str(e))
+            raise
+
+    # Clip launch and follow actions
+
+    def _set_clip_launch(self, track_index, clip_index, launch_mode=None,
+                         launch_quantization=None, legato=None,
+                         velocity_amount=None):
+        """Set a clip's launch behaviour."""
+        try:
+            track = self._track_at(track_index)
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise ValueError("No clip at slot {0}".format(clip_index))
+            clip = slot.clip
+            changed = {}
+            for attr, val, cast in (("launch_mode", launch_mode, int),
+                                    ("launch_quantization", launch_quantization, int),
+                                    ("legato", legato, bool),
+                                    ("velocity_amount", velocity_amount, float)):
+                if val is None:
+                    continue
+                if not hasattr(clip, attr):
+                    changed[attr] = "<not supported in this Live version>"
+                    continue
+                setattr(clip, attr, cast(val))
+                changed[attr] = getattr(clip, attr)
+            return {"clip_name": clip.name, "changed": changed}
+        except Exception as e:
+            self.log_message("Error setting clip launch: " + str(e))
+            raise
+
+    def _set_clip_follow_action(self, track_index, clip_index, settings):
+        """Set follow-action properties, adapting to this Live version.
+
+        Follow actions were reworked in Live 12, so rather than assume a
+        property set, this applies whichever of the requested attributes
+        actually exist on the clip and reports the rest as unsupported. Call
+        inspect_lom(target='clip', filter='follow') to see what is available.
+        """
+        try:
+            track = self._track_at(track_index)
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise ValueError("No clip at slot {0}".format(clip_index))
+            clip = slot.clip
+
+            available = sorted(
+                a for a in dir(clip)
+                if "follow" in a.lower() and not a.startswith("_"))
+
+            if not settings:
+                current = {}
+                for attr in available:
+                    try:
+                        val = getattr(clip, attr)
+                        if not callable(val):
+                            current[attr] = val
+                    except Exception:
+                        pass
+                return {"clip_name": clip.name, "available": available,
+                        "current": current, "changed": {}}
+
+            changed = {}
+            unsupported = []
+            for key, val in settings.items():
+                if not hasattr(clip, key):
+                    unsupported.append(key)
+                    continue
+                try:
+                    existing = getattr(clip, key)
+                    if isinstance(existing, bool):
+                        val = bool(val)
+                    elif isinstance(existing, int):
+                        val = int(val)
+                    elif isinstance(existing, float):
+                        val = float(val)
+                    setattr(clip, key, val)
+                    changed[key] = getattr(clip, key)
+                except Exception as e:
+                    unsupported.append("{0} ({1})".format(key, e))
+
+            return {"clip_name": clip.name, "available": available,
+                    "changed": changed, "unsupported": unsupported}
+        except Exception as e:
+            self.log_message("Error setting follow action: " + str(e))
+            raise
+
+    # Warp markers
+
+    def _manage_warp_markers(self, track_index, clip_index, action="list",
+                             beat_time=None, sample_time=None, warp_mode=None,
+                             warping=None):
+        """List, add or remove warp markers on an audio clip, and set warp mode."""
+        try:
+            track = self._track_at(track_index)
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise ValueError("No clip at slot {0}".format(clip_index))
+            clip = slot.clip
+            if clip.is_midi_clip:
+                raise ValueError("'{0}' is a MIDI clip — warp markers are "
+                                 "audio only".format(clip.name))
+
+            result = {"clip_name": clip.name}
+
+            if warping is not None:
+                clip.warping = bool(warping)
+                result["warping"] = clip.warping
+
+            if warp_mode is not None:
+                modes = list(getattr(clip, "available_warp_modes", []))
+                clip.warp_mode = int(warp_mode)
+                result["warp_mode"] = clip.warp_mode
+                result["available_warp_modes"] = modes
+
+            if action == "add":
+                if beat_time is None:
+                    raise ValueError("beat_time is required to add a warp marker")
+                kwargs = {"beat_time": float(beat_time)}
+                if sample_time is not None:
+                    kwargs["sample_time"] = float(sample_time)
+                clip.add_warp_marker(kwargs)
+                result["added_at_beat"] = float(beat_time)
+            elif action == "remove":
+                if beat_time is None:
+                    raise ValueError("beat_time is required to remove a warp marker")
+                clip.remove_warp_marker(float(beat_time))
+                result["removed_at_beat"] = float(beat_time)
+            elif action not in ("list", "set"):
+                raise ValueError("action must be list, add, remove or set")
+
+            markers = []
+            try:
+                for m in clip.warp_markers:
+                    markers.append({"beat_time": m.beat_time,
+                                    "sample_time": m.sample_time})
+            except Exception:
+                pass
+            result["warp_markers"] = markers[:64]
+            result["marker_count"] = len(markers)
+            return result
+        except Exception as e:
+            self.log_message("Error managing warp markers: " + str(e))
             raise
 
     # Routing, monitoring and crossfader

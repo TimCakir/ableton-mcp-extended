@@ -566,6 +566,267 @@ def get_session_overview(ctx: Context) -> str:
 
 
 @mcp.tool()
+def inspect_lom(
+    ctx: Context,
+    target: str = "song",
+    track_index: int | None = None,
+    clip_index: int | None = None,
+    device_index: int | None = None,
+    scene_index: int | None = None,
+    filter: str = "",
+) -> str:
+    """Report the real API surface of a live object in THIS Live version.
+
+    The Live Object Model changes between versions and the published
+    documentation is incomplete, so the running instance is the only
+    authoritative source. Use this instead of guessing at property names —
+    e.g. inspect_lom(target="clip", track_index=1, clip_index=1,
+    filter="follow") shows exactly which follow-action properties exist.
+
+    Parameters:
+    - target: song, track, clip, clip_slot, device, scene, mixer, master, view.
+    - track_index / clip_index / device_index / scene_index: 1-based, as needed.
+    - filter: only show names containing this substring.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {"target": target, "filter": filter}
+        for key, val in (
+            ("track_index", track_index), ("clip_index", clip_index),
+            ("device_index", device_index), ("scene_index", scene_index),
+        ):
+            if val is not None:
+                payload[key] = _to_zero_based(val, key)
+        r = ableton.send_command("inspect_lom", payload)
+        lines = [f"{r.get('target')} — Live API surface", ""]
+        props = r.get("properties") or []
+        if props:
+            lines.append("Properties:")
+            for p in props:
+                lines.append(f"  {p['name']} = {p['value']}")
+        methods = r.get("methods") or []
+        if methods:
+            lines.append("")
+            lines.append("Methods: " + ", ".join(methods))
+        if not props and not methods:
+            lines.append("(nothing matched)")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error inspecting LOM: {str(e)}")
+        return f"Error inspecting LOM: {str(e)}"
+
+
+@mcp.tool()
+def get_clip_automation(ctx: Context, track_index: int, clip_index: int) -> str:
+    """List which parameters already have automation envelopes on a clip.
+
+    Parameters:
+    - track_index / clip_index: 1-based track and clip slot.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        r = ableton.send_command("get_clip_automation", {
+            "track_index": ti, "clip_index": ci,
+        })
+        automated = r.get("automated") or []
+        if not automated:
+            return f"Clip '{r.get('clip_name')}' has no automation envelopes"
+        listing = "\n".join(
+            f"  {a['device']} → {a['parameter']}" for a in automated
+        )
+        return f"Clip '{r.get('clip_name')}' automates:\n{listing}"
+    except Exception as e:
+        logger.error(f"Error reading clip automation: {str(e)}")
+        return f"Error reading clip automation: {str(e)}"
+
+
+@mcp.tool()
+def write_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    parameter_name: str,
+    points: list,
+    device_index: int | None = None,
+    clear_first: bool = True,
+) -> str:
+    """Write real automation points into a clip envelope.
+
+    This actually draws automation, rather than only creating or clearing an
+    empty envelope.
+
+    Parameters:
+    - track_index / clip_index: 1-based track and clip slot.
+    - parameter_name: "Volume", "Pan", a send name, or a device parameter
+      such as "Filter Freq". Matched exactly first, then by substring.
+    - points: list of {"time": beats, "value": 0.0-1.0, "length": beats}.
+      Value is normalized and mapped onto the parameter's own range. Steps
+      are flat, so approximate a ramp with several short steps — e.g. a
+      4-beat filter sweep as 16 steps of length 0.25 with rising values.
+    - device_index: restrict the search to one device (1-based).
+    - clear_first: wipe the existing envelope before writing.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        payload: dict = {
+            "track_index": ti, "clip_index": ci,
+            "parameter_name": parameter_name, "points": points,
+            "clear_first": clear_first,
+        }
+        if device_index is not None:
+            payload["device_index"] = _to_zero_based(device_index, "device_index")
+        r = ableton.send_command("write_clip_automation", payload)
+        return (
+            f"Wrote {r.get('points_written')} automation points to "
+            f"'{r.get('parameter')}' ({r.get('device')}) on clip "
+            f"'{r.get('clip_name')}'"
+        )
+    except Exception as e:
+        logger.error(f"Error writing clip automation: {str(e)}")
+        return f"Error writing clip automation: {str(e)}"
+
+
+@mcp.tool()
+def set_clip_launch(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    launch_mode: int | None = None,
+    launch_quantization: int | None = None,
+    legato: bool | None = None,
+    velocity_amount: float | None = None,
+) -> str:
+    """Set how a clip launches — trigger/gate/toggle/repeat, quantization, legato.
+
+    Parameters:
+    - track_index / clip_index: 1-based.
+    - launch_mode: 0 = Trigger, 1 = Gate, 2 = Toggle, 3 = Repeat.
+    - launch_quantization: 0 = Global, then Live's quantization list.
+    - legato: Keep playback position when switching clips — essential for a
+      live set where one song's clips swap without restarting the phrase.
+    - velocity_amount: How much MIDI velocity affects clip volume.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        payload: dict = {"track_index": ti, "clip_index": ci}
+        for key, val in (
+            ("launch_mode", launch_mode),
+            ("launch_quantization", launch_quantization),
+            ("legato", legato), ("velocity_amount", velocity_amount),
+        ):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("set_clip_launch", payload)
+        changed = r.get("changed", {})
+        if not changed:
+            return f"No launch changes requested for '{r.get('clip_name')}'"
+        detail = ", ".join(f"{k}={v}" for k, v in changed.items())
+        return f"Set '{r.get('clip_name')}' launch: {detail}"
+    except Exception as e:
+        logger.error(f"Error setting clip launch: {str(e)}")
+        return f"Error setting clip launch: {str(e)}"
+
+
+@mcp.tool()
+def set_clip_follow_action(
+    ctx: Context, track_index: int, clip_index: int, settings: dict | None = None
+) -> str:
+    """Read or set a clip's follow actions.
+
+    Follow actions were reworked in Live 12, so this adapts to whatever the
+    running version exposes rather than assuming property names. Call it
+    with no settings first to see the available properties and their current
+    values, then set those names.
+
+    Parameters:
+    - track_index / clip_index: 1-based.
+    - settings: dict of follow-action property names to values, e.g.
+      {"follow_action_time": 4.0, "follow_action_enabled": True}. Omit to
+      just read.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        r = ableton.send_command("set_clip_follow_action", {
+            "track_index": ti, "clip_index": ci, "settings": settings or {},
+        })
+        lines = [f"Clip '{r.get('clip_name')}' follow actions:"]
+        available = r.get("available") or []
+        lines.append("  available: " + (", ".join(available) or "none"))
+        current = r.get("current") or {}
+        if current:
+            lines.append("  current: " + ", ".join(
+                f"{k}={v}" for k, v in current.items()))
+        changed = r.get("changed") or {}
+        if changed:
+            lines.append("  changed: " + ", ".join(
+                f"{k}={v}" for k, v in changed.items()))
+        unsupported = r.get("unsupported") or []
+        if unsupported:
+            lines.append("  NOT supported: " + ", ".join(str(u) for u in unsupported))
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error setting follow action: {str(e)}")
+        return f"Error setting follow action: {str(e)}"
+
+
+@mcp.tool()
+def manage_warp_markers(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    action: str = "list",
+    beat_time: float | None = None,
+    sample_time: float | None = None,
+    warp_mode: int | None = None,
+    warping: bool | None = None,
+) -> str:
+    """List, add or remove warp markers on an audio clip, and set warp mode.
+
+    Parameters:
+    - track_index / clip_index: 1-based.
+    - action: "list", "add", "remove", or "set" (for warp_mode/warping only).
+    - beat_time: Position in beats — required for add and remove.
+    - sample_time: Optional source position for an added marker.
+    - warp_mode: 0 Beats, 1 Tones, 2 Texture, 3 Re-Pitch, 4 Complex, 6 Complex Pro.
+    - warping: Turn warping on or off for the clip.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        payload: dict = {"track_index": ti, "clip_index": ci, "action": action}
+        for key, val in (
+            ("beat_time", beat_time), ("sample_time", sample_time),
+            ("warp_mode", warp_mode), ("warping", warping),
+        ):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("manage_warp_markers", payload)
+        lines = [f"Clip '{r.get('clip_name')}': {r.get('marker_count')} warp markers"]
+        for key in ("warping", "warp_mode", "added_at_beat", "removed_at_beat"):
+            if key in r:
+                lines.append(f"  {key} = {r[key]}")
+        markers = r.get("warp_markers") or []
+        if action == "list" and markers:
+            preview = ", ".join(
+                f"{m['beat_time']:.2f}" for m in markers[:16]
+            )
+            lines.append(f"  beats: {preview}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error managing warp markers: {str(e)}")
+        return f"Error managing warp markers: {str(e)}"
+
+
+@mcp.tool()
 def get_routing_options(ctx: Context, track_index: int) -> str:
     """List the input/output routing choices available on a track.
 

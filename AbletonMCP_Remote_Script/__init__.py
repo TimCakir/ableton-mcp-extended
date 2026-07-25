@@ -226,8 +226,15 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
+            elif command_type == "get_session_overview":
+                response["result"] = self._get_session_overview()
             # Commands that modify Live's state should be scheduled on the main thread
-            elif command_type in ["create_midi_track", "set_track_name",
+            elif command_type in ["create_midi_track", "create_audio_track",
+                                 "create_return_track", "duplicate_track",
+                                 "set_send", "set_track_state",
+                                 "create_scene", "set_scene_name", "fire_scene",
+                                 "set_clip_properties",
+                                 "set_track_name",
                                  "create_clip", "add_notes_to_clip", "set_clip_name",
                                  "set_tempo", "fire_clip", "stop_clip",
                                  "start_playback", "stop_playback", "load_browser_item",
@@ -253,6 +260,44 @@ class AbletonMCP(ControlSurface):
                         if command_type == "create_midi_track":
                             index = params.get("index", -1)
                             result = self._create_midi_track(index)
+                        elif command_type == "create_audio_track":
+                            index = params.get("index", -1)
+                            result = self._create_audio_track(index)
+                        elif command_type == "create_return_track":
+                            result = self._create_return_track()
+                        elif command_type == "duplicate_track":
+                            result = self._duplicate_track(params.get("track_index", 0))
+                        elif command_type == "set_send":
+                            result = self._set_send(
+                                params.get("track_index", 0),
+                                params.get("send_index", 0),
+                                params.get("value", 0.0))
+                        elif command_type == "set_track_state":
+                            result = self._set_track_state(
+                                params.get("track_index", 0),
+                                params.get("mute", None),
+                                params.get("solo", None),
+                                params.get("arm", None),
+                                params.get("color_index", None))
+                        elif command_type == "create_scene":
+                            result = self._create_scene(params.get("index", -1))
+                        elif command_type == "set_scene_name":
+                            result = self._set_scene_name(
+                                params.get("scene_index", 0),
+                                params.get("name", ""))
+                        elif command_type == "fire_scene":
+                            result = self._fire_scene(params.get("scene_index", 0))
+                        elif command_type == "set_clip_properties":
+                            result = self._set_clip_properties(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("looping", None),
+                                params.get("loop_end", None),
+                                params.get("gain", None),
+                                params.get("warping", None),
+                                params.get("color_index", None),
+                                params.get("quantize_to", None),
+                                params.get("quantize_amount", 1.0))
                         elif command_type == "set_track_name":
                             track_index = params.get("track_index", 0)
                             name = params.get("name", "")
@@ -1910,6 +1955,259 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error navigating preset: " + str(e))
+            raise
+
+    # Session / mixer / scene methods
+
+    def _get_session_overview(self):
+        """Compact map of the whole Set.
+
+        One small payload describing every track (session + returns), its
+        devices, clip count and mixer state. Cheap enough to call before any
+        indexed operation, which is the reliable way to avoid acting on stale
+        indices after a track is added, deleted or reordered.
+        """
+        try:
+            def describe(track, index, kind):
+                devices = []
+                try:
+                    devices = [d.name for d in track.devices]
+                except Exception:
+                    pass
+                clips = []
+                try:
+                    for slot_index, slot in enumerate(track.clip_slots):
+                        if slot.has_clip:
+                            clips.append({
+                                "slot": slot_index,
+                                "name": slot.clip.name,
+                                "length": slot.clip.length,
+                            })
+                except Exception:
+                    pass
+                info = {
+                    "index": index,
+                    "name": track.name,
+                    "kind": kind,
+                    "devices": devices,
+                    "clips": clips,
+                }
+                for attr in ("mute", "solo"):
+                    try:
+                        info[attr] = getattr(track, attr)
+                    except Exception:
+                        pass
+                try:
+                    info["arm"] = track.arm if track.can_be_armed else None
+                except Exception:
+                    pass
+                try:
+                    info["color_index"] = track.color_index
+                except Exception:
+                    pass
+                return info
+
+            tracks = []
+            offset = 0
+            for i, t in enumerate(self._song.tracks):
+                kind = "group" if t.is_foldable else (
+                    "midi" if t.has_midi_input else "audio")
+                tracks.append(describe(t, i, kind))
+                offset = i + 1
+            for j, t in enumerate(self._song.return_tracks):
+                tracks.append(describe(t, offset + j, "return"))
+
+            scenes = []
+            try:
+                for i, s in enumerate(self._song.scenes):
+                    scenes.append({"index": i, "name": s.name})
+            except Exception:
+                pass
+
+            return {
+                "tempo": self._song.tempo,
+                "signature": "{0}/{1}".format(
+                    self._song.signature_numerator,
+                    self._song.signature_denominator),
+                "session_track_count": len(self._song.tracks),
+                "return_track_count": len(self._song.return_tracks),
+                "tracks": tracks,
+                "scenes": scenes,
+            }
+        except Exception as e:
+            self.log_message("Error building session overview: " + str(e))
+            raise
+
+    def _create_audio_track(self, index):
+        """Create a new audio track at index (-1 = end)."""
+        try:
+            self._song.create_audio_track(index)
+            new_track = self._song.tracks[index if index >= 0 else -1]
+            return {"index": list(self._song.tracks).index(new_track),
+                    "name": new_track.name}
+        except Exception as e:
+            self.log_message("Error creating audio track: " + str(e))
+            raise
+
+    def _create_return_track(self):
+        """Create a new return track at the end of the return list."""
+        try:
+            self._song.create_return_track()
+            new_track = self._song.return_tracks[-1]
+            return {"index": len(self._song.tracks) + len(self._song.return_tracks) - 1,
+                    "name": new_track.name,
+                    "return_count": len(self._song.return_tracks)}
+        except Exception as e:
+            self.log_message("Error creating return track: " + str(e))
+            raise
+
+    def _duplicate_track(self, track_index):
+        """Duplicate a session track, including its devices and clips."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index {0} out of range (0-{1})".format(
+                    track_index, len(self._song.tracks) - 1))
+            source_name = self._song.tracks[track_index].name
+            self._song.duplicate_track(track_index)
+            new_track = self._song.tracks[track_index + 1]
+            return {"source": source_name,
+                    "index": track_index + 1,
+                    "name": new_track.name}
+        except Exception as e:
+            self.log_message("Error duplicating track: " + str(e))
+            raise
+
+    def _set_send(self, track_index, send_index, value):
+        """Set a track's send level to a return track.
+
+        send_index 0 = return A, 1 = return B, and so on. Value is
+        normalized 0.0-1.0.
+        """
+        try:
+            track = self._track_at(track_index)
+            sends = track.mixer_device.sends
+            if send_index < 0 or send_index >= len(sends):
+                raise IndexError(
+                    "Send index {0} out of range on '{1}' (0-{2})".format(
+                        send_index, track.name, len(sends) - 1))
+            send = sends[send_index]
+            target = send.min + (send.max - send.min) * max(0.0, min(1.0, value))
+            send.value = target
+            return {"track_name": track.name,
+                    "send_index": send_index,
+                    "send_name": send.name,
+                    "value": send.value,
+                    "display_value": str(send)}
+        except Exception as e:
+            self.log_message("Error setting send: " + str(e))
+            raise
+
+    def _set_track_state(self, track_index, mute=None, solo=None, arm=None,
+                         color_index=None):
+        """Set mute / solo / arm / colour on a track. Omitted values unchanged."""
+        try:
+            track = self._track_at(track_index)
+            changed = {}
+            if mute is not None:
+                track.mute = bool(mute)
+                changed["mute"] = track.mute
+            if solo is not None:
+                track.solo = bool(solo)
+                changed["solo"] = track.solo
+            if arm is not None:
+                if not track.can_be_armed:
+                    raise ValueError(
+                        "Track '{0}' cannot be armed".format(track.name))
+                track.arm = bool(arm)
+                changed["arm"] = track.arm
+            if color_index is not None:
+                track.color_index = int(color_index)
+                changed["color_index"] = track.color_index
+            return {"track_name": track.name, "changed": changed}
+        except Exception as e:
+            self.log_message("Error setting track state: " + str(e))
+            raise
+
+    def _create_scene(self, index):
+        """Create a scene at index (-1 = end)."""
+        try:
+            self._song.create_scene(index)
+            pos = index if index >= 0 else len(self._song.scenes) - 1
+            return {"index": pos, "name": self._song.scenes[pos].name,
+                    "scene_count": len(self._song.scenes)}
+        except Exception as e:
+            self.log_message("Error creating scene: " + str(e))
+            raise
+
+    def _set_scene_name(self, scene_index, name):
+        """Rename a scene."""
+        try:
+            if scene_index < 0 or scene_index >= len(self._song.scenes):
+                raise IndexError("Scene index {0} out of range (0-{1})".format(
+                    scene_index, len(self._song.scenes) - 1))
+            scene = self._song.scenes[scene_index]
+            scene.name = name
+            return {"index": scene_index, "name": scene.name}
+        except Exception as e:
+            self.log_message("Error setting scene name: " + str(e))
+            raise
+
+    def _fire_scene(self, scene_index):
+        """Launch a scene."""
+        try:
+            if scene_index < 0 or scene_index >= len(self._song.scenes):
+                raise IndexError("Scene index {0} out of range (0-{1})".format(
+                    scene_index, len(self._song.scenes) - 1))
+            scene = self._song.scenes[scene_index]
+            scene.fire()
+            return {"index": scene_index, "name": scene.name, "fired": True}
+        except Exception as e:
+            self.log_message("Error firing scene: " + str(e))
+            raise
+
+    def _set_clip_properties(self, track_index, clip_index, looping=None,
+                             loop_end=None, gain=None, warping=None,
+                             color_index=None, quantize_to=None,
+                             quantize_amount=1.0):
+        """Set clip properties and optionally quantize it.
+
+        quantize_to is a Live quantization grid constant (e.g. 5 = 1/16).
+        Audio-only properties (gain, warping) are ignored on MIDI clips.
+        """
+        try:
+            track = self._track_at(track_index)
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index {0} out of range".format(clip_index))
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise ValueError("No clip at slot {0} on '{1}'".format(
+                    clip_index, track.name))
+            clip = slot.clip
+            changed = {}
+            if looping is not None:
+                clip.looping = bool(looping)
+                changed["looping"] = clip.looping
+            if loop_end is not None:
+                clip.loop_end = float(loop_end)
+                changed["loop_end"] = clip.loop_end
+            if color_index is not None:
+                clip.color_index = int(color_index)
+                changed["color_index"] = clip.color_index
+            if not clip.is_midi_clip:
+                if gain is not None:
+                    clip.gain = float(gain)
+                    changed["gain"] = clip.gain
+                if warping is not None:
+                    clip.warping = bool(warping)
+                    changed["warping"] = clip.warping
+            if quantize_to is not None:
+                clip.quantize(int(quantize_to), float(quantize_amount))
+                changed["quantized_to"] = int(quantize_to)
+                changed["quantize_amount"] = float(quantize_amount)
+            return {"track_name": track.name, "clip_name": clip.name,
+                    "changed": changed}
+        except Exception as e:
+            self.log_message("Error setting clip properties: " + str(e))
             raise
 
     # Device helper methods

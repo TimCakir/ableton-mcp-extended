@@ -510,6 +510,302 @@ def get_track_volume(ctx: Context, track_index: int) -> str:
 
 
 @mcp.tool()
+def get_session_overview(ctx: Context) -> str:
+    """Get a compact map of the whole Set in one call.
+
+    Returns tempo, signature, and every track (session tracks first, then
+    return tracks) with its 1-based index, name, kind, devices, clips and
+    mixer state — plus the scene list.
+
+    Call this before any indexed operation. Track indices shift whenever a
+    track is added, deleted or moved, so acting on remembered indices is the
+    most common way to write to the wrong track. This is far cheaper than
+    calling get_track_info per track.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_session_overview")
+        lines = [
+            f"Tempo {result.get('tempo')} BPM | {result.get('signature')} | "
+            f"{result.get('session_track_count')} tracks, "
+            f"{result.get('return_track_count')} returns",
+            "",
+        ]
+        for t in result.get("tracks", []):
+            flags = []
+            if t.get("mute"):
+                flags.append("MUTED")
+            if t.get("solo"):
+                flags.append("SOLO")
+            if t.get("arm"):
+                flags.append("ARMED")
+            flag_str = f" [{', '.join(flags)}]" if flags else ""
+            devices = ", ".join(t.get("devices") or []) or "—"
+            lines.append(
+                f"{t['index'] + 1:>3}. {t['name']} ({t['kind']}){flag_str}"
+            )
+            lines.append(f"      devices: {devices}")
+            clips = t.get("clips") or []
+            if clips:
+                clip_str = ", ".join(
+                    f"slot {c['slot'] + 1}:'{c['name']}' ({c['length']}b)"
+                    for c in clips
+                )
+                lines.append(f"      clips: {clip_str}")
+        scenes = result.get("scenes", [])
+        if scenes:
+            lines.append("")
+            lines.append(
+                "Scenes: "
+                + ", ".join(f"{s['index'] + 1}:'{s['name']}'" for s in scenes)
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting session overview: {str(e)}")
+        return f"Error getting session overview: {str(e)}"
+
+
+@mcp.tool()
+def create_audio_track(ctx: Context, index: int = -1) -> str:
+    """Create a new audio track.
+
+    Parameters:
+    - index: 1-based position to insert at, or -1 for the end of the list.
+    """
+    try:
+        ableton = get_ableton_connection()
+        zero_based = -1 if index == -1 else _to_zero_based(index, "index")
+        result = ableton.send_command("create_audio_track", {"index": zero_based})
+        return (
+            f"Created audio track '{result.get('name')}' "
+            f"at index {result.get('index', 0) + 1}"
+        )
+    except Exception as e:
+        logger.error(f"Error creating audio track: {str(e)}")
+        return f"Error creating audio track: {str(e)}"
+
+
+@mcp.tool()
+def create_return_track(ctx: Context) -> str:
+    """Create a new return track at the end of the return list.
+
+    Return tracks are addressed by indices after all session tracks: with 10
+    session tracks, returns A/B/C are indices 11/12/13.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("create_return_track")
+        return (
+            f"Created return track '{result.get('name')}' at index "
+            f"{result.get('index', 0) + 1} "
+            f"({result.get('return_count')} returns total)"
+        )
+    except Exception as e:
+        logger.error(f"Error creating return track: {str(e)}")
+        return f"Error creating return track: {str(e)}"
+
+
+@mcp.tool()
+def duplicate_track(ctx: Context, track_index: int) -> str:
+    """Duplicate a session track with all its devices and clips.
+
+    The copy is inserted directly after the source, so every track below it
+    shifts down by one — call get_session_overview afterwards.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        result = ableton.send_command("duplicate_track", {"track_index": ti})
+        return (
+            f"Duplicated '{result.get('source')}' -> '{result.get('name')}' "
+            f"at index {result.get('index', 0) + 1}. "
+            f"Indices below have shifted; re-check with get_session_overview."
+        )
+    except Exception as e:
+        logger.error(f"Error duplicating track: {str(e)}")
+        return f"Error duplicating track: {str(e)}"
+
+
+@mcp.tool()
+def set_send(ctx: Context, track_index: int, send_index: int, value: float) -> str:
+    """Set how much of a track is sent to a return track.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    - send_index: Return to send to, 1-based (1 = return A, 2 = B, 3 = C).
+    - value: Normalized 0.0-1.0, where 0.0 is no send and 1.0 is full.
+
+    Keep sub and bass tracks dry — reverb on low frequencies is the most
+    common cause of a muddy mix.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        si = _to_zero_based(send_index, "send_index")
+        result = ableton.send_command("set_send", {
+            "track_index": ti,
+            "send_index": si,
+            "value": value,
+        })
+        return (
+            f"Set '{result.get('track_name')}' send "
+            f"{chr(ord('A') + si)} to {result.get('display_value')}"
+        )
+    except Exception as e:
+        logger.error(f"Error setting send: {str(e)}")
+        return f"Error setting send: {str(e)}"
+
+
+@mcp.tool()
+def set_track_state(
+    ctx: Context,
+    track_index: int,
+    mute: bool | None = None,
+    solo: bool | None = None,
+    arm: bool | None = None,
+    color_index: int | None = None,
+) -> str:
+    """Set mute, solo, arm and/or colour on a track. Omitted values are left alone.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    - mute / solo / arm: True or False. Arm fails on tracks that can't be armed.
+    - color_index: Live colour palette index (0-69).
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        payload: dict = {"track_index": ti}
+        for key, val in (
+            ("mute", mute), ("solo", solo), ("arm", arm),
+            ("color_index", color_index),
+        ):
+            if val is not None:
+                payload[key] = val
+        result = ableton.send_command("set_track_state", payload)
+        changed = result.get("changed", {})
+        if not changed:
+            return f"No changes requested for '{result.get('track_name')}'"
+        detail = ", ".join(f"{k}={v}" for k, v in changed.items())
+        return f"Set '{result.get('track_name')}': {detail}"
+    except Exception as e:
+        logger.error(f"Error setting track state: {str(e)}")
+        return f"Error setting track state: {str(e)}"
+
+
+@mcp.tool()
+def create_scene(ctx: Context, index: int = -1) -> str:
+    """Create a new scene.
+
+    Parameters:
+    - index: 1-based position, or -1 for the end of the scene list.
+    """
+    try:
+        ableton = get_ableton_connection()
+        zero_based = -1 if index == -1 else _to_zero_based(index, "index")
+        result = ableton.send_command("create_scene", {"index": zero_based})
+        return (
+            f"Created scene {result.get('index', 0) + 1} "
+            f"({result.get('scene_count')} scenes total)"
+        )
+    except Exception as e:
+        logger.error(f"Error creating scene: {str(e)}")
+        return f"Error creating scene: {str(e)}"
+
+
+@mcp.tool()
+def set_scene_name(ctx: Context, scene_index: int, name: str) -> str:
+    """Rename a scene. Useful for labelling song sections in Session view.
+
+    Parameters:
+    - scene_index: Scene number (1-based).
+    - name: New scene name, e.g. "Verse 1" or "Drop".
+    """
+    try:
+        ableton = get_ableton_connection()
+        si = _to_zero_based(scene_index, "scene_index")
+        result = ableton.send_command("set_scene_name", {
+            "scene_index": si, "name": name,
+        })
+        return f"Renamed scene {result.get('index', 0) + 1} to '{result.get('name')}'"
+    except Exception as e:
+        logger.error(f"Error setting scene name: {str(e)}")
+        return f"Error setting scene name: {str(e)}"
+
+
+@mcp.tool()
+def fire_scene(ctx: Context, scene_index: int) -> str:
+    """Launch a scene, firing every clip in that row.
+
+    Parameters:
+    - scene_index: Scene number (1-based).
+    """
+    try:
+        ableton = get_ableton_connection()
+        si = _to_zero_based(scene_index, "scene_index")
+        result = ableton.send_command("fire_scene", {"scene_index": si})
+        return f"Fired scene {result.get('index', 0) + 1} '{result.get('name')}'"
+    except Exception as e:
+        logger.error(f"Error firing scene: {str(e)}")
+        return f"Error firing scene: {str(e)}"
+
+
+@mcp.tool()
+def set_clip_properties(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    looping: bool | None = None,
+    loop_end: float | None = None,
+    gain: float | None = None,
+    warping: bool | None = None,
+    color_index: int | None = None,
+    quantize_to: int | None = None,
+    quantize_amount: float = 1.0,
+) -> str:
+    """Set clip loop, gain, warp, colour, and optionally quantize it.
+
+    Parameters:
+    - track_index / clip_index: 1-based track and clip slot.
+    - looping: Whether the clip loops.
+    - loop_end: Loop end position in beats.
+    - gain: Audio clip gain, 0.0-1.0 (ignored on MIDI clips).
+    - warping: Whether an audio clip is warped (ignored on MIDI clips).
+    - color_index: Live colour palette index (0-69).
+    - quantize_to: Grid constant — 4 = 1/8, 5 = 1/16, 6 = 1/32.
+    - quantize_amount: 0.0-1.0. Use less than 1.0 to tighten while keeping feel.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        payload: dict = {"track_index": ti, "clip_index": ci,
+                         "quantize_amount": quantize_amount}
+        for key, val in (
+            ("looping", looping), ("loop_end", loop_end), ("gain", gain),
+            ("warping", warping), ("color_index", color_index),
+            ("quantize_to", quantize_to),
+        ):
+            if val is not None:
+                payload[key] = val
+        result = ableton.send_command("set_clip_properties", payload)
+        changed = result.get("changed", {})
+        if not changed:
+            return f"No changes requested for clip '{result.get('clip_name')}'"
+        detail = ", ".join(f"{k}={v}" for k, v in changed.items())
+        return (
+            f"Set '{result.get('clip_name')}' on "
+            f"'{result.get('track_name')}': {detail}"
+        )
+    except Exception as e:
+        logger.error(f"Error setting clip properties: {str(e)}")
+        return f"Error setting clip properties: {str(e)}"
+
+
+@mcp.tool()
 def set_track_volume(ctx: Context, track_index: int, volume: float) -> str:
     """Set the mixer fader volume for a track directly.
 

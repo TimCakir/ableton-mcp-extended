@@ -241,6 +241,12 @@ class AbletonMCP(ControlSurface):
                     params.get("device_index", None),
                     params.get("scene_index", None),
                     params.get("filter", ""))
+            elif command_type == "get_meters":
+                response["result"] = self._get_meters()
+            elif command_type == "get_modulation_targets":
+                response["result"] = self._get_modulation_targets(
+                    params.get("track_index", 0),
+                    params.get("device_index", 0))
             elif command_type == "get_clip_automation":
                 response["result"] = self._get_clip_automation(
                     params.get("track_index", 0),
@@ -263,6 +269,9 @@ class AbletonMCP(ControlSurface):
                                  "write_clip_automation",
                                  "set_clip_launch", "set_clip_follow_action",
                                  "manage_warp_markers",
+                                 "set_device_modulation", "move_device",
+                                 "manage_rack", "control_looper",
+                                 "set_song_scale", "add_notes_extended",
                                  "set_track_name",
                                  "create_clip", "add_notes_to_clip", "set_clip_name",
                                  "set_tempo", "fire_clip", "stop_clip",
@@ -327,6 +336,42 @@ class AbletonMCP(ControlSurface):
                                 params.get("color_index", None),
                                 params.get("quantize_to", None),
                                 params.get("quantize_amount", 1.0))
+                        elif command_type == "set_device_modulation":
+                            result = self._set_device_modulation(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("target", ""),
+                                params.get("source", ""),
+                                params.get("value", 0.0))
+                        elif command_type == "move_device":
+                            result = self._move_device(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("target_track_index", None),
+                                params.get("position", 0))
+                        elif command_type == "manage_rack":
+                            result = self._manage_rack(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("action", "info"),
+                                params.get("value", None))
+                        elif command_type == "control_looper":
+                            result = self._control_looper(
+                                params.get("track_index", 0),
+                                params.get("device_index", None),
+                                params.get("action", "info"))
+                        elif command_type == "set_song_scale":
+                            result = self._set_song_scale(
+                                params.get("root_note", None),
+                                params.get("scale_name", None),
+                                params.get("swing_amount", None),
+                                params.get("clip_trigger_quantization", None))
+                        elif command_type == "add_notes_extended":
+                            result = self._add_notes_extended(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("notes", []),
+                                params.get("replace", False))
                         elif command_type == "write_clip_automation":
                             result = self._write_clip_automation(
                                 params.get("track_index", 0),
@@ -2326,6 +2371,361 @@ class AbletonMCP(ControlSurface):
                     "changed": changed}
         except Exception as e:
             self.log_message("Error setting clip properties: " + str(e))
+            raise
+
+    # Metering, modulation, racks, looper
+
+    def _get_meters(self):
+        """Read output level meters for every track.
+
+        Not a substitute for listening, but it makes level relationships
+        measurable: which track is loudest, whether anything is clipping,
+        whether a part is actually audible in the mix.
+        """
+        try:
+            readings = []
+            tracks = list(self._song.tracks) + list(self._song.return_tracks)
+            for i, t in enumerate(tracks):
+                entry = {"index": i, "name": t.name}
+                for attr in ("output_meter_level", "output_meter_left",
+                             "output_meter_right", "input_meter_level"):
+                    try:
+                        entry[attr] = round(getattr(t, attr), 4)
+                    except Exception:
+                        pass
+                readings.append(entry)
+            master = {"name": "Master"}
+            for attr in ("output_meter_level", "output_meter_left",
+                         "output_meter_right"):
+                try:
+                    master[attr] = round(
+                        getattr(self._song.master_track, attr), 4)
+                except Exception:
+                    pass
+            return {"is_playing": self._song.is_playing,
+                    "tracks": readings, "master": master}
+        except Exception as e:
+            self.log_message("Error reading meters: " + str(e))
+            raise
+
+    def _get_modulation_targets(self, track_index, device_index):
+        """List modulation sources and targets on a device that supports them.
+
+        Wavetable exposes its modulation matrix through the API, so
+        envelope-to-filter and LFO-to-pitch routings can be made
+        programmatically rather than dragged by hand.
+        """
+        try:
+            track = self._track_at(track_index)
+            device = track.devices[device_index]
+            info = {"device": device.name, "supports_modulation": False}
+
+            if not hasattr(device, "visible_modulation_target_names"):
+                info["note"] = (
+                    "This device does not expose a modulation matrix. "
+                    "Wavetable does; most others do not.")
+                return info
+
+            info["supports_modulation"] = True
+            try:
+                info["targets"] = list(device.visible_modulation_target_names)
+            except Exception:
+                info["targets"] = []
+
+            sources = {}
+            for attr in dir(device):
+                if attr.endswith("_source_list") or attr.endswith("_list"):
+                    if "mod_matrix" not in attr and "modulation" not in attr:
+                        continue
+                    try:
+                        sources[attr] = list(getattr(device, attr))
+                    except Exception:
+                        pass
+            info["source_lists"] = sources
+
+            modulatable = []
+            if hasattr(device, "is_parameter_modulatable"):
+                for p in tuple(device.parameters):
+                    try:
+                        if device.is_parameter_modulatable(p):
+                            modulatable.append(p.name)
+                    except Exception:
+                        pass
+            info["modulatable_parameters"] = modulatable
+            return info
+        except Exception as e:
+            self.log_message("Error reading modulation targets: " + str(e))
+            raise
+
+    def _set_device_modulation(self, track_index, device_index, target,
+                               source, value):
+        """Route a modulation source to a parameter and set its depth.
+
+        target is a parameter name on the device (e.g. "Filter 1 Freq"),
+        source is the modulation source name as reported by
+        get_modulation_targets, and value is the depth, -1.0 to 1.0.
+        """
+        try:
+            track = self._track_at(track_index)
+            device = track.devices[device_index]
+
+            if not hasattr(device, "set_modulation_value"):
+                raise ValueError(
+                    "Device '{0}' does not expose a modulation matrix".format(
+                        device.name))
+
+            param = None
+            target_lower = str(target).strip().lower()
+            for p in tuple(device.parameters):
+                if p.name.strip().lower() == target_lower:
+                    param = p
+                    break
+            if param is None:
+                for p in tuple(device.parameters):
+                    if target_lower in p.name.strip().lower():
+                        param = p
+                        break
+            if param is None:
+                raise ValueError("Parameter '{0}' not found on '{1}'".format(
+                    target, device.name))
+
+            if hasattr(device, "is_parameter_modulatable"):
+                if not device.is_parameter_modulatable(param):
+                    raise ValueError(
+                        "'{0}' cannot be modulated".format(param.name))
+
+            if hasattr(device, "add_parameter_to_modulation_matrix"):
+                try:
+                    device.add_parameter_to_modulation_matrix(param)
+                except Exception:
+                    pass
+
+            depth = max(-1.0, min(1.0, float(value)))
+            device.set_modulation_value(param, depth)
+            applied = None
+            try:
+                applied = device.get_modulation_value(param)
+            except Exception:
+                pass
+
+            return {"device": device.name, "parameter": param.name,
+                    "source": source, "depth": depth, "readback": applied}
+        except Exception as e:
+            self.log_message("Error setting modulation: " + str(e))
+            raise
+
+    def _move_device(self, track_index, device_index, target_track_index=None,
+                     position=0):
+        """Move a device to a new position, on the same track or another.
+
+        Device order is signal order, so this is how a chain gets corrected
+        without deleting and reloading — e.g. moving an EQ in front of a
+        compressor so low rumble stops triggering gain reduction.
+        """
+        try:
+            track = self._track_at(track_index)
+            devices = tuple(track.devices)
+            if device_index < 0 or device_index >= len(devices):
+                raise IndexError("Device index {0} out of range on '{1}'".format(
+                    device_index, track.name))
+            device = devices[device_index]
+            target_track = (self._track_at(target_track_index)
+                            if target_track_index is not None else track)
+            self._song.move_device(device, target_track, int(position))
+            return {"device": device.name,
+                    "from_track": track.name,
+                    "to_track": target_track.name,
+                    "position": int(position),
+                    "chain": [d.name for d in target_track.devices]}
+        except Exception as e:
+            self.log_message("Error moving device: " + str(e))
+            raise
+
+    def _manage_rack(self, track_index, device_index, action="info", value=None):
+        """Inspect and control a rack: macros, variations, chain selector."""
+        try:
+            track = self._track_at(track_index)
+            device = track.devices[device_index]
+            if not getattr(device, "can_have_chains", False):
+                raise ValueError("'{0}' is not a rack".format(device.name))
+
+            if action == "info":
+                info = {"device": device.name}
+                for attr in ("variation_count", "selected_variation_index",
+                             "visible_macro_count", "has_macro_mappings",
+                             "is_showing_chains"):
+                    try:
+                        info[attr] = getattr(device, attr)
+                    except Exception:
+                        pass
+                try:
+                    info["chains"] = [c.name for c in device.chains]
+                except Exception:
+                    pass
+                try:
+                    info["macros"] = [
+                        {"name": p.name, "value": p.value}
+                        for p in device.parameters if "Macro" in p.name]
+                except Exception:
+                    pass
+                return info
+            if action == "add_macro":
+                device.add_macro()
+                return {"device": device.name, "action": "add_macro",
+                        "visible_macro_count": device.visible_macro_count}
+            if action == "remove_macro":
+                device.remove_macro()
+                return {"device": device.name, "action": "remove_macro",
+                        "visible_macro_count": device.visible_macro_count}
+            if action == "randomize_macros":
+                device.randomize_macros()
+                return {"device": device.name, "action": "randomize_macros"}
+            if action == "store_variation":
+                device.store_variation()
+                return {"device": device.name, "action": "store_variation",
+                        "variation_count": device.variation_count}
+            if action == "recall_variation":
+                if value is not None:
+                    device.selected_variation_index = int(value)
+                device.recall_selected_variation()
+                return {"device": device.name, "action": "recall_variation",
+                        "selected_variation_index": device.selected_variation_index}
+            if action == "delete_variation":
+                device.delete_selected_variation()
+                return {"device": device.name, "action": "delete_variation",
+                        "variation_count": device.variation_count}
+            if action == "chain_selector":
+                if value is None:
+                    raise ValueError("chain_selector requires a value")
+                selector = device.chain_selector
+                target = selector.min + (selector.max - selector.min) * \
+                    max(0.0, min(1.0, float(value)))
+                selector.value = target
+                return {"device": device.name, "chain_selector": selector.value}
+            raise ValueError("Unknown rack action '{0}'".format(action))
+        except Exception as e:
+            self.log_message("Error managing rack: " + str(e))
+            raise
+
+    def _control_looper(self, track_index, device_index=None, action="info"):
+        """Control a Looper device — record, overdub, play, stop, clear, export."""
+        try:
+            track = self._track_at(track_index)
+            devices = tuple(track.devices)
+            looper = None
+            if device_index is not None:
+                looper = devices[device_index]
+            else:
+                for d in devices:
+                    if d.class_name == "Looper" or "looper" in d.name.lower():
+                        looper = d
+                        break
+            if looper is None:
+                raise ValueError("No Looper found on '{0}'".format(track.name))
+
+            if action == "info":
+                info = {"device": looper.name}
+                for attr in ("loop_length", "tempo", "record_length_index"):
+                    try:
+                        info[attr] = getattr(looper, attr)
+                    except Exception:
+                        pass
+                info["available_actions"] = [
+                    a for a in ("record", "overdub", "play", "stop", "clear",
+                                "undo", "double_length", "half_length",
+                                "double_speed", "half_speed",
+                                "export_to_clip_slot")
+                    if hasattr(looper, a)]
+                return info
+
+            if not hasattr(looper, action):
+                raise ValueError(
+                    "Looper has no action '{0}'. Available: {1}".format(
+                        action, ", ".join(
+                            a for a in dir(looper)
+                            if not a.startswith("_") and callable(
+                                getattr(looper, a, None)))))
+            getattr(looper, action)()
+            return {"device": looper.name, "action": action, "done": True}
+        except Exception as e:
+            self.log_message("Error controlling looper: " + str(e))
+            raise
+
+    def _set_song_scale(self, root_note=None, scale_name=None,
+                        swing_amount=None, clip_trigger_quantization=None):
+        """Set the Set's key/scale, global swing, and clip launch quantization.
+
+        Live 12 tracks a Set-wide root note and scale that scale-aware
+        devices and the MIDI editor follow.
+        """
+        try:
+            changed = {}
+            if root_note is not None:
+                self._song.root_note = int(root_note)
+                changed["root_note"] = self._song.root_note
+            if scale_name is not None:
+                self._song.scale_name = str(scale_name)
+                changed["scale_name"] = self._song.scale_name
+            if swing_amount is not None:
+                self._song.swing_amount = max(0.0, min(1.0, float(swing_amount)))
+                changed["swing_amount"] = self._song.swing_amount
+            if clip_trigger_quantization is not None:
+                self._song.clip_trigger_quantization = int(
+                    clip_trigger_quantization)
+                changed["clip_trigger_quantization"] = \
+                    self._song.clip_trigger_quantization
+            try:
+                changed["scale_intervals"] = list(self._song.scale_intervals)
+            except Exception:
+                pass
+            return {"changed": changed}
+        except Exception as e:
+            self.log_message("Error setting song scale: " + str(e))
+            raise
+
+    def _add_notes_extended(self, track_index, clip_index, notes, replace=False):
+        """Add MIDI notes with per-note probability and velocity deviation.
+
+        The older set_notes API cannot express probability, which is what
+        makes programmed patterns breathe — hats that land 80% of the time
+        rather than every single loop.
+        """
+        try:
+            import Live
+            track = self._track_at(track_index)
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise ValueError("No clip at slot {0}".format(clip_index))
+            clip = slot.clip
+
+            if replace:
+                try:
+                    clip.remove_notes_extended(0, 128, 0.0, clip.length)
+                except Exception:
+                    pass
+
+            specs = []
+            for n in notes:
+                spec = Live.Clip.MidiNoteSpecification(
+                    pitch=int(n.get("pitch", 60)),
+                    start_time=float(n.get("start_time", 0.0)),
+                    duration=float(n.get("duration", 0.25)),
+                    velocity=float(n.get("velocity", 100)),
+                    mute=bool(n.get("mute", False)))
+                for extra in ("probability", "velocity_deviation",
+                              "release_velocity"):
+                    if extra in n:
+                        try:
+                            setattr(spec, extra, float(n[extra]))
+                        except Exception:
+                            pass
+                specs.append(spec)
+
+            clip.add_new_notes(tuple(specs))
+            return {"clip_name": clip.name, "notes_added": len(specs),
+                    "replaced": bool(replace)}
+        except Exception as e:
+            self.log_message("Error adding extended notes: " + str(e))
             raise
 
     # Introspection

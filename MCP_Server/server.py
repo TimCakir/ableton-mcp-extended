@@ -566,6 +566,290 @@ def get_session_overview(ctx: Context) -> str:
 
 
 @mcp.tool()
+def get_meters(ctx: Context) -> str:
+    """Read output level meters for every track and the master.
+
+    Not hearing, but measurement: which track is loudest, whether anything
+    is clipping, whether a part is actually audible. Play the Set first —
+    meters read near zero when stopped.
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command("get_meters")
+        lines = [f"Playing: {r.get('is_playing')}", ""]
+        for t in r.get("tracks", []):
+            level = t.get("output_meter_level")
+            bar = "█" * int(min(1.0, (level or 0)) * 30)
+            lines.append(f"{t['index'] + 1:>3}. {t['name'][:20]:<20} {level} {bar}")
+        m = r.get("master", {})
+        lines.append("")
+        lines.append(f"     MASTER               {m.get('output_meter_level')}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error reading meters: {str(e)}")
+        return f"Error reading meters: {str(e)}"
+
+
+@mcp.tool()
+def get_modulation_targets(ctx: Context, track_index: int, device_index: int) -> str:
+    """List modulation sources and modulatable parameters on a device.
+
+    Wavetable exposes its modulation matrix through the API, so
+    envelope-to-filter and LFO-to-pitch can be routed programmatically.
+    Most other devices do not — this reports which case applies.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        r = ableton.send_command("get_modulation_targets", {
+            "track_index": ti, "device_index": di,
+        })
+        if not r.get("supports_modulation"):
+            return f"'{r.get('device')}': {r.get('note')}"
+        lines = [f"'{r.get('device')}' modulation matrix:", ""]
+        targets = r.get("targets") or []
+        if targets:
+            lines.append("  current targets: " + ", ".join(targets))
+        for name, vals in (r.get("source_lists") or {}).items():
+            lines.append(f"  {name}: {', '.join(str(v) for v in vals[:20])}")
+        mods = r.get("modulatable_parameters") or []
+        if mods:
+            lines.append("")
+            lines.append(f"  modulatable ({len(mods)}): " + ", ".join(mods[:40]))
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error reading modulation targets: {str(e)}")
+        return f"Error reading modulation targets: {str(e)}"
+
+
+@mcp.tool()
+def set_device_modulation(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    target: str,
+    source: str = "",
+    value: float = 0.5,
+) -> str:
+    """Route modulation to a parameter and set its depth (Wavetable etc).
+
+    This is what makes a filter envelope possible without dragging in the
+    UI — e.g. target "Filter 1 Freq" with an envelope source for a plucky
+    filter sweep.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - target: Parameter name to modulate, e.g. "Filter 1 Freq".
+    - source: Modulation source name from get_modulation_targets.
+    - value: Depth, -1.0 to 1.0.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        r = ableton.send_command("set_device_modulation", {
+            "track_index": ti, "device_index": di,
+            "target": target, "source": source, "value": value,
+        })
+        return (
+            f"Modulating '{r.get('parameter')}' on '{r.get('device')}' "
+            f"at depth {r.get('depth')} (readback {r.get('readback')})"
+        )
+    except Exception as e:
+        logger.error(f"Error setting modulation: {str(e)}")
+        return f"Error setting modulation: {str(e)}"
+
+
+@mcp.tool()
+def move_device(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    target_track_index: int | None = None,
+    position: int = 1,
+) -> str:
+    """Move a device within a track's chain, or to another track.
+
+    Device order is signal order, so this fixes a chain without deleting and
+    reloading — e.g. putting an EQ in front of a compressor so low rumble
+    stops triggering gain reduction.
+
+    Parameters:
+    - track_index / device_index: 1-based source.
+    - target_track_index: 1-based destination track, or omit to stay put.
+    - position: 1-based slot to land in.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        payload: dict = {
+            "track_index": ti, "device_index": di,
+            "position": _to_zero_based(position, "position"),
+        }
+        if target_track_index is not None:
+            payload["target_track_index"] = _to_zero_based(
+                target_track_index, "target_track_index")
+        r = ableton.send_command("move_device", payload)
+        chain = " → ".join(r.get("chain") or [])
+        return (
+            f"Moved '{r.get('device')}' to '{r.get('to_track')}' "
+            f"position {r.get('position', 0) + 1}\n  chain: {chain}"
+        )
+    except Exception as e:
+        logger.error(f"Error moving device: {str(e)}")
+        return f"Error moving device: {str(e)}"
+
+
+@mcp.tool()
+def manage_rack(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    action: str = "info",
+    value: float | None = None,
+) -> str:
+    """Inspect and control a rack: macros, variations, chain selector.
+
+    Macro variations are snapshots of all macro positions — the fastest way
+    to build performable presets, and recallable live.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - action: info, add_macro, remove_macro, randomize_macros,
+      store_variation, recall_variation, delete_variation, chain_selector.
+    - value: Variation index for recall_variation, or 0.0-1.0 for
+      chain_selector.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        payload: dict = {"track_index": ti, "device_index": di, "action": action}
+        if value is not None:
+            payload["value"] = value
+        r = ableton.send_command("manage_rack", payload)
+        return "\n".join(f"{k}: {v}" for k, v in r.items())
+    except Exception as e:
+        logger.error(f"Error managing rack: {str(e)}")
+        return f"Error managing rack: {str(e)}"
+
+
+@mcp.tool()
+def control_looper(
+    ctx: Context,
+    track_index: int,
+    action: str = "info",
+    device_index: int | None = None,
+) -> str:
+    """Control a Looper device — record, overdub, play, stop, clear, undo, export.
+
+    For a live duo this is the loop pedal, driven from the Set rather than
+    a footswitch.
+
+    Parameters:
+    - track_index: 1-based track holding the Looper.
+    - action: info, record, overdub, play, stop, clear, undo,
+      double_length, half_length, double_speed, half_speed,
+      export_to_clip_slot.
+    - device_index: 1-based, if the track has more than one Looper.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        payload: dict = {"track_index": ti, "action": action}
+        if device_index is not None:
+            payload["device_index"] = _to_zero_based(device_index, "device_index")
+        r = ableton.send_command("control_looper", payload)
+        return "\n".join(f"{k}: {v}" for k, v in r.items())
+    except Exception as e:
+        logger.error(f"Error controlling looper: {str(e)}")
+        return f"Error controlling looper: {str(e)}"
+
+
+@mcp.tool()
+def set_song_scale(
+    ctx: Context,
+    root_note: int | None = None,
+    scale_name: str | None = None,
+    swing_amount: float | None = None,
+    clip_trigger_quantization: int | None = None,
+) -> str:
+    """Set the Set's key and scale, global swing, and clip launch quantization.
+
+    Live 12 tracks a Set-wide root note and scale that the MIDI editor and
+    scale-aware devices follow — worth setting in a template so every new
+    clip starts in the right key.
+
+    Parameters:
+    - root_note: 0 = C, 1 = C#, ... 9 = A, 11 = B.
+    - scale_name: e.g. "Major", "Minor", "Dorian", "Mixolydian".
+    - swing_amount: 0.0-1.0 global swing.
+    - clip_trigger_quantization: 0 = None, 1 = 8 bars ... typically 4 = 1 bar.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {}
+        for key, val in (
+            ("root_note", root_note), ("scale_name", scale_name),
+            ("swing_amount", swing_amount),
+            ("clip_trigger_quantization", clip_trigger_quantization),
+        ):
+            if val is not None:
+                payload[key] = val
+        if not payload:
+            return "No scale changes requested"
+        r = ableton.send_command("set_song_scale", payload)
+        changed = r.get("changed", {})
+        return "Song: " + ", ".join(f"{k}={v}" for k, v in changed.items())
+    except Exception as e:
+        logger.error(f"Error setting song scale: {str(e)}")
+        return f"Error setting song scale: {str(e)}"
+
+
+@mcp.tool()
+def add_notes_extended(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    notes: list,
+    replace: bool = False,
+) -> str:
+    """Add MIDI notes with per-note probability and velocity deviation.
+
+    The standard note API cannot express probability, which is what makes
+    programmed parts breathe — a hat that lands 80% of the time instead of
+    identically every loop.
+
+    Parameters:
+    - track_index / clip_index: 1-based.
+    - notes: list of {"pitch", "start_time", "duration", "velocity",
+      "mute", "probability" (0.0-1.0), "velocity_deviation",
+      "release_velocity"}.
+    - replace: Clear existing notes first.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        r = ableton.send_command("add_notes_extended", {
+            "track_index": ti, "clip_index": ci,
+            "notes": notes, "replace": replace,
+        })
+        return (
+            f"Added {r.get('notes_added')} notes to '{r.get('clip_name')}'"
+            + (" (replaced existing)" if r.get("replaced") else "")
+        )
+    except Exception as e:
+        logger.error(f"Error adding extended notes: {str(e)}")
+        return f"Error adding extended notes: {str(e)}"
+
+
+@mcp.tool()
 def inspect_lom(
     ctx: Context,
     target: str = "song",

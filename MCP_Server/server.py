@@ -566,6 +566,48 @@ def get_session_overview(ctx: Context) -> str:
 
 
 @mcp.tool()
+def call_lom(
+    ctx: Context,
+    path: str = "song",
+    member: str = "",
+    args: list | None = None,
+    set_value: float | str | bool | None = None,
+) -> str:
+    """Read, set, or call anything in Live's object model. The escape hatch.
+
+    Reaches any part of the Live API without needing a new purpose-built
+    tool first. Undocumented C++ signatures surface as readable errors that
+    state the expected argument types, which is how a signature gets
+    discovered rather than guessed at.
+
+    Parameters:
+    - path: Dotted path from song. Numeric segments index collections, e.g.
+      "tracks.3.devices.0", "return_tracks.0", "scenes.1",
+      "tracks.0.mixer_device.sends.0". All indices here are 0-based, matching
+      the Live API itself.
+    - member: Property or method name. Omit to inspect the object at path.
+    - args: Arguments if member is a method.
+    - set_value: Value to assign if member is a writable property.
+
+    Examples:
+      path="tracks.0", member="name"                  → read a track name
+      path="tracks.0.devices.0", member="parameters"  → list parameters
+      path="song", member="tempo", set_value=124      → set tempo
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {"path": path, "member": member, "args": args or []}
+        if set_value is not None:
+            payload["set_value"] = set_value
+            payload["has_set_value"] = True
+        r = ableton.send_command("call_lom", payload)
+        return json.dumps(r, indent=2)[:6000]
+    except Exception as e:
+        logger.error(f"Error in call_lom: {str(e)}")
+        return f"Error in call_lom: {str(e)}"
+
+
+@mcp.tool()
 def get_meters(ctx: Context) -> str:
     """Read output level meters for every track and the master.
 

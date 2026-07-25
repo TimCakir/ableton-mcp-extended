@@ -269,6 +269,7 @@ class AbletonMCP(ControlSurface):
                                  "write_clip_automation",
                                  "set_clip_launch", "set_clip_follow_action",
                                  "manage_warp_markers",
+                                 "call_lom",
                                  "set_device_modulation", "move_device",
                                  "manage_rack", "control_looper",
                                  "set_song_scale", "add_notes_extended",
@@ -336,6 +337,13 @@ class AbletonMCP(ControlSurface):
                                 params.get("color_index", None),
                                 params.get("quantize_to", None),
                                 params.get("quantize_amount", 1.0))
+                        elif command_type == "call_lom":
+                            result = self._call_lom(
+                                params.get("path", "song"),
+                                params.get("member", ""),
+                                params.get("args", []),
+                                params.get("set_value", None),
+                                params.get("has_set_value", False))
                         elif command_type == "set_device_modulation":
                             result = self._set_device_modulation(
                                 params.get("track_index", 0),
@@ -2373,6 +2381,94 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error setting clip properties: " + str(e))
             raise
 
+    # Generic Live Object Model access
+
+    def _resolve_lom_path(self, path):
+        """Resolve a dotted LOM path like 'tracks.3.devices.0' from song.
+
+        Numeric segments index into collections; everything else is an
+        attribute. 'song' or an empty path returns the song itself.
+        """
+        obj = self._song
+        parts = [p for p in str(path).split(".") if p and p != "song"]
+        for part in parts:
+            if part.isdigit() or (part.startswith("-") and part[1:].isdigit()):
+                obj = obj[int(part)]
+            else:
+                obj = getattr(obj, part)
+        return obj
+
+    def _describe_value(self, value, depth=0):
+        """Turn a LOM value into something JSON can carry."""
+        if isinstance(value, (int, float, bool, str)) or value is None:
+            return value
+        if isinstance(value, (list, tuple)) or hasattr(value, "__len__"):
+            try:
+                items = list(value)
+            except Exception:
+                return "<{0}>".format(type(value).__name__)
+            if depth >= 1:
+                return "<{0} items>".format(len(items))
+            return [self._describe_value(v, depth + 1) for v in items[:64]]
+        for attr in ("name", "display_name"):
+            try:
+                return "<{0} '{1}'>".format(type(value).__name__,
+                                            getattr(value, attr))
+            except Exception:
+                continue
+        return "<{0}>".format(type(value).__name__)
+
+    def _call_lom(self, path, member, args=None, set_value=None,
+                  has_set_value=False):
+        """Read a property, set a property, or call a method anywhere in the LOM.
+
+        The escape hatch: anything Live exposes is reachable without shipping
+        new code first. Undocumented C++ signatures surface as readable
+        errors listing the expected argument types, which is how a signature
+        gets discovered rather than guessed.
+        """
+        try:
+            obj = self._resolve_lom_path(path)
+            if not member:
+                return {"path": path,
+                        "type": type(obj).__name__,
+                        "value": self._describe_value(obj)}
+
+            if not hasattr(obj, member):
+                available = sorted(a for a in dir(obj) if not a.startswith("_"))
+                raise AttributeError(
+                    "'{0}' has no member '{1}'. Available: {2}".format(
+                        type(obj).__name__, member, ", ".join(available[:80])))
+
+            attr = getattr(obj, member)
+
+            if callable(attr):
+                call_args = list(args or [])
+                result = attr(*call_args)
+                return {"path": path, "member": member, "called_with": call_args,
+                        "returned": self._describe_value(result)}
+
+            if has_set_value:
+                current = attr
+                new = set_value
+                if isinstance(current, bool):
+                    new = bool(new)
+                elif isinstance(current, int) and not isinstance(current, bool):
+                    new = int(new)
+                elif isinstance(current, float):
+                    new = float(new)
+                setattr(obj, member, new)
+                return {"path": path, "member": member,
+                        "was": self._describe_value(current),
+                        "now": self._describe_value(getattr(obj, member))}
+
+            return {"path": path, "member": member,
+                    "value": self._describe_value(attr),
+                    "is_callable": False}
+        except Exception as e:
+            self.log_message("Error in call_lom: " + str(e))
+            raise
+
     # Metering, modulation, racks, looper
 
     def _get_meters(self):
@@ -2494,22 +2590,47 @@ class AbletonMCP(ControlSurface):
                     raise ValueError(
                         "'{0}' cannot be modulated".format(param.name))
 
-            if hasattr(device, "add_parameter_to_modulation_matrix"):
+            # The matrix is addressed by integer indices, not parameter
+            # objects: set_modulation_value(target_index, source_index, value).
+            # A parameter must be a visible target before it can be modulated.
+            def target_names():
                 try:
-                    device.add_parameter_to_modulation_matrix(param)
+                    return [str(n) for n in device.visible_modulation_target_names]
                 except Exception:
-                    pass
+                    return []
+
+            names = target_names()
+            if param.name not in names:
+                if hasattr(device, "add_parameter_to_modulation_matrix"):
+                    device.add_parameter_to_modulation_matrix(param)
+                    names = target_names()
+            if param.name not in names:
+                raise ValueError(
+                    "Could not add '{0}' as a modulation target. Visible "
+                    "targets: {1}".format(param.name, ", ".join(names)))
+            target_index = names.index(param.name)
+
+            try:
+                source_index = int(source)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "source must be an integer index into the device's "
+                    "modulation sources (Wavetable: 0 = Env 2, 1 = Env 3, "
+                    "2 = LFO 1, 3 = LFO 2). Got '{0}'.".format(source))
 
             depth = max(-1.0, min(1.0, float(value)))
-            device.set_modulation_value(param, depth)
+            device.set_modulation_value(target_index, source_index, depth)
+
             applied = None
             try:
-                applied = device.get_modulation_value(param)
+                applied = device.get_modulation_value(target_index, source_index)
             except Exception:
                 pass
 
             return {"device": device.name, "parameter": param.name,
-                    "source": source, "depth": depth, "readback": applied}
+                    "target_index": target_index, "source_index": source_index,
+                    "depth": depth, "readback": applied,
+                    "visible_targets": names}
         except Exception as e:
             self.log_message("Error setting modulation: " + str(e))
             raise

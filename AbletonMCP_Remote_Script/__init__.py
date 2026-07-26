@@ -6978,8 +6978,19 @@ class AbletonMCP(ControlSurface):
             "active": True, "status": "recording",
             "track": track.name, "parameter": param.name, "device": owner,
             "from_beat": start_beat, "to_beat": end_beat,
-            "position": start_beat, "samples": 0, "restore": restore,
+            "position": start_beat, "samples": 0, "ticks": 0,
+            "restore": restore,
         }
+
+        # Ticks are ~100 ms. If the playhead somehow never reaches end_beat —
+        # a loop brace switched on by hand mid-pass would do it — the chain
+        # would reschedule itself forever, holding Live in record. Cap it at
+        # a generous multiple of the expected duration.
+        try:
+            expected_ticks = (end_beat - start_beat) * 60.0 / song.tempo * 10.0
+        except Exception:
+            expected_ticks = 600.0
+        max_ticks = int(expected_ticks * 3) + 100
 
         def step():
             current = getattr(self, "_auto_rec", None)
@@ -6988,8 +6999,28 @@ class AbletonMCP(ControlSurface):
             try:
                 now = song.current_song_time
                 current["position"] = now
-                if now >= end_beat or not song.is_playing:
+                # `not is_playing` means the user stopped the transport — but
+                # on the first tick it can also just mean start_playing() has
+                # not been applied yet, and a count-in delays it further.
+                # Treating that as "finished" would abort the pass before it
+                # recorded anything, so only honour it once rolling.
+                stopped = current["samples"] > 0 and not song.is_playing
+                if now >= end_beat or stopped:
+                    # Land exactly on the target. Without this the envelope
+                    # ends at whatever the last tick interpolated, up to one
+                    # tick short of the value that was asked for.
+                    if not stopped:
+                        try:
+                            param.value = pmin + (pmax - pmin) * pts[-1][1]
+                        except Exception:
+                            pass
                     self._finish_auto_rec("done")
+                    return
+                current["ticks"] += 1
+                if current["ticks"] > max_ticks:
+                    self.log_message(
+                        "automation record ran past its tick budget; stopping")
+                    self._finish_auto_rec("timeout")
                     return
                 param.value = pmin + (pmax - pmin) * self._interpolate_points(
                     pts, now)
@@ -7039,7 +7070,9 @@ class AbletonMCP(ControlSurface):
         result["loop"] = song.loop
         if play:
             song.start_playing()
-        result["playing"] = song.is_playing
+        # is_playing read in the same tick as start_playing() still reports the
+        # old value, so report the intent rather than a stale read.
+        result["playing"] = bool(play)
         result["position"] = song.current_song_time
         return result
 

@@ -48,12 +48,36 @@ for dest in "${targets[@]}"; do
   fi
 done
 
-echo
-if [ "$updated" -eq 0 ]; then
-  echo "Everything already current. Nothing to restart."
-else
-  echo "$updated location(s) updated."
-  echo
-  echo "RESTART ABLETON LIVE — it will not pick this up otherwise."
-  echo "Then run get_build_info to confirm all three copies agree."
+# The MCP server is not deployed anywhere — the host imports it at launch —
+# so this script cannot see what the running process has. But it CAN see
+# whether server.py changed since the last deploy, which is the trigger for
+# needing a host restart. Twice the advice given was "restart Ableton" when
+# server.py had gained new tools and Claude Code needed restarting too; the
+# tools then appeared missing and looked like Live limitations.
+SERVER="$REPO/MCP_Server/server.py"
+STAMP="$REPO/.deploy-server-hash"
+server_changed=0
+if [ -f "$SERVER" ]; then
+  now="$(shasum "$SERVER" | cut -d' ' -f1)"
+  [ -f "$STAMP" ] && prev="$(cat "$STAMP")" || prev=""
+  [ "$now" != "$prev" ] && server_changed=1
+  printf '%s' "$now" > "$STAMP"
 fi
+
+echo
+if [ "$updated" -eq 0 ] && [ "$server_changed" -eq 0 ]; then
+  echo "Everything already current. Nothing to restart."
+  exit 0
+fi
+
+[ "$updated" -gt 0 ] && echo "$updated remote-script location(s) updated." || true
+echo
+if [ "$updated" -gt 0 ]; then
+  echo "  RESTART ABLETON LIVE      — it only reads the remote script at startup."
+fi
+if [ "$server_changed" -eq 1 ]; then
+  echo "  RESTART CLAUDE CODE       — server.py changed; the host only re-imports"
+  echo "                              it on restart, so new tools stay invisible."
+fi
+echo
+echo "Then run get_build_info and believe what it says — all three must match."

@@ -37,7 +37,7 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-07-26.14"
+SERVER_BUILD_ID = "2026-07-26.15"
 
 @dataclass
 class AbletonConnection:
@@ -5773,13 +5773,23 @@ def create_arrangement_midi_clip(
         return f"Error creating arrangement MIDI clip: {str(e)}"
 
 
-def _db(level: float) -> str:
-    """Live's normalised meter level as an approximate dB string."""
-    if level <= 0.0001:
-        return "-inf"
-    import math
-    # Live's meter taper: 0.85 reads as 0 dB on the fader scale.
-    return f"{20 * math.log10(level / 0.85):+.1f}"
+def _level(value: float) -> str:
+    """Format Live's normalised meter level.
+
+    Deliberately NOT converted to dB. An earlier version printed
+    `20*log10(level/0.85)` and reported the main bus at "-0.4 dB" for a
+    section whose bounced file measured -8.3 dBFS — an 8 dB error, in the
+    direction that makes a healthy mix look like it is clipping.
+
+    `output_meter_level` is a normalised display value on Live's own meter
+    taper, which is not logarithmic in any published way, so any dB figure
+    derived from it is invented. The raw value compares tracks against each
+    other honestly, which is what this is for. For true dBFS, bounce the
+    section with `bounce_to_audio` and measure the file.
+    """
+    if value <= 0.0001:
+        return "  --  "
+    return f"{value:.3f}"
 
 
 @mcp.tool()
@@ -5858,9 +5868,15 @@ def measure_section(
         if not taken:
             return "No meter readings were taken — did the transport roll?"
 
+        loudest = max((s["peak"] for s in collected.values()), default=1.0) or 1.0
         lines = [
             f"Bars {from_bar}-{to_bar - 1} ({beats:g} beats, {taken} samples)",
-            f"{'track':<16} {'peak':>8} {'avg':>8}  audible",
+            "Live meter units 0-1, NOT dBFS — good for comparing tracks to "
+            "each other.",
+            "For absolute levels, bounce_to_audio the section and measure the "
+            "file.",
+            "",
+            f"{'track':<16} {'peak':>7} {'avg':>7}  audible",
         ]
         silent = []
         for name, s in collected.items():
@@ -5868,11 +5884,15 @@ def measure_section(
             pct = 100 * s["audible"] / max(s["n"], 1)
             if s["peak"] <= 0.01:
                 silent.append(name)
+            bar = "#" * int(round(20 * s["peak"] / loudest))
             lines.append(
-                f"{name[:16]:<16} {_db(s['peak']):>8} {_db(mean):>8}  {pct:3.0f}%")
-        lines.append(f"{'MASTER':<16} {_db(master_peak):>8}")
-        if master_peak >= 1.0:
-            lines.append("\nMASTER IS CLIPPING — pull the mix down.")
+                f"{name[:16]:<16} {_level(s['peak']):>7} {_level(mean):>7} "
+                f"{pct:3.0f}%  {bar}")
+        lines.append(f"{'MASTER':<16} {_level(master_peak):>7}")
+        if master_peak >= 0.999:
+            lines.append(
+                "\nMASTER METER IS PINNED at full scale — almost certainly "
+                "clipping. Confirm by bouncing and measuring the file.")
         if silent:
             lines.append(
                 "\nNever audible in this section: " + ", ".join(silent) +

@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.14"
+BUILD_ID = "2026-07-26.15"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""

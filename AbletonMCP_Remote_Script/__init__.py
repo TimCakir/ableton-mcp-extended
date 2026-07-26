@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.8"
+BUILD_ID = "2026-07-26.9"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -77,9 +77,6 @@ class AbletonMCP(ControlSurface):
         self.server_thread = None
         self.running = False
         
-        # Cache the song reference for easier access
-        self._song = self.song()
-
         # In-flight arrangement-automation record pass, if any
         self._auto_rec = self._auto_rec_state_default()
 
@@ -91,6 +88,24 @@ class AbletonMCP(ControlSurface):
         # Show a message in Ableton
         self.show_message("AbletonMCP: Listening for commands on port " + str(DEFAULT_PORT))
     
+    @property
+    def _song(self):
+        """The document Live has open RIGHT NOW.
+
+        This used to be captured once in __init__ and reused by ~200 call
+        sites. Live replaces the Song object when a different Set is opened,
+        so after the user switched documents every one of those call sites was
+        addressing the previous Set — reads returned the old Set's contents
+        and writes would have gone somewhere invisible.
+
+        It was caught exactly that way: opening a Set with a full arrangement
+        still reported zero arrangement clips, and get_session_overview failed
+        with a raw handle error ("did not match C++ signature:
+        TPyHandle<ASong>") when called during the switch. Resolving fresh
+        costs nothing and removes the whole class.
+        """
+        return self.song()
+
     def disconnect(self):
         """Called when Ableton closes or the control surface is removed"""
         self.log_message("AbletonMCP disconnecting...")
@@ -7104,6 +7119,23 @@ class AbletonMCP(ControlSurface):
                    "loop": song.loop,
                    "return_to_start": bool(return_to_start)}
 
+        # Arrangement record captures ARMED TRACKS as well as parameter moves,
+        # and recording across a range REPLACES whatever is arranged there.
+        # An automation pass needs no armed track at all, so disarm everything
+        # for the duration. Without this, writing a filter sweep over bars
+        # 33-49 would silently punch out the clips on whichever track happened
+        # to be armed — destroying arranged material as a side effect of
+        # writing automation to an unrelated track.
+        arm_map = []
+        for index, other in enumerate(tuple(song.tracks)):
+            try:
+                arm_map.append((index, bool(other.arm)))
+                if other.arm:
+                    other.arm = False
+            except Exception:
+                pass
+        restore["arm_map"] = arm_map
+
         # A loop would send the playhead back and re-record over the pass.
         song.loop = False
         song.start_time = start_beat
@@ -7233,6 +7265,17 @@ class AbletonMCP(ControlSurface):
                    "return_to_start": bool(return_to_start),
                    "arm_map": arm_map}
 
+        # Disarm every other track first. Any track left armed also records,
+        # replacing whatever is arranged on it across the same range — so
+        # punching a vocal take over bars 33-49 would quietly destroy bars
+        # 33-49 of an unrelated armed track. Exclusive arm usually does this,
+        # but it is a preference and cannot be relied on.
+        for other in tuple(song.tracks):
+            try:
+                if other.arm and other != track:
+                    other.arm = False
+            except Exception:
+                pass
         if arm_track:
             track.arm = True
         song.loop = False

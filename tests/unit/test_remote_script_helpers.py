@@ -5,6 +5,8 @@ import sys
 import types
 from unittest.mock import MagicMock
 
+import pytest
+
 
 class _StubControlSurface:
     def __init__(self, c_instance):
@@ -72,11 +74,45 @@ class _GroupTrack:
 def _make_script(tracks=()):
     script = AbletonMCP.__new__(AbletonMCP)
     script.log_message = lambda _msg: None
-    script._song = MagicMock()
-    script._song.tracks = list(tracks)
-    script._song.return_tracks = []
-    script._song.master_track = MagicMock()
+    # `_song` is a read-only property that resolves song() on every access,
+    # because Live swaps the Song object when a different Set is opened. Stub
+    # the source, not the property. The same mock comes back each time, so
+    # tests can still do script._song.cue_points = (...).
+    song = MagicMock()
+    song.tracks = list(tracks)
+    song.return_tracks = []
+    song.master_track = MagicMock()
+    script.song = lambda: song
     return script
+
+
+class TestSongIsResolvedFresh:
+    """Live swaps the Song object when a different Set is opened.
+
+    This was cached once in __init__ and reused by ~200 call sites, so after
+    the user switched Sets everything addressed the *previous* document: a Set
+    with a full arrangement reported zero arrangement clips, and
+    get_session_overview died on a raw `TPyHandle<ASong>` signature error.
+    """
+
+    def test_song_follows_a_document_change(self):
+        script = AbletonMCP.__new__(AbletonMCP)
+        template, real_set = MagicMock(name="template"), MagicMock(name="set")
+        current = [template]
+        script.song = lambda: current[0]
+
+        assert script._song is template
+        current[0] = real_set           # user opens a different Set
+        assert script._song is real_set, (
+            "_song is stale after a document change — every call site is now "
+            "addressing the Set that was open at startup")
+
+    def test_song_cannot_be_re_cached_by_assignment(self):
+        """A future edit reintroducing `self._song = ...` must fail loudly."""
+        script = AbletonMCP.__new__(AbletonMCP)
+        script.song = lambda: MagicMock()
+        with pytest.raises(AttributeError):
+            script._song = MagicMock()
 
 
 class TestGetTrackInfoOnGroupTrack:

@@ -165,10 +165,63 @@ after any structural change.
 e.g. the tool `duplicate_clip_to_arrangement` sends `duplicate_to_arrangement`,
 and it takes `destination_time` **in beats**, not bar/beat.
 
+### Scale is stored per CLIP as well as per song — `set_song_scale` is not enough
+
+Live 12 keeps a `<ScaleInformation>` block (`Root`, `Name`) on **every clip**, not
+only on the song. A clip bakes in the song's scale **at creation time** and then
+keeps it.
+
+Consequences, all measured on `Love on the Beach` (2026-07-26):
+
+- `set_song_scale` writes only the song-level field. In that Set, **271 of 280 clips
+  carried `Root=0, Name=0` (C Major)**; the only 9 holding `Root=9, Name=1` (A Minor)
+  were the ones created *after* the call.
+- With `InKey = true`, the global key display follows the selected clip, so a Set
+  full of stale clips **re-asserts the old scale** and the next save persists it.
+  This reverted twice and read as spontaneous.
+- The origin was the **template**: its song-level scale was C Major, so every clip
+  in every song grown from it was born in C Major. Fix a template's scale while it
+  is still empty — there are no per-clip fields to chase, which is the whole
+  asymmetry. `set_song_scale`'s own docstring already says exactly this ("worth
+  setting in a template so every new clip starts in the right key"); the knowledge
+  was present and simply not applied.
+- `Name` is an index into Live's scale list: `0` = Major, `1` = Minor.
+- **Nothing is transposed by any of this.** It is editor highlighting and
+  scale-aware-device behaviour, not note data.
+
+There is currently no tool for per-clip scale — see `TOOLING-BACKLOG.md`.
+
+### The API reports memory; only the saved file reports what survived
+
+Reading a value back confirms the **write landed**. It says nothing about whether
+the value will still be there after a save. Those are different questions, and
+answering the first while reporting the second is how the scale bug above hid for
+five consecutive saves.
+
+For anything that must persist, verify the file:
+
+```bash
+gunzip -c "Song.als" | tr '>' '>\n' | grep -A2 '<ScaleInformation'
+```
+
+`.als` is gzipped XML. Indentation depth distinguishes scope — a block at **depth 2**
+is song-level; deeper blocks are per-clip.
+
+**`Backup/` is a save-by-save history.** Live writes a copy on every save, so a
+value can be dated to the exact save it changed at. One trap: the timestamp in the
+filename is when the **backup** was written, and its contents are the *previous*
+version — order by file mtime, not by filename, or you will name the wrong save.
+(That mistake was made and corrected the same day.)
+
 ### Do not infer a cause from a state change you did not observe
 Sends were found at zero after clips were deleted, and this was written up as
 "deleting clips resets sends". **It was wrong** — the user had zeroed them by hand.
 Nothing in the API had done it.
+
+A second instance, same shape: `root_note=0 / scale_name="Major"` was written up as
+"the field was never set". That was a guess about history with no evidence behind
+it — the real cause (inherited from the template, then re-asserted by 271 clips) was
+readable from the file the entire time.
 
 The reasoning error: a state change was noticed, a plausible mechanism was
 invented, and it went straight into the docs as a verified fact without being

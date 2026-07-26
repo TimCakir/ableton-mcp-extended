@@ -37,7 +37,7 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-07-26.17"
+SERVER_BUILD_ID = "2026-07-26.18"
 
 @dataclass
 class AbletonConnection:
@@ -3448,49 +3448,39 @@ def manage_song_data(
 @mcp.tool()
 def set_song_options(
     ctx: Context,
-    exclusive_arm: bool | None = None,
-    exclusive_solo: bool | None = None,
-    select_on_launch: bool | None = None,
     tempo_follower_enabled: bool | None = None,
     is_ableton_link_enabled: bool | None = None,
-    count_in_duration: int | None = None,
 ) -> str:
-    """Global behaviour flags. Omitted values are left alone.
+    """Report Live's global behaviour flags; set the two that are settable.
 
-    `exclusive_arm` is the important one: it is why arming a track silently
-    disarms whatever was armed before. Turning it off is the clean fix when
-    several tracks need arming, and it explains a class of "my arm state
-    changed by itself" surprises.
+    Most of these are Live PREFERENCES, mirrored READ-ONLY into the API —
+    probed one at a time, because a property appearing in the object's
+    property list says nothing about whether it has a setter.
 
-    `count_in_duration` delays the transport when recording, which can make
-    a record pass look like it never started.
+    Settable:  tempo_follower_enabled, is_ableton_link_enabled
+    Read-only: exclusive_arm, exclusive_solo, select_on_launch,
+               count_in_duration  (change these in Live's Preferences)
 
-    Parameters:
-    - exclusive_arm / exclusive_solo: One-at-a-time arm / solo.
-    - select_on_launch: Move the selection to a fired clip.
-    - tempo_follower_enabled / is_ableton_link_enabled: Sync options.
-    - count_in_duration: 0 = None, 1 = 1 Bar, 2 = 2 Bars, 3 = 4 Bars
-      (mapping per Cycling '74's LOM reference, not guessed). Anything above
-      0 delays the transport when recording, which is long enough to look
-      like a record pass never started.
+    They are worth reading even when they cannot be written:
+    - `exclusive_arm` explains why creating a track silently disarms
+      whatever was armed before. It does NOT affect arming through the API —
+      several tracks can be armed at once regardless.
+    - `count_in_duration` (0 = None, 1 = 1 Bar, 2 = 2 Bars, 3 = 4 Bars)
+      delays the transport when recording, which makes a record pass look
+      like it never started.
     """
     try:
         ableton = get_ableton_connection()
         payload = {k: v for k, v in {
-            "exclusive_arm": exclusive_arm,
-            "exclusive_solo": exclusive_solo,
-            "select_on_launch": select_on_launch,
             "tempo_follower_enabled": tempo_follower_enabled,
             "is_ableton_link_enabled": is_ableton_link_enabled,
-            "count_in_duration": count_in_duration,
         }.items() if v is not None}
-        if not payload:
-            payload = {}
         r = ableton.send_command("set_song_options", payload)
-        cur = r.get("current") or {}
+        read_only = set(r.get("read_only") or [])
         lines = ["Song options:"]
-        for k, v in cur.items():
-            lines.append(f"  {k:<26} {v}")
+        for k, v in (r.get("current") or {}).items():
+            tag = "  (read-only)" if k in read_only else ""
+            lines.append(f"  {k:<26} {v}{tag}")
         return "\n".join(lines)
     except Exception as e:
         logger.error(f"Error setting song options: {str(e)}")

@@ -187,28 +187,42 @@ class TestRecorderLiveness:
 
 
 class TestStemExportArmHandling:
-    """Stem export arms many tracks at once, which needs exclusive_arm off."""
+    """Stem export arms many tracks at once and must restore the arm map.
 
-    def test_export_stems_disables_and_restores_exclusive_arm(self):
+    An earlier version tried to switch `exclusive_arm` off first. That was
+    wrong twice over: the property is READ-ONLY on Song, and exclusive arm
+    does not apply to arm writes through the API anyway — two resampling
+    tracks armed via the API both read back True. Live's exclusive arm fires
+    when a track is CREATED, which is a different thing entirely.
+    """
+
+    def test_export_stems_does_not_try_to_write_exclusive_arm(self):
         src = _remote_source()
         body = re.search(r'def _export_stems\(.*?\n(.*?)(?=\n    def )',
                          src, re.DOTALL)
         assert body, "_export_stems not found"
-        text = body.group(1)
-        assert 'exclusive_arm = False' in text, (
-            "export_stems must switch exclusive_arm off, or arming each stem "
-            "track disarms the previous one and only the last records")
-        assert 'pre_exclusive' in text, (
-            "export_stems must capture and restore the user's exclusive_arm")
+        assert 'song.exclusive_arm =' not in body.group(1), (
+            "exclusive_arm has no setter — writing it raises and aborts the "
+            "export before any stem is recorded")
 
-    def test_finish_restores_exclusive_arm_before_arm_map(self):
-        """Restoring arm state while exclusive_arm is on would undo itself."""
+    def test_export_stems_restores_the_arm_map(self):
         src = _remote_source()
-        body = re.search(r'def _finish_auto_rec\(.*?\n(.*?)(?=\n    def )',
+        body = re.search(r'def _export_stems\(.*?\n(.*?)(?=\n    def )',
                          src, re.DOTALL).group(1)
-        assert body.index('exclusive_arm') < body.index('arm_map'), (
-            "exclusive_arm must be restored BEFORE the arm map, or exclusive "
-            "arm disarms each track as the next one is restored")
+        assert 'pre_arm' in body and 'arm_map' in body, (
+            "export_stems must capture arm state before arming stem tracks "
+            "and restore it afterwards")
+
+    def test_song_options_never_writes_a_read_only_property(self):
+        """Probed: these four raise \"no setter\" on Song."""
+        src = _remote_source()
+        body = re.search(r'def _set_song_options\(.*?\n(.*?)(?=\n    def )',
+                         src, re.DOTALL).group(1)
+        for name in ('exclusive_arm', 'exclusive_solo', 'select_on_launch',
+                     'count_in_duration'):
+            assert 'setattr(song, "%s"' % name not in body
+            assert 'song.%s =' % name not in body, (
+                "%s is read-only; writing it raises" % name)
 
 
 class TestBuildStamp:

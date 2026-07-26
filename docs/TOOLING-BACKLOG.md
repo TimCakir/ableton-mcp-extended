@@ -42,6 +42,48 @@ replaces positional indexing, which renumbered under its own deletions.
 
 ## Blocking real work
 
+**0. `modify_clip_notes` is broken outright on Live 12.3.8 — BUG, not a gap.**
+Every modification fails, not just some. `transpose`, `velocity_scale`,
+`velocity_set`, `humanize_ms` and `probability` all return:
+
+```
+Clip.apply_note_modifications(Clip, tuple) did not match C++ signature:
+  apply_note_modifications(TPyHandle<AClip>, std::vector<NClipApi::TNoteInfo>)
+```
+
+`_modify_clip_notes` passes `tuple(notes)` where `notes` came straight from
+`get_notes_extended`. *Hypothesis, unverified:* the
+`MidiNote` objects that come out of `get_notes_extended` are not re-submittable and
+need converting to whatever `TNoteInfo` expects. Failures are clean — verified that a
+failed call leaves note velocities untouched.
+
+This is an exposed, documented tool that currently cannot do anything. It also blocks
+transposing a finished song, which is the realistic path if a singer needs a
+different key.
+
+**0b. Per-clip scale has no tool at all.**
+`set_song_scale` writes only the song-level field, but Live 12 stores scale on every
+clip and clips re-assert it (see LIVE-API-FACTS). So the song scale cannot be made to
+*stick* on any Set that already has clips. Needed: either a `scale` option on the
+clip tools, or an `apply_song_scale_to_all_clips` command. Verify `Clip.root_note` /
+`Clip.scale_name` exist via `inspect_lom` before building — do not assume from the
+XML field names.
+
+Real cost already paid: a song's key reverted to C Major twice, and the only
+available fix is 271 individual clip writes.
+
+**0c. Note probability may not survive the write path — unresolved.**
+`_add_notes_extended` sets `probability` with `setattr` on a
+`MidiNoteSpecification` *after* construction, inside a bare `except Exception: pass`.
+Notes written with `probability` come back reading no probability. Cannot yet tell
+whether the write silently fails or `get_clip_notes` cannot read it back, because
+`modify_clip_notes` (the other write path) is broken per item 0.
+
+Suggestive, not conclusive: the `Tops (probability)` clip in `Love on the Beach` —
+documented in `SOUND.md` as 45–75% per note — also reports no probability. Either it
+never wrote, or the readback is blind. Worth resolving because "breathing" patterns
+are a recorded, approved part of that project's sound and may not exist.
+
 **1. Section variation without clip envelopes.**
 Clip envelopes still cannot reach the arrangement, so section-level change comes
 from MIDI content, per-section clip variants, or `record_arrangement_automation`.

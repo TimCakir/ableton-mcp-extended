@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.17"
+BUILD_ID = "2026-07-26.18"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -3081,11 +3081,20 @@ class AbletonMCP(ControlSurface):
             if not clip.is_midi_clip:
                 raise ValueError("'{0}' is an audio clip".format(clip.name))
             span = float(time_span) if time_span is not None else float(clip.length)
-            notes = list(clip.get_notes_extended(
-                int(from_pitch), int(pitch_span), float(from_time), span))
-            if not notes:
+            # Keep Live's own vector. get_notes_extended returns a
+            # MidiNoteVector, and apply_note_modifications wants THAT type
+            # back — its C++ signature is std::vector<NClipApi::TNoteInfo>.
+            # Wrapping it in list()/tuple() made every call fail with
+            # "Clip.apply_note_modifications(Clip, tuple) did not match C++
+            # signature", which left this tool unable to do anything at all.
+            # The documented pattern is: fetch the vector, mutate the notes
+            # in place, hand the same vector back.
+            notes = clip.get_notes_extended(
+                int(from_pitch), int(pitch_span), float(from_time), span)
+            if not len(notes):
                 return {"clip_name": clip.name, "modified": 0}
 
+            probability_error = None
             # Deterministic offsets in beats, derived from tempo.
             beats_per_ms = self._song.tempo / 60000.0
             offsets = [0.0, 0.6, -0.4, 0.9, -0.7, 0.3, -0.2, 0.8]
@@ -3102,19 +3111,43 @@ class AbletonMCP(ControlSurface):
                     shift = offsets[i % len(offsets)] * float(humanize_ms) * beats_per_ms
                     n.start_time = max(0.0, float(n.start_time) + shift)
                 if probability is not None:
+                    # Was swallowed by a bare `except: pass`, so a build where
+                    # MidiNote has no probability looked identical to one that
+                    # wrote it — which is why "notes come back with no
+                    # probability" could not be diagnosed. Record the outcome
+                    # instead of hiding it.
                     try:
                         n.probability = max(0.0, min(1.0, float(probability)))
-                    except Exception:
-                        pass
+                        probability_error = None
+                    except Exception as exc:
+                        probability_error = str(exc)
 
-            clip.apply_note_modifications(tuple(notes))
-            return {"clip_name": clip.name, "track_name": track.name,
-                    "modified": len(notes),
-                    "applied": {"transpose": transpose,
-                                "velocity_scale": velocity_scale,
-                                "velocity_set": velocity_set,
-                                "humanize_ms": humanize_ms,
-                                "probability": probability}}
+            clip.apply_note_modifications(notes)
+            result = {"clip_name": clip.name, "track_name": track.name,
+                      "modified": len(notes),
+                      "applied": {"transpose": transpose,
+                                  "velocity_scale": velocity_scale,
+                                  "velocity_set": velocity_set,
+                                  "humanize_ms": humanize_ms,
+                                  "probability": probability}}
+            if probability is not None:
+                result["probability_written"] = probability_error is None
+                if probability_error:
+                    result["probability_error"] = probability_error
+            # Read one note back so the caller can see whether the write
+            # actually landed, rather than trusting the absence of an error.
+            try:
+                check = clip.get_notes_extended(
+                    int(from_pitch), int(pitch_span), float(from_time), span)
+                if len(check):
+                    first = check[0]
+                    result["verify_first_note"] = {
+                        "pitch": first.pitch, "velocity": round(first.velocity, 2),
+                        "start_time": round(first.start_time, 4),
+                        "probability": getattr(first, "probability", None)}
+            except Exception:
+                pass
+            return result
         except Exception as e:
             self.log_message("Error modifying clip notes: " + str(e))
             raise
@@ -7182,14 +7215,6 @@ class AbletonMCP(ControlSurface):
         # Arming a track makes Live's exclusive arm disarm the others, and
         # nothing reports it — so the whole arm map is captured and put back,
         # disarming everything first so exclusive arm cannot fight the restore.
-        # Stem export switches exclusive_arm off so many tracks can be armed
-        # at once; put the user's setting back before touching arm state, or
-        # the restore itself would disarm what it is trying to restore.
-        if "exclusive_arm" in restore:
-            try:
-                song.exclusive_arm = restore["exclusive_arm"]
-            except Exception:
-                pass
         # freeze_track: deactivate the source only once its bounce is on disk.
         deactivate = restore.get("deactivate_track_index")
         if deactivate is not None:
@@ -7496,17 +7521,26 @@ class AbletonMCP(ControlSurface):
             return {"action": "get", "scope": where, "key": key, "value": got}
         raise ValueError("action must be 'get' or 'set'")
 
-    def _set_song_options(self, **options):
-        """Global behaviour flags that were never wrapped.
+    # Probed one by one rather than assumed: appearing in inspect_lom's
+    # property list says nothing about whether a setter exists.
+    #   writable : tempo_follower_enabled, is_ableton_link_enabled
+    #   READ-ONLY: exclusive_arm, exclusive_solo, select_on_launch,
+    #              count_in_duration  ("property of 'Song' object has no setter")
+    SONG_OPTIONS_WRITABLE = ("tempo_follower_enabled", "is_ableton_link_enabled")
+    SONG_OPTIONS_READONLY = ("exclusive_arm", "exclusive_solo",
+                             "select_on_launch", "count_in_duration")
 
-        `exclusive_arm` is the one that matters: it is the mechanism behind
-        arming a track silently disarming whatever was armed before, which
-        has bitten this integration more than once.
+    def _set_song_options(self, **options):
+        """Report global behaviour flags, and set the two that are settable.
+
+        Most of these are Live PREFERENCES mirrored read-only into the API.
+        They still matter to read: `exclusive_arm` explains why creating a
+        track disarms another, and `count_in_duration` explains a record pass
+        that looks like it never started.
         """
         song = self._song
         changed = {}
-        for name in ("exclusive_arm", "exclusive_solo", "select_on_launch",
-                     "tempo_follower_enabled", "is_ableton_link_enabled"):
+        for name in self.SONG_OPTIONS_WRITABLE:
             val = options.get(name)
             if val is not None:
                 try:
@@ -7515,22 +7549,17 @@ class AbletonMCP(ControlSurface):
                                      "observed": getattr(song, name)}
                 except Exception as exc:
                     changed[name] = {"error": str(exc)}
-        count_in = options.get("count_in_duration")
-        if count_in is not None:
-            try:
-                song.count_in_duration = int(count_in)
-                changed["count_in_duration"] = song.count_in_duration
-            except Exception as exc:
-                changed["count_in_duration"] = {"error": str(exc)}
+        refused = [n for n in self.SONG_OPTIONS_READONLY
+                   if options.get(n) is not None]
         current = {}
-        for name in ("exclusive_arm", "exclusive_solo", "select_on_launch",
-                     "tempo_follower_enabled", "is_ableton_link_enabled",
-                     "count_in_duration"):
+        for name in self.SONG_OPTIONS_WRITABLE + self.SONG_OPTIONS_READONLY:
             try:
                 current[name] = getattr(song, name)
             except Exception:
                 pass
-        return {"changed": changed, "current": current}
+        return {"changed": changed, "current": current,
+                "read_only": list(self.SONG_OPTIONS_READONLY),
+                "refused": refused}
 
     def _delete_return_track(self, return_index):
         """Delete a return track by its position among the returns.
@@ -7619,6 +7648,10 @@ class AbletonMCP(ControlSurface):
             raise ValueError(
                 "No input routing matching '{0}'. Available: {1}".format(
                     source_name, ", ".join(available)))
+        # Routing must be set BEFORE arming. An audio track on "Ext. In"
+        # with no usable audio input silently refuses to arm — arm stays
+        # False with no error, and can_be_armed still reports True. On
+        # "Resampling" it arms immediately.
         track.input_routing_type = chosen
         try:
             track.current_monitoring_state = 2      # Off
@@ -7662,8 +7695,12 @@ class AbletonMCP(ControlSurface):
                 pre_arm.append((i, bool(track.arm)))
             except Exception:
                 pass
-        pre_exclusive = bool(song.exclusive_arm)
-        song.exclusive_arm = False
+        # No exclusive_arm handling here. It is READ-ONLY on Song, and it
+        # turns out not to matter: arming several tracks through the API
+        # leaves them all armed. Live's exclusive arm applies when a track is
+        # CREATED (which is what stole arm from another track earlier), not to
+        # arm writes. Verified by arming two resampling tracks and reading
+        # both back True.
 
         made = []
         try:
@@ -7679,7 +7716,6 @@ class AbletonMCP(ControlSurface):
                     song.delete_track(entry["index"])
                 except Exception:
                     pass
-            song.exclusive_arm = pre_exclusive
             raise
 
         result = self._record_over_range(
@@ -7690,7 +7726,6 @@ class AbletonMCP(ControlSurface):
         # would restore them as armed. Replace it with the map taken before,
         # and put exclusive_arm back too.
         self._auto_rec["restore"]["arm_map"] = pre_arm
-        self._auto_rec["restore"]["exclusive_arm"] = pre_exclusive
         self._auto_rec["stem_track_indices"] = [m["index"] for m in made]
 
         result["stems"] = made

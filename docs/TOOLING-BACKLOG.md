@@ -23,6 +23,16 @@ writable, so a section can be auditioned and metered.
 the running server, and names which is stale. `./deploy.sh` pushes to every path
 Live might read. This was the root cause of most "Live cannot do that" reports.
 
+**Batch envelope.** `batch` runs a list of commands over one connection, through
+the ordinary `_process_command` path. Not registered as mutating, so it runs on
+the client thread and can recurse without deadlocking on its own queue.
+
+**Take recording.** `record_over_range(track, from_bar, to_bar)` punches a take
+without hand-timing the record button.
+
+**Time-range arrangement deletes.** `delete_arrangement_clip(from_bar, to_bar)`
+replaces positional indexing, which renumbered under its own deletions.
+
 ---
 
 ## Blocking real work
@@ -33,20 +43,19 @@ from MIDI content, per-section clip variants, or `record_arrangement_automation`
 Worth a dedicated tool: generate a variant of a clip (drop the kick, thin the
 voicing, double the density) and place it over a bar range in one call.
 
-**2. `delete_arrangement_clip` addressing is fragile.**
-It takes a positional index into `arrangement_clips`, which shifts as clips are
-added or removed — the same class of bug as track-index drift.
-*Fix:* address by time range (`from_time` / `to_time`), which is how arrangement
-edits are actually thought about.
+**2. Reading arrangement automation back.**
+Automation can now be written but not read: there is no envelope object to
+inspect, and `automation_state` only reports *that* a parameter is automated.
+Sampling `param.value` while scrubbing looked unpromising in one observation —
+after a record pass, reading the fader while stopped returned the last value
+set (0.9) rather than the automated one (0.2) — so a stopped-playhead scrub
+probably does not re-evaluate automation. Sampling during playback would, at
+real-time cost. Untested; one experiment, not a plan.
 
 ---
 
 ## Worth having
 
-- **Batch command envelope.** Every call is one socket round-trip (~0.2 s on a
-  persistent connection, ~0.6 s on a fresh one). Building an arrangement took
-  ~260 calls. A `batch` command taking a list of commands would turn minutes into
-  seconds and make large edits practical.
 - **`insert_device` at a position.** Currently devices always append and then need
   `move_device`. Live exposes `Track.insert_device`; signature unverified.
 - **Sample loading into Simpler / drum pads from a file path**, not only a browser

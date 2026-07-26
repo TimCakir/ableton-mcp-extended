@@ -42,6 +42,12 @@ with "parameter not found" while `set_device_parameter` works fine.
 e.g. the tool `duplicate_clip_to_arrangement` sends `duplicate_to_arrangement`,
 and it takes `destination_time` **in beats**, not bar/beat.
 
+### Deleting clips resets mixer sends to zero
+Clips carrying send automation leave the mixer send parameters at 0 once deleted.
+Stripping a set back to a template therefore silently removes all reverb and delay
+routing — and it will not be noticed until something sounds dry days later.
+**After deleting clips, re-assert send levels and verify by reading them back.**
+
 ### Repeated destructive calls can trip the permission classifier
 Deleting many tracks in a row gets blocked. Ask the user to do bulk deletion by
 hand — it is faster for them anyway.

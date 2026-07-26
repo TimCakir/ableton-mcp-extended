@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.7"
+BUILD_ID = "2026-07-26.8"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -6965,7 +6965,8 @@ class AbletonMCP(ControlSurface):
     def _auto_rec_state_default(self):
         return {"active": False, "status": "idle", "track": None,
                 "parameter": None, "device": None, "from_beat": None,
-                "to_beat": None, "position": None, "samples": 0}
+                "to_beat": None, "position": None, "samples": 0,
+                "ticks": 0, "stopped_ticks": 0}
 
     @staticmethod
     def _interpolate_points(pts, t):
@@ -7114,7 +7115,7 @@ class AbletonMCP(ControlSurface):
             "track": track.name, "parameter": param.name, "device": owner,
             "from_beat": start_beat, "to_beat": end_beat,
             "position": start_beat, "samples": 0, "ticks": 0,
-            "restore": restore,
+            "stopped_ticks": 0, "restore": restore,
         }
 
         # Ticks are ~100 ms. If the playhead somehow never reaches end_beat —
@@ -7139,7 +7140,15 @@ class AbletonMCP(ControlSurface):
                 # not been applied yet, and a count-in delays it further.
                 # Treating that as "finished" would abort the pass before it
                 # recorded anything, so only honour it once rolling.
-                stopped = current["samples"] > 0 and not song.is_playing
+                # One not-playing reading is not proof the user stopped: the
+                # transport was observed reading stopped for a moment while a
+                # queued command settled. Ending the pass on that would leave
+                # a silently partial envelope, so require two in a row.
+                if current["samples"] > 0 and not song.is_playing:
+                    current["stopped_ticks"] += 1
+                else:
+                    current["stopped_ticks"] = 0
+                stopped = current["stopped_ticks"] >= 2
                 if now >= end_beat or stopped:
                     # Land exactly on the target. Without this the envelope
                     # ends at whatever the last tick interpolated, up to one
@@ -7236,7 +7245,7 @@ class AbletonMCP(ControlSurface):
             "track": track.name, "parameter": "input (take)", "device": None,
             "from_beat": from_beat, "to_beat": to_beat,
             "position": from_beat, "samples": 0, "ticks": 0,
-            "restore": restore,
+            "stopped_ticks": 0, "restore": restore,
         }
 
         try:
@@ -7252,8 +7261,14 @@ class AbletonMCP(ControlSurface):
             try:
                 now = song.current_song_time
                 current["position"] = now
-                stopped = current["samples"] > 0 and not song.is_playing
-                if now >= to_beat or stopped:
+                # Two consecutive not-playing readings, for the same reason as
+                # the automation recorder: one is not proof, and stopping
+                # early would silently truncate the take.
+                if current["samples"] > 0 and not song.is_playing:
+                    current["stopped_ticks"] += 1
+                else:
+                    current["stopped_ticks"] = 0
+                if now >= to_beat or current["stopped_ticks"] >= 2:
                     self._finish_auto_rec("done")
                     return
                 current["ticks"] += 1

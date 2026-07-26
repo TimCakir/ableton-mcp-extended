@@ -45,12 +45,20 @@ voicing, double the density) and place it over a bar range in one call.
 
 **2. Reading arrangement automation back.**
 Automation can now be written but not read: there is no envelope object to
-inspect, and `automation_state` only reports *that* a parameter is automated.
-Sampling `param.value` while scrubbing looked unpromising in one observation —
-after a record pass, reading the fader while stopped returned the last value
-set (0.9) rather than the automated one (0.2) — so a stopped-playhead scrub
-probably does not re-evaluate automation. Sampling during playback would, at
-real-time cost. Untested; one experiment, not a plan.
+inspect, and `automation_state` only reports *that* a parameter is automated,
+not its shape.
+
+The cheap approach is ruled out. **A stopped transport does not evaluate
+automation** — the parameter holds its last value regardless of where the
+playhead sits. Confirmed on 12.4.3: with the playhead at beat 1.28 and a
+recorded envelope present, `volume` read `0.85` (the pre-record value) while
+stopped, then `0.15` — the true value at that point — the moment the transport
+rolled. So scrubbing `start_time` and sampling will read a constant and look
+like "no automation".
+
+Sampling during playback does work: 0.15 → 0.55 → 0.95 came back in order.
+That makes readback possible but real-time, i.e. reading a 16-bar envelope
+costs 16 bars. Worth wrapping only if something actually needs it.
 
 ---
 

@@ -1,8 +1,14 @@
 # Live API — verified facts and hard limits
 
-Everything here was verified against a **running Live 12.4.1 Suite**, not recalled
+Everything here was verified against a **running Live 12.4.3 Suite**, not recalled
 or read from documentation. Published LOM docs are incomplete and
 version-dependent; the running instance is the only authority.
+
+Re-verified on 12.4.3 after the 12.4.1 → 12.4.3 update: `song.start_time` is
+still writable, playback still starts from it (meters at bar 33 showed CHORDS at
+`0.81` and PLUCK/ARP at `0.57`, both silent at bar 17, with FX/RISER still silent
+until bar 37), and automation recording still writes real arrangement automation
+(`automation_state` 0 → 1, replaying 0.15 → 0.55 → 0.95 unattended).
 
 **Two ways to check something rather than assume it:**
 1. `inspect_lom(target=…, filter=…)` — real properties and methods of a live object.
@@ -67,6 +73,19 @@ build twice.
 Wavetable's cutoff reports as `Flt 1 Freq` in `.name`, but the UI and
 `.original_name` say `Filter 1 Freq`. Match **both**, or automation calls fail
 with "parameter not found" while `set_device_parameter` works fine.
+
+### A stopped transport does not evaluate automation
+
+Reading a parameter while stopped returns whatever value it is holding, not the
+automated value at the playhead. Confirmed on 12.4.3: with a recorded envelope
+present and the playhead at beat 1.28, `volume` read `0.85` while stopped and
+`0.15` — the real value there — as soon as the transport rolled.
+
+So a parameter read that "proves" automation is absent proves nothing unless the
+transport was rolling. Check `song.is_playing` before drawing a conclusion from
+any parameter value; `start_playback` does not always leave it True, and a
+single read of `is_playing == False` has been observed while a queued command
+settled.
 
 ### Creating a track silently disarms whatever was armed
 

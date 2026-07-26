@@ -68,6 +68,17 @@ Wavetable's cutoff reports as `Flt 1 Freq` in `.name`, but the UI and
 `.original_name` say `Filter 1 Freq`. Match **both**, or automation calls fail
 with "parameter not found" while `set_device_parameter` works fine.
 
+### Creating a track silently disarms whatever was armed
+
+Observed, not inferred: `create_midi_track` left the new track armed, and Live's
+exclusive-arm behaviour unarmed the track that had been armed before it. The new
+track was then deleted, and the original track stayed unarmed — the arm was gone
+with no call having touched it.
+
+Nothing reports this. If a scratch track is created for a test, **read the arm
+state first and put it back**, the same way track indices have to be re-read
+after any structural change.
+
 ### Wire command names ≠ MCP tool names
 e.g. the tool `duplicate_clip_to_arrangement` sends `duplicate_to_arrangement`,
 and it takes `destination_time` **in beats**, not bar/beat.

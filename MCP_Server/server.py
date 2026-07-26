@@ -37,7 +37,7 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-07-26.15"
+SERVER_BUILD_ID = "2026-07-26.16"
 
 @dataclass
 class AbletonConnection:
@@ -3469,7 +3469,10 @@ def set_song_options(
     - exclusive_arm / exclusive_solo: One-at-a-time arm / solo.
     - select_on_launch: Move the selection to a fired clip.
     - tempo_follower_enabled / is_ableton_link_enabled: Sync options.
-    - count_in_duration: Index into Live's count-in choices (0 = none).
+    - count_in_duration: 0 = None, 1 = 1 Bar, 2 = 2 Bars, 3 = 4 Bars
+      (mapping per Cycling '74's LOM reference, not guessed). Anything above
+      0 delays the transport when recording, which is long enough to look
+      like a record pass never started.
     """
     try:
         ableton = get_ableton_connection()

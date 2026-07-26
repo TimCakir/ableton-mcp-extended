@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.15"
+BUILD_ID = "2026-07-26.16"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -1536,8 +1536,17 @@ class AbletonMCP(ControlSurface):
             raise
     
     def _set_tempo(self, tempo):
-        """Set the tempo of the session"""
+        """Set the tempo of the session.
+
+        Cycling '74 documents the valid range as 20.0-999.0. Checked here so
+        an out-of-range value reports what is wrong instead of being clamped
+        or rejected somewhere less legible.
+        """
         try:
+            tempo = float(tempo)
+            if not (20.0 <= tempo <= 999.0):
+                raise ValueError(
+                    "Tempo must be 20.0-999.0 BPM, got {0}".format(tempo))
             self._song.tempo = tempo
             
             result = {
@@ -3161,6 +3170,25 @@ class AbletonMCP(ControlSurface):
             elif action != "info":
                 raise ValueError(
                     "action must be info, duplicate_loop, duplicate_region or crop")
+
+            # Cycling '74 documents these as BEATS for MIDI and warped audio
+            # but SECONDS for UNWARPED audio: "loop_start and loop_end are in
+            # absolute clip beat time if clip is MIDI or warped... If the clip
+            # is unwarped audio, they are given in seconds." Same property,
+            # different unit, and no error either way — so a caller thinking
+            # in bars silently writes seconds. Report which unit applies.
+            units = "beats"
+            try:
+                if clip.is_audio_clip and not clip.warping:
+                    units = "seconds"
+            except Exception:
+                pass
+            result["units"] = units
+            if units == "seconds":
+                result["warning"] = (
+                    "UNWARPED audio clip: loop_start, loop_end, start_marker "
+                    "and end_marker are in SECONDS here, not beats. Enable "
+                    "warping to work in musical time.")
 
             for attr in ("length", "loop_start", "loop_end",
                          "start_marker", "end_marker"):

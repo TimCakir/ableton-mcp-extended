@@ -10,7 +10,20 @@ still writable, playback still starts from it (meters at bar 33 showed CHORDS at
 until bar 37), and automation recording still writes real arrangement automation
 (`automation_state` 0 → 1, replaying 0.15 → 0.55 → 0.95 unattended).
 
-**Two ways to check something rather than assume it:**
+**Read the published reference too.** This file previously argued the running
+instance is the only authority, and used that to skip the docs entirely. The
+running instance is authoritative about *what exists*; it says nothing about
+*semantics*. Cycling '74's LOM reference documents units, valid ranges, enum
+meanings and deferral behaviour that no amount of `inspect_lom` will reveal —
+including the deferred-write rule that was rediscovered here three times the
+hard way. Start at
+<https://docs.cycling74.com/apiref/lom/> (per-class reference) and
+<https://docs.cycling74.com/userguide/m4l/live_api_overview/>.
+It documents the Max for Live wrapper over the same object model, so member
+lists can lag this build — cross-check existence with `inspect_lom`, and take
+semantics from the docs.
+
+**Two ways to check what exists rather than assume it:**
 1. `inspect_lom(target=…, filter=…)` — real properties and methods of a live object.
    This is the authority.
 2. `strings` over `/Applications/Ableton Live 12 Suite.app/Contents/App-Resources/MIDI Remote Scripts/_MxDCore/LomTypes.pyc`
@@ -83,6 +96,47 @@ present and the playhead at beat 1.28, `volume` read `0.85` while stopped and
 
 So a parameter read that "proves" automation is absent proves nothing unless the
 transport was actually rolling.
+
+### Deferred writes are a documented Live behaviour, not a quirk of ours
+
+Cycling '74's LOM reference says of `Clip.warping`: *"Internally, Live will
+defer the setting of this property. This has the consequence that if you are
+sequencing API calls from a single event, the actual order of operations may
+differ from what you'd intuitively expect."*
+
+The same class of deferral was hit independently here on `record_mode`,
+`is_playing` and `arm` — three separate bugs, each diagnosed from scratch,
+before reading that this is a known and documented property of the API. **Any
+write may not be visible to a read in the same tick.** Never confirm a write by
+reading it back immediately; report the intent, or re-read on a later tick.
+
+The Max for Live guidance is the same rule in its own idiom: *"changes to a
+Live Set and its contents are not possible from a notification"*, fixed with
+`deferlow`. `schedule_message` is the remote-script equivalent and is why the
+recorders run on Live's tick rather than in a loop.
+
+### The same property can carry different UNITS
+
+`loop_start`, `loop_end` and `playing_position` are in **beats** for MIDI and
+warped audio, and in **seconds** for unwarped audio. No error is raised either
+way, so a caller thinking in bars silently writes seconds. `manage_clip_region`
+now reports which unit applies.
+
+Other documented values worth not guessing:
+
+| Property | Documented values |
+|---|---|
+| `count_in_duration` | 0 = None, 1 = 1 Bar, 2 = 2 Bars, 3 = 4 Bars |
+| `tempo` | 20.0 – 999.0, and may itself be automated |
+| `clip_trigger_quantization` | 0 = None … 13 = 1/32 |
+| Warp marker BPM | segments must stay within [5, 999] |
+| `song.file_path` / `name` | **empty until the Set has been saved** |
+| `visible_tracks` | excludes tracks inside a folded group |
+
+`Clip.start_time` also means different things by context: for arrangement clips
+it is the offset in the arrangement; for session clips it is *the time the clip
+was started*, and it **can be negative**. Only ever range-filter it on
+`arrangement_clips`.
 
 ### `song.is_playing` lags `start_playing()` by several ticks
 

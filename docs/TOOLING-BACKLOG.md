@@ -6,6 +6,40 @@ and what is genuinely impossible.
 
 ---
 
+## START HERE — build 2026-07-26.20, five tools never executed
+
+Run `get_build_info` first. Live and the MCP host were last restarted at build
+`.18`; the repo is at `.20`, so **both need restarting** before any of the below
+can be tested.
+
+**Verified against the real Set (15):** `get_build_info`, `play_section`,
+`batch`, `record_arrangement_automation`, `get_automation_record_status`,
+`cancel_automation_record`, `bounce_to_audio`, `import_audio_file`,
+`insert_device`, `measure_section`, `get_performance_report`,
+`manage_song_data`, `set_song_options`, `delete_arrangement_clip` (bar range),
+`record_over_range` (single stem, real audio at −10.0 dBFS).
+
+**Written but NEVER EXECUTED (5) — treat as unproven:**
+
+| Tool | Status |
+|---|---|
+| `export_stems` (multi-track) | Failed twice, fixed twice. Single stem works. |
+| `freeze_track` | Shares the verified bounce path; deactivation untested. |
+| `capture_session_to_arrangement` | **Destructive.** Scratch scene only. |
+| `modify_clip_notes` | Repair reasoned from the error, never run. |
+| `delete_return_track` | Trivial, but untried. |
+
+**Test `export_stems` on 2–3 named tracks, never all 11 first.** Check each
+file's SSND peak individually and confirm they differ — the failure mode to
+hunt is *only the last stem has audio*. Afterwards check FX / RISER did **not**
+gain a clip across the export range: that bug has occurred once already.
+
+`capture_session_to_arrangement` overwrites the arrangement across its range on
+every track in the scene, and is not undoable through this API. Build a scratch
+MIDI track and a scratch scene for it. Do not point it at `Love on the Beach`.
+
+---
+
 ## Done
 
 **Arrangement-clip note editing.** The note and region tools now take

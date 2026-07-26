@@ -37,7 +37,7 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-07-26.12"
+SERVER_BUILD_ID = "2026-07-26.13"
 
 @dataclass
 class AbletonConnection:
@@ -5607,6 +5607,75 @@ def create_arrangement_midi_clip(
     except Exception as e:
         logger.error(f"Error creating arrangement MIDI clip: {str(e)}")
         return f"Error creating arrangement MIDI clip: {str(e)}"
+
+
+@mcp.tool()
+def import_audio_file(
+    ctx: Context,
+    track_index: int,
+    file_path: str,
+    clip_index: int = 0,
+    bar: int = 0,
+    name: str | None = None,
+) -> str:
+    """Load an audio file into a session clip slot, or into the arrangement.
+
+    `ClipSlot.create_audio_clip` has always existed but only the arrangement
+    path was wrapped, so a rendered, recorded or generated file could be put
+    on the timeline and never auditioned in a session slot. The ElevenLabs
+    subsystem in this repo documents exactly this tool as its route into
+    Ableton, and it was never built on the Ableton side.
+
+    Pairs with `bounce_to_audio` (re-import a bounce), and with anything that
+    writes a file to disk.
+
+    Parameters:
+    - track_index: Track number (1-based). Must be an AUDIO track — to put a
+      sample inside an instrument on a MIDI track use load_sample_to_drum_pad
+      or manage_simpler_sample instead.
+    - file_path: Absolute path to the audio file.
+    - clip_index: Session clip slot (1-based) to load into. Refuses to
+      overwrite an occupied slot.
+    - bar: Arrangement bar (1-based) to place it at instead. Give clip_index
+      OR bar, not both.
+    - name: Optional name for the resulting clip.
+    """
+    try:
+        if not os.path.isabs(file_path):
+            return f"Error: file_path must be absolute, got '{file_path}'"
+        if not os.path.exists(file_path):
+            return (
+                f"Error: no file at '{file_path}'. Live resolves the path "
+                f"itself and fails silently on a missing one, so it is "
+                f"checked here first."
+            )
+        if clip_index and bar:
+            return "Error: give clip_index or bar, not both"
+        if not clip_index and not bar:
+            return "Error: give clip_index (session) or bar (arrangement)"
+
+        ableton = get_ableton_connection()
+        payload: dict = {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "file_path": file_path,
+        }
+        if clip_index:
+            payload["clip_index"] = _to_zero_based(clip_index, "clip_index")
+        else:
+            num, denom = _get_time_signature()
+            payload["position"] = bar_to_beat(bar, num, denom)
+        if name:
+            payload["name"] = name
+
+        r = ableton.send_command("import_audio_file", payload)
+        where = (f"slot {clip_index}" if clip_index else f"bar {bar}")
+        return (
+            f"Loaded '{r.get('name')}' ({r.get('length')} beats) into "
+            f"{where} on '{r.get('track')}'"
+        )
+    except Exception as e:
+        logger.error(f"Error importing audio file: {str(e)}")
+        return f"Error importing audio file: {str(e)}"
 
 
 @mcp.tool()

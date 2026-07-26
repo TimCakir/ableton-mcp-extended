@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.12"
+BUILD_ID = "2026-07-26.13"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -416,6 +416,7 @@ class AbletonMCP(ControlSurface):
                                  "record_over_range",
                                  "bounce_to_audio",
                                  "delete_return_track",
+                                 "import_audio_file",
                                  "cancel_automation_record",
                                  "play_section",
                                  "call_lom", "set_device_sidechain",
@@ -810,6 +811,13 @@ class AbletonMCP(ControlSurface):
                                 params.get("to_beat", 0.0),
                                 params.get("arm_track", True),
                                 params.get("return_to_start", True))
+                        elif command_type == "import_audio_file":
+                            result = self._import_audio_file(
+                                params.get("track_index", 0),
+                                params.get("file_path", ""),
+                                params.get("clip_index", None),
+                                params.get("position", None),
+                                params.get("name", None))
                         elif command_type == "delete_return_track":
                             result = self._delete_return_track(
                                 params.get("return_index", 0))
@@ -2072,6 +2080,67 @@ class AbletonMCP(ControlSurface):
             return track.duplicate_clip_to_arrangement(slot.clip, position)
         finally:
             slot.delete_clip()
+
+    def _import_audio_file(self, track_index, file_path, clip_index=None,
+                           position=None, name=None):
+        """Load an audio file into a session slot, or into the arrangement.
+
+        The bridge that was missing. `ClipSlot.create_audio_clip` has always
+        existed, but only the arrangement path was ever wrapped, so a
+        generated or recorded file could be placed on the timeline and never
+        auditioned in a session slot. The ElevenLabs subsystem in this repo
+        documents an `import_audio_file` tool for exactly this and it was
+        never built on the Ableton side.
+        """
+        track = self._track_at(track_index)
+        if not getattr(track, "has_audio_input", False):
+            raise ValueError(
+                "'{0}' is not an audio track — an audio file needs one. Use "
+                "load_sample_to_drum_pad or manage_simpler_sample to put a "
+                "sample inside an instrument on a MIDI track.".format(
+                    track.name))
+
+        if clip_index is None and position is None:
+            raise ValueError("Give clip_index (session) or position (arrangement)")
+
+        if clip_index is not None:
+            slots = track.clip_slots
+            if clip_index < 0 or clip_index >= len(slots):
+                raise IndexError(
+                    "Clip slot {0} out of range (0-{1})".format(
+                        clip_index, len(slots) - 1))
+            slot = slots[clip_index]
+            if slot.has_clip:
+                raise ValueError(
+                    "Slot {0} on '{1}' already holds '{2}' — delete it first "
+                    "rather than overwriting silently".format(
+                        clip_index, track.name, slot.clip.name))
+            slot.create_audio_clip(file_path)
+            clip = slot.clip
+            if name:
+                try:
+                    clip.name = name
+                except Exception:
+                    pass
+            return {"where": "session", "track": track.name,
+                    "clip_index": clip_index, "name": clip.name,
+                    "length": clip.length, "file_path": file_path}
+
+        track.create_audio_clip(file_path, float(position))
+        placed = None
+        for clip in track.arrangement_clips:
+            if abs(clip.start_time - float(position)) < 0.01:
+                placed = clip
+                break
+        if placed is not None and name:
+            try:
+                placed.name = name
+            except Exception:
+                pass
+        return {"where": "arrangement", "track": track.name,
+                "position": float(position), "file_path": file_path,
+                "name": getattr(placed, "name", None),
+                "length": getattr(placed, "length", None)}
 
     def _create_arrangement_audio_clip(self, track_index, position, file_path):
         """Create audio clip in arrangement from file."""

@@ -12,6 +12,29 @@ and what is genuinely impossible.
 `arrangement=True` and resolve through `_resolve_clip`. Arranged material can be
 read and edited in place.
 
+**`modify_clip_notes` repaired.** It had been broken *outright* on 12.3.8 — not
+partially. `transpose`, `velocity_scale`, `velocity_set`, `humanize_ms` and
+`probability` all failed with:
+
+```
+Clip.apply_note_modifications(Clip, tuple) did not match C++ signature:
+  apply_note_modifications(TPyHandle<AClip>, std::vector<NClipApi::TNoteInfo>)
+```
+
+Cause: `get_notes_extended` returns a **`MidiNoteVector`**, and
+`apply_note_modifications` wants that same type back. Wrapping it in `tuple()` (or
+`list()`) destroyed it. The correct pattern is **fetch the vector, mutate the notes in
+place, hand the same vector back**. Failures were at least clean — a failed call left
+note data untouched, verified by reading velocities back.
+
+Two lessons kept from it:
+- **A bare `except Exception: pass` around an optional property write made this
+  undiagnosable.** A build where `MidiNote` has no `probability` looked identical to
+  one that wrote it successfully. The tool now reports `probability_written` /
+  `probability_error` rather than hiding the outcome.
+- **The tool now reads a note back** (`verify_first_note`) instead of inferring success
+  from the absence of an exception. Worth copying anywhere a write can half-succeed.
+
 **Arrangement automation.** `record_arrangement_automation` writes real track
 automation by recording off the transport. The old belief that this was
 impossible is corrected in `LIVE-API-FACTS.md`. Verified end to end on 12.4.3
@@ -42,26 +65,7 @@ replaces positional indexing, which renumbered under its own deletions.
 
 ## Blocking real work
 
-**0. `modify_clip_notes` is broken outright on Live 12.3.8 — BUG, not a gap.**
-Every modification fails, not just some. `transpose`, `velocity_scale`,
-`velocity_set`, `humanize_ms` and `probability` all return:
-
-```
-Clip.apply_note_modifications(Clip, tuple) did not match C++ signature:
-  apply_note_modifications(TPyHandle<AClip>, std::vector<NClipApi::TNoteInfo>)
-```
-
-`_modify_clip_notes` passes `tuple(notes)` where `notes` came straight from
-`get_notes_extended`. *Hypothesis, unverified:* the
-`MidiNote` objects that come out of `get_notes_extended` are not re-submittable and
-need converting to whatever `TNoteInfo` expects. Failures are clean — verified that a
-failed call leaves note velocities untouched.
-
-This is an exposed, documented tool that currently cannot do anything. It also blocks
-transposing a finished song, which is the realistic path if a singer needs a
-different key.
-
-**0b. Per-clip scale has no tool at all.**
+**0. Per-clip scale has no tool at all.**
 `set_song_scale` writes only the song-level field, but Live 12 stores scale on every
 clip and clips re-assert it (see LIVE-API-FACTS). So the song scale cannot be made to
 *stick* on any Set that already has clips. Needed: either a `scale` option on the
@@ -72,17 +76,26 @@ XML field names.
 Real cost already paid: a song's key reverted to C Major twice, and the only
 available fix is 271 individual clip writes.
 
-**0c. Note probability may not survive the write path — unresolved.**
-`_add_notes_extended` sets `probability` with `setattr` on a
-`MidiNoteSpecification` *after* construction, inside a bare `except Exception: pass`.
-Notes written with `probability` come back reading no probability. Cannot yet tell
-whether the write silently fails or `get_clip_notes` cannot read it back, because
-`modify_clip_notes` (the other write path) is broken per item 0.
+**0b. Note probability — now instrumented, still unanswered.**
+`modify_clip_notes` now reports `probability_written` and any `probability_error`
+instead of swallowing it, and reads a note back as `verify_first_note`. So the
+question is diagnosable — but **nobody has run it against Live yet**, so it is not
+answered.
 
-Suggestive, not conclusive: the `Tops (probability)` clip in `Love on the Beach` —
-documented in `SOUND.md` as 45–75% per note — also reports no probability. Either it
-never wrote, or the readback is blind. Worth resolving because "breathing" patterns
-are a recorded, approved part of that project's sound and may not exist.
+What to run: `modify_clip_notes(..., probability=0.65)` on a narrow pitch window, then
+check `probability_written`, `probability_error` and `verify_first_note`. That
+distinguishes "this build's `MidiNote` has no `probability`" from "the write worked and
+`get_clip_notes` cannot read it back".
+
+Then also settle `_add_notes_extended`, which still sets probability with `setattr` on
+a `MidiNoteSpecification` *after* construction inside a bare `except: pass` — the same
+silent-failure shape that was just removed from `modify_clip_notes`. Notes written
+through it come back reading no probability.
+
+Why it matters: the `Tops (probability)` clip in `Love on the Beach` is documented in
+that project's `SOUND.md` as 45–75% per note, and reports none. Either it never wrote,
+or the readback is blind. Its "breathing" hats are a recorded, Tim-approved part of
+the sound and may not actually exist. Same for the rim-shot ghosts in `AC Garage 110`.
 
 **1. Section variation without clip envelopes.**
 Clip envelopes still cannot reach the arrangement, so section-level change comes

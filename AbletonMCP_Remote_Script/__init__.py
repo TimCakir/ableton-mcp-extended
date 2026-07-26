@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.18"
+BUILD_ID = "2026-07-26.19"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -7613,12 +7613,47 @@ class AbletonMCP(ControlSurface):
         result["source"] = resolved
         return result
 
+    def _route_track_input(self, track, source_name):
+        """Point a track's input at `source_name`, resolved against Live.
+
+        The available list depends on the audio interface and on which other
+        tracks exist, so it is matched rather than assumed. It also reads
+        EMPTY on a track created in the current tick — call this on a later
+        tick than create_audio_track.
+        """
+        wanted = str(source_name).strip().lower()
+        options = tuple(track.available_input_routing_types)
+        chosen = None
+        for routing in options:
+            if routing.display_name.strip().lower() == wanted:
+                chosen = routing
+                break
+        if chosen is None:
+            for routing in options:
+                if wanted in routing.display_name.strip().lower():
+                    chosen = routing
+                    break
+        if chosen is None:
+            raise ValueError(
+                "No input routing matching '{0}'. Available: {1}".format(
+                    source_name,
+                    ", ".join(r.display_name for r in options) or
+                    "(empty — the track was probably created this same tick)"))
+        # Routing must be set BEFORE arming: an audio track on a dead input
+        # silently refuses to arm, with can_be_armed still reporting True.
+        track.input_routing_type = chosen
+        try:
+            track.current_monitoring_state = 2      # Off
+        except Exception:
+            pass
+        return chosen.display_name
+
     def _new_resampling_track(self, source_name, label=None):
         """Add an audio track fed from `source_name`, ready to record.
 
-        Shared by bounce_to_audio, export_stems and freeze_track. Monitoring
-        is forced Off — a resampling track that monitors itself feeds the
-        main bus back into itself.
+        Single-track path (bounce_to_audio, freeze_track). Creating and
+        routing in one tick is fine for ONE track; see _export_stems for why
+        it is not fine for several.
         """
         song = self._song
         song.create_audio_track(-1)
@@ -7629,35 +7664,12 @@ class AbletonMCP(ControlSurface):
                 track.name = label
             except Exception:
                 pass
-
-        wanted = str(source_name).strip().lower()
-        chosen = None
-        for routing in tuple(track.available_input_routing_types):
-            if routing.display_name.strip().lower() == wanted:
-                chosen = routing
-                break
-        if chosen is None:
-            for routing in tuple(track.available_input_routing_types):
-                if wanted in routing.display_name.strip().lower():
-                    chosen = routing
-                    break
-        if chosen is None:
-            available = [r.display_name
-                         for r in tuple(track.available_input_routing_types)]
-            song.delete_track(index)
-            raise ValueError(
-                "No input routing matching '{0}'. Available: {1}".format(
-                    source_name, ", ".join(available)))
-        # Routing must be set BEFORE arming. An audio track on "Ext. In"
-        # with no usable audio input silently refuses to arm — arm stays
-        # False with no error, and can_be_armed still reports True. On
-        # "Resampling" it arms immediately.
-        track.input_routing_type = chosen
         try:
-            track.current_monitoring_state = 2      # Off
+            resolved = self._route_track_input(track, source_name)
         except Exception:
-            pass
-        return index, track, chosen.display_name
+            song.delete_track(index)
+            raise
+        return index, track, resolved
 
     def _export_stems(self, from_beat, to_beat, track_names=None):
         """Bounce every track to its own audio file in ONE transport pass.
@@ -7665,11 +7677,18 @@ class AbletonMCP(ControlSurface):
         The obvious implementation bounces each track separately, costing N
         real-time passes. But an audio track can take ANY track as its input,
         so N resampling tracks can be armed together and captured in a single
-        playthrough — 11 stems for the price of one.
+        playthrough — 11 stems for the price of one. Arming several at once
+        works: exclusive arm applies when a track is CREATED, not to arm
+        writes through the API.
 
-        This requires `exclusive_arm` OFF. With it on, arming each stem track
-        disarms the previous one and only the last would record — which would
-        look like the feature simply not working.
+        Creation and configuration are split across ticks on purpose. A track
+        created in this tick does not yet have its
+        `available_input_routing_types` populated — the list reads EMPTY —
+        so routing them in the same tick worked for the first track and
+        failed on the second with "No input routing matching 'X'. Available:"
+        and nothing after it. Same deferral rule as everywhere else in this
+        API: a thing written (or created) now is not necessarily readable
+        until Live's next tick.
         """
         state = getattr(self, "_auto_rec", None)
         if state and state.get("active"):
@@ -7688,6 +7707,11 @@ class AbletonMCP(ControlSurface):
             sources.append(name)
         if not sources:
             raise ValueError("No matching source tracks")
+        if wanted is not None:
+            missing = wanted - set(n.strip().lower() for n in sources)
+            if missing:
+                raise ValueError(
+                    "No track named: {0}".format(", ".join(sorted(missing))))
 
         pre_arm = []
         for i, track in enumerate(tuple(song.tracks)):
@@ -7695,42 +7719,73 @@ class AbletonMCP(ControlSurface):
                 pre_arm.append((i, bool(track.arm)))
             except Exception:
                 pass
-        # No exclusive_arm handling here. It is READ-ONLY on Song, and it
-        # turns out not to matter: arming several tracks through the API
-        # leaves them all armed. Live's exclusive arm applies when a track is
-        # CREATED (which is what stole arm from another track earlier), not to
-        # arm writes. Verified by arming two resampling tracks and reading
-        # both back True.
 
-        made = []
+        # Tick 1: create the tracks and nothing else.
+        created = []
+        for name in sources:
+            song.create_audio_track(-1)
+            created.append((len(song.tracks) - 1, name))
+
+        self._auto_rec = {
+            "active": True, "status": "preparing",
+            "track": "{0} stems".format(len(created)),
+            "parameter": "stem export", "device": None,
+            "from_beat": from_beat, "to_beat": to_beat,
+            "position": from_beat, "samples": 0, "ticks": 0,
+            "rolling": False, "waiting": 0, "stalled": 0,
+            "restore": {},
+        }
+
+        def configure():
+            # Tick 2: the tracks now exist properly, so route and arm them.
+            made = []
+            try:
+                for index, name in created:
+                    track = song.tracks[index]
+                    try:
+                        track.name = "STEM " + name
+                    except Exception:
+                        pass
+                    resolved = self._route_track_input(track, name)
+                    track.arm = True
+                    made.append({"index": index, "name": track.name,
+                                 "source": resolved})
+                # Clear the placeholder so the pass's own guard lets it start.
+                self._auto_rec = self._auto_rec_state_default()
+                self._record_over_range(
+                    made[0]["index"], from_beat, to_beat,
+                    arm_track=False, solo_arm=False)
+                # The pass captured arm state AFTER the stem tracks were
+                # armed, which would restore them armed. Use the map from
+                # before they existed.
+                self._auto_rec["restore"]["arm_map"] = pre_arm
+                self._auto_rec["parameter"] = "stem export"
+                self._auto_rec["track"] = "{0} stems".format(len(made))
+                self._auto_rec["stems"] = [m["source"] for m in made]
+            except Exception as exc:
+                self.log_message("stem export setup failed: " + str(exc))
+                for index, _ in reversed(created):
+                    try:
+                        song.delete_track(index)
+                    except Exception:
+                        pass
+                self._auto_rec = self._auto_rec_state_default()
+                self._auto_rec["status"] = "failed"
+                self._auto_rec["error"] = str(exc)
+
+        self.schedule_message(1, configure)
+
+        beats = float(to_beat) - float(from_beat)
         try:
-            for name in sources:
-                index, track, resolved = self._new_resampling_track(
-                    name, "STEM " + name)
-                track.arm = True
-                made.append({"index": index, "name": track.name,
-                             "source": resolved})
+            seconds = beats * 60.0 / song.tempo
         except Exception:
-            for entry in reversed(made):
-                try:
-                    song.delete_track(entry["index"])
-                except Exception:
-                    pass
-            raise
-
-        result = self._record_over_range(
-            made[0]["index"], from_beat, to_beat,
-            arm_track=False, solo_arm=False)
-
-        # The pass captured arm state AFTER the stem tracks were armed, which
-        # would restore them as armed. Replace it with the map taken before,
-        # and put exclusive_arm back too.
-        self._auto_rec["restore"]["arm_map"] = pre_arm
-        self._auto_rec["stem_track_indices"] = [m["index"] for m in made]
-
-        result["stems"] = made
-        result["stem_count"] = len(made)
-        return result
+            seconds = None
+        return {"started": True, "stem_count": len(created),
+                "stems": [{"source": n} for _, n in created],
+                "from_beat": from_beat, "to_beat": to_beat,
+                "beats": beats, "estimated_seconds": seconds,
+                "note": "Tracks created; routing and recording start on the "
+                        "next tick. Poll get_automation_record_status."}
 
     def _freeze_track(self, track_index, from_beat, to_beat,
                       deactivate=True):

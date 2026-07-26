@@ -23,6 +23,36 @@ def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
     return AbletonMCP(c_instance)
 
+
+# --- module level, next to DEFAULT_PORT / HOST at the top of the file ---
+
+# Simpler and Sample expose these as bare ints. On the builds tested there is
+# no companion list of display strings to resolve against (unlike routing types
+# or grooves), so these tables are the FALLBACK mapping only: every lookup goes
+# through _simpler_enum_names(), which prefers a real list off the live object
+# whenever one exists. A raw index is always accepted as the escape hatch, and
+# Live itself rejects out-of-range values.
+SIMPLER_PLAYBACK_MODES = ("classic", "one_shot", "slicing")
+SIMPLER_SLICING_PLAYBACK_MODES = ("mono", "poly", "thru")
+SAMPLE_SLICING_STYLES = ("transient", "beat", "region", "manual")
+SAMPLE_WARP_MODES = ("beats", "tones", "texture", "repitch",
+                     "complex", "rex", "complex_pro")
+
+# Companion-list attribute names to probe before falling back to the tables
+# above. Live has never published these for Simpler on the builds tested, but
+# probing costs nothing and means a future build's own strings win.
+SIMPLER_ENUM_LISTS = {
+    "playback_mode": ("playback_mode_list", "available_playback_modes"),
+    "slicing_playback_mode": ("slicing_playback_mode_list",
+                              "available_slicing_playback_modes"),
+    "slicing_style": ("slicing_style_list", "available_slicing_styles"),
+    "warp_mode": ("warp_mode_list", "available_warp_modes"),
+}
+
+
+# --- methods on the AbletonMCP control surface class ---
+
+
 class AbletonMCP(ControlSurface):
     """AbletonMCP Remote Script for Ableton Live"""
     
@@ -251,6 +281,41 @@ class AbletonMCP(ControlSurface):
                     params.get("pitch_span", 128))
             elif command_type == "get_meters":
                 response["result"] = self._get_meters()
+            elif command_type == "get_drift_modulation":
+                response["result"] = self._get_drift_modulation(
+                    params.get("track_index", 0),
+                    params.get("device_index", 0))
+            elif command_type == "get_device_modes":
+                response["result"] = self._get_device_modes(
+                    params.get("track_index", 0),
+                    params.get("device_index", 0),
+                    params.get("chain_index", None))
+            elif command_type == "get_plugin_info":
+                response["result"] = self._get_plugin_info(
+                    params.get("track_index", 0),
+                    params.get("device_index", 0),
+                    params.get("chain_index", None),
+                    params.get("bank", None))
+            elif command_type == "get_device_io":
+                response["result"] = self._get_device_io(
+                    params.get("track_index", 0),
+                    params.get("device_index", 0),
+                    params.get("chain_index", None))
+#     and must NOT go in the mutating command list. ---
+            elif command_type == "get_rack_map":
+                ti = params.get("track_index", 0)
+                di = params.get("device_index", 0)
+                response["result"] = self._get_rack_map(
+                    ti, di,
+                    params.get("include_devices", True),
+                    params.get("pads", "filled"))
+            elif command_type == "get_simpler_info":
+                response["result"] = self._get_simpler_info(
+                    params.get("track_index", 0),
+                    params.get("device_index", 0),
+                    params.get("chain_path", None))
+            elif command_type == "get_application_info":
+                response["result"] = self._get_application_info()
             elif command_type == "get_modulation_targets":
                 response["result"] = self._get_modulation_targets(
                     params.get("track_index", 0),
@@ -282,6 +347,23 @@ class AbletonMCP(ControlSurface):
                                  "undo_step", "transport_action",
                                  "set_mixer_extras", "set_view_detail",
                                  "set_scene_signature",
+                                 "set_drift_modulation",
+                                 "set_device_mode",
+                                 "select_plugin_preset",
+                                 "set_device_io_routing",
+                                 "configure_looper",
+                                 "manage_rack_variations",
+                                 "set_chain_state",
+                                 "manage_drum_pad",
+                                 "set_simpler_playback",
+                                 "manage_simpler_sample",
+                                 "manage_simpler_slices",
+                                 "manage_take_lanes",
+                                 "edit_cue_point",
+                                 "manage_groove_pool",
+                                 "press_dialog_button",
+                                 "control_live_view",
+                                 "manage_tuning_system",
                                  "call_lom", "set_device_sidechain",
                                  "set_device_modulation", "move_device",
                                  "manage_rack", "control_looper",
@@ -415,6 +497,182 @@ class AbletonMCP(ControlSurface):
                                 params.get("numerator", None),
                                 params.get("denominator", None),
                                 params.get("enabled", None))
+                        elif command_type == "set_drift_modulation":
+                            result = self._set_drift_modulation(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("source_1", None),
+                                params.get("target_1", None),
+                                params.get("source_2", None),
+                                params.get("target_2", None),
+                                params.get("source_3", None),
+                                params.get("target_3", None),
+                                params.get("filter_source_1", None),
+                                params.get("filter_source_2", None),
+                                params.get("lfo_source", None),
+                                params.get("pitch_source_1", None),
+                                params.get("pitch_source_2", None),
+                                params.get("shape_source", None),
+                                params.get("voice_count", None),
+                                params.get("voice_mode", None),
+                                params.get("pitch_bend_range", None))
+                        elif command_type == "set_device_mode":
+                            result = self._set_device_mode(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("chain_index", None),
+                                params.get("settings", None))
+                        elif command_type == "select_plugin_preset":
+                            result = self._select_plugin_preset(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("chain_index", None),
+                                params.get("preset", None),
+                                params.get("preset_index", None))
+                        elif command_type == "set_device_io_routing":
+                            result = self._set_device_io_routing(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("bus", None),
+                                params.get("bus_index", 0),
+                                params.get("chain_index", None),
+                                params.get("routing_type", None),
+                                params.get("routing_channel", None))
+#     (~line 445) with this one, then add the three new branches. ---
+                        elif command_type == "manage_rack":
+                            result = self._manage_rack(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("action", "info"),
+                                params.get("value", None),
+                                params.get("count", 1),
+                                params.get("chain_index", None))
+                        elif command_type == "manage_rack_variations":
+                            result = self._manage_rack_variations(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("action", "list"),
+                                params.get("variation_index", None))
+                        elif command_type == "set_chain_state":
+                            result = self._set_chain_state(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("chain_index", None),
+                                params.get("chain_name", None),
+                                params.get("pad_note", None),
+                                params.get("return_chain", False),
+                                params.get("name", None),
+                                params.get("color_index", None),
+                                params.get("mute", None),
+                                params.get("solo", None),
+                                params.get("volume", None),
+                                params.get("panning", None),
+                                params.get("chain_activator", None),
+                                params.get("send_index", None),
+                                params.get("send_value", None))
+                        elif command_type == "manage_drum_pad":
+                            result = self._manage_drum_pad(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("pad_note", 36),
+                                params.get("name", None),
+                                params.get("mute", None),
+                                params.get("solo", None),
+                                params.get("choke_group", None),
+                                params.get("out_note", None),
+                                params.get("copy_to_note", None))
+# --- The three names below MUST also be added to the
+# --- (see REMOTE_COMMAND_NAMES) or they never reach these branches.
+                        elif command_type == "set_simpler_playback":
+                            result = self._set_simpler_playback(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("chain_path", None),
+                                params.get("playback_mode", None),
+                                params.get("slicing_playback_mode", None),
+                                params.get("pad_slicing", None),
+                                params.get("voices", None),
+                                params.get("retrigger", None),
+                                params.get("pitch_bend_range", None),
+                                params.get("note_pitch_bend_range", None))
+                        elif command_type == "manage_simpler_sample":
+                            result = self._manage_simpler_sample(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("chain_path", None),
+                                params.get("action", None),
+                                params.get("start_frames", None),
+                                params.get("start_beats", None),
+                                params.get("end_frames", None),
+                                params.get("end_beats", None),
+                                params.get("gain", None),
+                                params.get("warping", None),
+                                params.get("warp_mode", None),
+                                params.get("warp_as_beats", None))
+                        elif command_type == "manage_simpler_slices":
+                            result = self._manage_simpler_slices(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("chain_path", None),
+                                params.get("action", "info"),
+                                params.get("at_frames", None),
+                                params.get("at_beats", None),
+                                params.get("to_frames", None),
+                                params.get("to_beats", None),
+                                params.get("slicing_style", None),
+                                params.get("beat_division", None),
+                                params.get("region_count", None),
+                                params.get("sensitivity", None))
+                        elif command_type == "manage_take_lanes":
+                            result = self._manage_take_lanes(
+                                params.get("track_index", 0),
+                                params.get("action", "info"),
+                                params.get("lane_index", None),
+                                params.get("name", None),
+                                params.get("include_in_playback", None))
+                        elif command_type == "edit_cue_point":
+                            result = self._edit_cue_point(
+                                params.get("cue_index", None),
+                                params.get("name", None),
+                                params.get("new_name", None),
+                                params.get("time", None),
+                                params.get("jump", False))
+                        elif command_type == "manage_groove_pool":
+                            result = self._manage_groove_pool(
+                                params.get("groove", None),
+                                params.get("base", None),
+                                params.get("quantization_amount", None),
+                                params.get("timing_amount", None),
+                                params.get("random_amount", None),
+                                params.get("velocity_amount", None),
+                                params.get("global_amount", None),
+                                params.get("new_name", None))
+                        elif command_type == "press_dialog_button":
+                            result = self._press_dialog_button(
+                                params.get("button_index", 0))
+                        elif command_type == "control_live_view":
+                            result = self._control_live_view(
+                                params.get("action", "show"),
+                                params.get("view_name", None),
+                                params.get("direction", "down"),
+                                params.get("modifier", False))
+                        elif command_type == "manage_tuning_system":
+                            result = self._manage_tuning_system(
+                                params.get("action", "info"),
+                                params.get("name", None))
+                        elif command_type == "control_looper":
+                            result = self._control_looper(
+                                params.get("track_index", 0),
+                                params.get("device_index", None),
+                                params.get("action", "info"),
+                                params.get("scene_index", None))
+                        elif command_type == "configure_looper":
+                            result = self._configure_looper(
+                                params.get("track_index", 0),
+                                params.get("device_index", None),
+                                params.get("record_length", None),
+                                params.get("overdub_after_record", None),
+                                params.get("tempo", None))
                         elif command_type == "call_lom":
                             result = self._call_lom(
                                 params.get("path", "song"),
@@ -448,11 +706,7 @@ class AbletonMCP(ControlSurface):
                                 params.get("device_index", 0),
                                 params.get("action", "info"),
                                 params.get("value", None))
-                        elif command_type == "control_looper":
-                            result = self._control_looper(
-                                params.get("track_index", 0),
-                                params.get("device_index", None),
-                                params.get("action", "info"))
+
                         elif command_type == "set_song_scale":
                             result = self._set_song_scale(
                                 params.get("root_note", None),
@@ -2876,6 +3130,2922 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error setting scene signature: " + str(e))
             raise
 
+
+    # --- Drift ---------------------------------------------------------
+    # Every Drift enum is an (_index, _list) pair. The _list is a read-only
+    # tuple of display strings; only the _index is writable.
+    DRIFT_ENUMS = [
+        ("source_1", "mod_matrix_source_1"),
+        ("target_1", "mod_matrix_target_1"),
+        ("source_2", "mod_matrix_source_2"),
+        ("target_2", "mod_matrix_target_2"),
+        ("source_3", "mod_matrix_source_3"),
+        ("target_3", "mod_matrix_target_3"),
+        ("filter_source_1", "mod_matrix_filter_source_1"),
+        ("filter_source_2", "mod_matrix_filter_source_2"),
+        ("lfo_source", "mod_matrix_lfo_source"),
+        ("pitch_source_1", "mod_matrix_pitch_source_1"),
+        ("pitch_source_2", "mod_matrix_pitch_source_2"),
+        ("shape_source", "mod_matrix_shape_source"),
+        ("voice_count", "voice_count"),
+        ("voice_mode", "voice_mode"),
+    ]
+
+    def _drift_device(self, track_index, device_index):
+        """Resolve a device and verify it is a Drift."""
+        track, device = self._resolve_device(track_index, device_index)
+        if not hasattr(device, "mod_matrix_source_1_index"):
+            raise ValueError(
+                "'{0}' is not a Drift device".format(device.name))
+        return track, device
+
+    def _drift_options(self, device, base):
+        """Read the display-string tuple for a Drift enum, as a list."""
+        if not hasattr(device, base + "_list"):
+            return []
+        try:
+            return [str(o) for o in getattr(device, base + "_list")]
+        except Exception:
+            return []
+
+    def _drift_read_slot(self, device, base):
+        """Current value of one enum slot as a name, or None if absent.
+
+        Falls back to the raw index when the option list is unavailable.
+        """
+        index_attr = base + "_index"
+        if not hasattr(device, index_attr):
+            return None
+        try:
+            index = getattr(device, index_attr)
+        except Exception:
+            return None
+        options = self._drift_options(device, base)
+        if options and 0 <= index < len(options):
+            return options[index]
+        return index
+
+    def _drift_set_enum(self, device, base, value):
+        """Resolve a name (or raw int) against base + '_list' and set the index.
+
+        Matching order: exact, case-insensitive exact, case-insensitive
+        partial. Never assume the ordering of the list — always look it up.
+        A raw int is only accepted when the option list can be read, so an
+        index can be range-checked rather than blindly trusted.
+        """
+        index_attr = base + "_index"
+        if not hasattr(device, index_attr):
+            return "<not supported>"
+        options = self._drift_options(device, base)
+        if isinstance(value, bool):
+            raise ValueError("'{0}' needs a name or an index".format(base))
+        if isinstance(value, (int, float)) and not isinstance(value, str):
+            if not options:
+                raise ValueError(
+                    "Cannot verify index {0} for {1}: this Live version does "
+                    "not expose {1}_list. Pass a name instead.".format(
+                        value, base))
+            target = int(value)
+            if target < 0 or target >= len(options):
+                raise ValueError(
+                    "Index {0} out of range for {1} (0-{2})".format(
+                        target, base, len(options) - 1))
+        else:
+            wanted = str(value).strip()
+            target = None
+            for i, o in enumerate(options):
+                if o == wanted:
+                    target = i
+                    break
+            if target is None:
+                low = wanted.lower()
+                for i, o in enumerate(options):
+                    if o.strip().lower() == low:
+                        target = i
+                        break
+            if target is None:
+                low = wanted.lower()
+                for i, o in enumerate(options):
+                    if low in o.strip().lower():
+                        target = i
+                        break
+            if target is None:
+                raise ValueError(
+                    "'{0}' is not a valid {1}. Available: {2}".format(
+                        value, base, ", ".join(options) if options else "none"))
+        setattr(device, index_attr, target)
+        new_index = getattr(device, index_attr)
+        if options and 0 <= new_index < len(options):
+            return options[new_index]
+        return new_index
+
+    def _get_drift_modulation(self, track_index, device_index):
+        """Report Drift's whole modulation matrix, voicing and pitch bend.
+
+        Also returns every legal option per slot, so a caller can pick a
+        source or target BY NAME without guessing the ordering.
+        """
+        try:
+            track, device = self._drift_device(track_index, device_index)
+            result = {
+                "track": track.name,
+                "device": device.name,
+                "slots": {},
+                "options": {},
+            }
+            for key, base in self.DRIFT_ENUMS:
+                current = self._drift_read_slot(device, base)
+                if current is None:
+                    continue
+                result["slots"][key] = current
+                result["options"][key] = self._drift_options(device, base)
+            if hasattr(device, "pitch_bend_range"):
+                try:
+                    result["pitch_bend_range"] = device.pitch_bend_range
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            self.log_message("Error reading Drift modulation: " + str(e))
+            raise
+
+    def _set_drift_modulation(self, track_index, device_index,
+                              source_1=None, target_1=None,
+                              source_2=None, target_2=None,
+                              source_3=None, target_3=None,
+                              filter_source_1=None, filter_source_2=None,
+                              lfo_source=None, pitch_source_1=None,
+                              pitch_source_2=None, shape_source=None,
+                              voice_count=None, voice_mode=None,
+                              pitch_bend_range=None):
+        """Rewire Drift's modulation matrix and voicing. Omitted = unchanged."""
+        try:
+            track, device = self._drift_device(track_index, device_index)
+            requested = {
+                "source_1": source_1, "target_1": target_1,
+                "source_2": source_2, "target_2": target_2,
+                "source_3": source_3, "target_3": target_3,
+                "filter_source_1": filter_source_1,
+                "filter_source_2": filter_source_2,
+                "lfo_source": lfo_source,
+                "pitch_source_1": pitch_source_1,
+                "pitch_source_2": pitch_source_2,
+                "shape_source": shape_source,
+                "voice_count": voice_count,
+                "voice_mode": voice_mode,
+            }
+            changed = {}
+            for key, base in self.DRIFT_ENUMS:
+                value = requested.get(key, None)
+                if value is None:
+                    continue
+                changed[key] = self._drift_set_enum(device, base, value)
+
+            if pitch_bend_range is not None:
+                if not hasattr(device, "pitch_bend_range"):
+                    changed["pitch_bend_range"] = "<not supported>"
+                else:
+                    device.pitch_bend_range = int(pitch_bend_range)
+                    changed["pitch_bend_range"] = device.pitch_bend_range
+
+            if not changed:
+                raise ValueError("No Drift changes requested")
+
+            result = {
+                "track": track.name,
+                "device": device.name,
+                "changed": changed,
+                "slots": {},
+            }
+            for key, base in self.DRIFT_ENUMS:
+                current = self._drift_read_slot(device, base)
+                if current is None:
+                    continue
+                result["slots"][key] = current
+            if hasattr(device, "pitch_bend_range"):
+                try:
+                    result["pitch_bend_range"] = device.pitch_bend_range
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            self.log_message("Error setting Drift modulation: " + str(e))
+            raise
+
+    # Members every Device (and every Rack) already has — anything beyond this
+    # list is what makes a device special, and is what get_device_modes reports.
+    _BASE_DEVICE_MEMBERS = (
+        "View", "can_compare_ab", "can_have_chains", "can_have_drum_pads",
+        "can_show_chains", "canonical_parent", "chains", "class_display_name",
+        "class_name", "drum_pads", "has_drum_pads", "has_macro_mappings",
+        "is_active", "is_collapsed", "is_using_compare_preset_b",
+        "latency_in_ms", "latency_in_samples", "name", "parameters",
+        "return_chains", "save_preset_to_compare_ab_slot", "selected_chain",
+        "selected_drum_pad", "selected_variation_index", "store_chosen_bank",
+        "type", "variation_count", "view", "visible_drum_pads",
+        "visible_macro_count")
+
+    def _mode_device(self, track_index, device_index, chain_index=None):
+        """Resolve the device whose modes are being read or written.
+
+        _resolve_device() is deliberately called WITHOUT chain_index: it
+        returns the rack itself for a chain reference, which is not what
+        this tool wants. The chain hop is done here instead.
+        """
+        track, device = self._resolve_device(track_index, device_index)
+        if chain_index is not None:
+            if not getattr(device, "can_have_chains", False):
+                raise ValueError("Device '{0}' is not a rack and has no chains".format(
+                    getattr(device, "name", "?")))
+            chains = list(getattr(device, "chains", []) or [])
+            if chain_index < 0 or chain_index >= len(chains):
+                raise IndexError("Chain index {0} out of range on '{1}' (0-{2})".format(
+                    chain_index, getattr(device, "name", "?"), len(chains) - 1))
+            chain = chains[chain_index]
+            chain_devices = list(getattr(chain, "devices", []) or [])
+            if not chain_devices:
+                raise ValueError("Chain '{0}' has no devices".format(
+                    getattr(chain, "name", "?")))
+            device = chain_devices[0]
+        return track, device
+
+    def _mode_options(self, device, list_attr):
+        """Read a *_list property as a plain list of display strings."""
+        try:
+            return [str(v) for v in getattr(device, list_attr)]
+        except Exception:
+            return []
+
+    def _scan_device_modes(self, device):
+        """Split a device's non-base members into enum pairs and plain values.
+
+        Live models its character switches as a PAIR: a writable integer
+        (either '<name>_index' or plain '<name>') plus a read-only
+        '<name>_list' of display strings. The ordering is per-device and per
+        Live version, so the list is always the authority — never a guess.
+
+        A '<name>_list' whose partner is readable but is NOT an integer (a
+        string, a bool) is not an index pair at all; it is left to the plain
+        values so the setter never tries to write an int into it.
+
+        Returns (enums, values) where enums maps a mode name to a dict with
+        the index attribute, the option strings and the current selection.
+        """
+        names = []
+        for attr in dir(device):
+            if attr.startswith("_") or attr in self._BASE_DEVICE_MEMBERS:
+                continue
+            names.append(attr)
+
+        enums = {}
+        consumed = set()
+        for attr in names:
+            if not attr.endswith("_list"):
+                continue
+            base = attr[:-5]
+            options = self._mode_options(device, attr)
+            if not options:
+                continue
+            index_attr = None
+            if base + "_index" in names:
+                index_attr = base + "_index"
+            elif base in names:
+                index_attr = base
+            if index_attr is None:
+                continue
+            readable = True
+            raw = None
+            try:
+                raw = getattr(device, index_attr)
+            except Exception:
+                readable = False
+            if readable:
+                # bool is a subclass of int, so it has to be excluded first.
+                if isinstance(raw, bool) or not isinstance(raw, int):
+                    continue
+                current_index = int(raw)
+            else:
+                current_index = None
+            current = None
+            if current_index is not None and 0 <= current_index < len(options):
+                current = options[current_index]
+            enums[base] = {
+                "index_attr": index_attr,
+                "options": options,
+                "current_index": current_index,
+                "current": current,
+            }
+            consumed.add(attr)
+            consumed.add(index_attr)
+
+        values = {}
+        for attr in names:
+            if attr in consumed:
+                continue
+            try:
+                value = getattr(device, attr)
+            except Exception:
+                continue
+            if callable(value):
+                continue
+            if isinstance(value, bool) or isinstance(value, (int, float)):
+                values[attr] = value
+            elif isinstance(value, str):
+                values[attr] = value
+        return enums, values
+
+    def _get_device_modes(self, track_index, device_index, chain_index=None):
+        """List every mode switch a device exposes, with its options."""
+        try:
+            track, device = self._mode_device(track_index, device_index, chain_index)
+            enums, values = self._scan_device_modes(device)
+            mode_list = []
+            for name in sorted(enums.keys()):
+                info = enums[name]
+                mode_list.append({
+                    "name": name,
+                    "current": info["current"],
+                    "current_index": info["current_index"],
+                    "options": info["options"],
+                })
+            value_list = []
+            for name in sorted(values.keys()):
+                value_list.append({
+                    "name": name,
+                    "value": self._describe_value(values[name]),
+                })
+            return {
+                "track": getattr(track, "name", "?"),
+                "device": getattr(device, "name", "?"),
+                "class_name": getattr(device, "class_name", ""),
+                "modes": mode_list,
+                "values": value_list,
+            }
+        except Exception as e:
+            self.log_message("Error getting device modes: " + str(e))
+            raise
+
+    def _resolve_mode_choice(self, mode, info, value):
+        """Turn a user-supplied name (or index) into a valid list index."""
+        options = info["options"]
+        if isinstance(value, bool):
+            raise ValueError(
+                "'{0}' expects one of: {1}".format(mode, ", ".join(options)))
+        if isinstance(value, (int, float)):
+            index = int(value)
+        else:
+            wanted = str(value).strip().lower()
+            index = None
+            for i, opt in enumerate(options):
+                if opt.strip().lower() == wanted:
+                    index = i
+                    break
+            if index is None:
+                partial = [i for i, opt in enumerate(options)
+                           if wanted in opt.strip().lower()]
+                if len(partial) == 1:
+                    index = partial[0]
+                elif len(partial) > 1:
+                    raise ValueError("'{0}' is ambiguous for {1}: {2}".format(
+                        value, mode,
+                        ", ".join(options[i] for i in partial)))
+            if index is None and wanted.isdigit():
+                index = int(wanted)
+            if index is None:
+                raise ValueError("'{0}' is not a {1}. Available: {2}".format(
+                    value, mode, ", ".join(options)))
+        if index < 0 or index >= len(options):
+            raise ValueError(
+                "{0} index {1} out of range (0-{2})".format(
+                    mode, index, len(options) - 1))
+        return index
+
+    def _coerce_mode_value(self, device, attr, value):
+        """Coerce a plain (non-enum) member to the type it already holds."""
+        current = None
+        try:
+            current = getattr(device, attr)
+        except Exception:
+            pass
+        if isinstance(current, bool) or isinstance(value, bool):
+            if isinstance(value, str):
+                wanted = value.strip().lower()
+                if wanted in ("on", "true", "yes", "1"):
+                    return True
+                if wanted in ("off", "false", "no", "0"):
+                    return False
+                raise ValueError(
+                    "'{0}' expects on/off, got '{1}'".format(attr, value))
+            return bool(value)
+        if isinstance(current, float):
+            return float(value)
+        if isinstance(current, int):
+            return int(float(value))
+        if isinstance(current, str):
+            return str(value)
+        try:
+            return int(float(value))
+        except Exception:
+            return value
+
+    def _set_device_mode(self, track_index, device_index, chain_index=None,
+                         settings=None):
+        """Set one or more mode switches on a device, resolving names to indices.
+
+        'settings' is an ordered mapping of member name -> value. Enum-style
+        members are matched against their own *_list (never assumed), plain
+        members are coerced to the type they already hold.
+
+        The device is re-scanned after every write. Some of Live's lists are
+        dependent — Hybrid Reverb replaces ir_file_list when ir_category
+        changes — so a cached option list would resolve the second setting
+        against the previous category's files.
+        """
+        try:
+            track, device = self._mode_device(track_index, device_index, chain_index)
+            if not settings:
+                raise ValueError("set_device_mode needs at least one mode to set")
+            enums, values = self._scan_device_modes(device)
+            device_name = getattr(device, "name", "?")
+
+            changed = {}
+            for raw_mode in settings:
+                value = settings[raw_mode]
+                if value is None:
+                    continue
+                mode = str(raw_mode).strip()
+                try:
+                    info = enums.get(mode)
+                    if info is None and mode.endswith("_index"):
+                        info = enums.get(mode[:-6])
+                        if info is not None:
+                            mode = mode[:-6]
+
+                    if info is not None:
+                        index = self._resolve_mode_choice(mode, info, value)
+                        options = info["options"]
+                        try:
+                            setattr(device, info["index_attr"], index)
+                        except Exception as write_error:
+                            raise ValueError(
+                                "'{0}' on '{1}' would not accept '{2}': {3}".format(
+                                    mode, device_name, options[index],
+                                    str(write_error)))
+                        try:
+                            now = int(getattr(device, info["index_attr"]))
+                        except Exception:
+                            now = index
+                        changed[mode] = (options[now]
+                                         if 0 <= now < len(options) else now)
+                    else:
+                        current = None
+                        if mode in values:
+                            current = values[mode]
+                        elif (mode not in self._BASE_DEVICE_MEMBERS
+                              and hasattr(device, mode)):
+                            probe = getattr(device, mode, None)
+                            if callable(probe):
+                                raise ValueError(
+                                    "'{0}' on '{1}' is a method, not a "
+                                    "settable mode".format(mode, device_name))
+                        else:
+                            available = sorted(
+                                list(enums.keys()) + list(values.keys()))
+                            raise ValueError(
+                                "'{0}' has no mode '{1}'. Available: {2}".format(
+                                    device_name, mode, ", ".join(available)))
+                        try:
+                            setattr(device, mode,
+                                    self._coerce_mode_value(device, mode, value))
+                        except ValueError:
+                            raise
+                        except Exception as write_error:
+                            raise ValueError(
+                                "'{0}' on '{1}' is read-only or rejected "
+                                "'{2}': {3}".format(mode, device_name, value,
+                                                    str(write_error)))
+                        changed[mode] = self._describe_value(
+                            getattr(device, mode, current))
+
+                    # Dependent lists (ir_file_list after ir_category) are
+                    # rebuilt by Live on write — re-read, never reuse.
+                    enums, values = self._scan_device_modes(device)
+                except Exception as e:
+                    if changed:
+                        raise ValueError("{0} (already applied: {1})".format(
+                            str(e),
+                            ", ".join("{0} = {1}".format(k, changed[k])
+                                      for k in sorted(changed.keys()))))
+                    raise
+
+            return {
+                "track": getattr(track, "name", "?"),
+                "device": device_name,
+                "class_name": getattr(device, "class_name", ""),
+                "changed": changed,
+            }
+        except Exception as e:
+            self.log_message("Error setting device mode: " + str(e))
+            raise
+
+
+    def _external_device_at(self, track_index, device_index, chain_index=None):
+        """Resolve a device, optionally one nested inside a rack chain.
+
+        Plugins and Max devices are very often parked inside an Instrument or
+        Audio Effect Rack, so external-device tools must be able to reach in.
+        When chain_index is given, device_index addresses the rack and the
+        first device of that chain is returned (same contract as the existing
+        navigate_preset / get_device_parameters commands).
+        """
+        track = self._track_at(track_index)
+        devices = tuple(track.devices)
+        if device_index < 0 or device_index >= len(devices):
+            raise IndexError("Device index {0} out of range on '{1}' (0-{2})".format(
+                device_index, track.name, len(devices) - 1 if devices else 0))
+        device = devices[device_index]
+        if chain_index is not None:
+            if not getattr(device, "can_have_chains", False):
+                raise ValueError("'{0}' is not a rack and has no chains".format(
+                    device.name))
+            chains = tuple(device.chains)
+            if chain_index < 0 or chain_index >= len(chains):
+                raise IndexError("Chain index {0} out of range on '{1}' (0-{2})".format(
+                    chain_index, device.name, len(chains) - 1 if chains else 0))
+            chain = chains[chain_index]
+            if not chain.devices:
+                raise ValueError("Chain '{0}' has no devices".format(chain.name))
+            device = chain.devices[0]
+        return track, device
+
+    def _match_routing_option(self, options, wanted, label):
+        """Pick an element out of an available_* collection by display name.
+
+        Routing properties are typed as Live objects, so they can only ever be
+        assigned an element that came out of the matching available_*
+        collection — a string will not do.
+        """
+        options = list(options)
+        if not options:
+            raise ValueError("No options available for {0}".format(label))
+        wanted_lower = str(wanted).strip().lower()
+        for opt in options:
+            if opt.display_name.strip().lower() == wanted_lower:
+                return opt
+        partial = [o for o in options
+                   if wanted_lower in o.display_name.strip().lower()]
+        if len(partial) == 1:
+            return partial[0]
+        if len(partial) > 1:
+            raise ValueError("'{0}' is ambiguous for {1}, matches: {2}".format(
+                wanted, label, ", ".join(o.display_name for o in partial)))
+        raise ValueError("'{0}' not found for {1}. Available: {2}".format(
+            wanted, label, ", ".join(o.display_name for o in options)))
+
+    def _device_io_buses(self, device):
+        """Map the four Device.IO collections a Max device can expose."""
+        return [
+            ("audio_in", getattr(device, "audio_inputs", None)),
+            ("audio_out", getattr(device, "audio_outputs", None)),
+            ("midi_in", getattr(device, "midi_inputs", None)),
+            ("midi_out", getattr(device, "midi_outputs", None)),
+        ]
+
+    def _describe_device_io(self, io_obj):
+        """Summarise one Device.IO bus."""
+        info = {}
+        for attr in ("routing_type", "routing_channel"):
+            try:
+                info[attr] = getattr(io_obj, attr).display_name
+            except Exception:
+                info[attr] = None
+        for attr, key in (("available_routing_types", "available_types"),
+                          ("available_routing_channels", "available_channels")):
+            try:
+                info[key] = [x.display_name for x in getattr(io_obj, attr)]
+            except Exception:
+                info[key] = []
+        try:
+            info["default_external_routing_channel_is_none"] = \
+                io_obj.default_external_routing_channel_is_none
+        except Exception:
+            pass
+        return info
+
+    def _describe_device_parameter(self, param, index):
+        """One parameter, in the same shape _get_device_parameters returns.
+
+        value is normalized 0.0-1.0 so it can be round-tripped straight into
+        set_device_parameter; index is the 0-based position in
+        device.parameters, which is what parameter_index addresses.
+        """
+        pmin = param.min
+        pmax = param.max
+        raw = param.value
+        norm = (raw - pmin) / (pmax - pmin) if pmax != pmin else 0.0
+        entry = {
+            "index": index,
+            "name": param.name,
+            "value": round(norm, 4),
+            "raw_value": raw,
+            "min": pmin,
+            "max": pmax,
+            "display_value": str(param),
+        }
+        try:
+            entry["is_quantized"] = bool(param.is_quantized)
+        except Exception:
+            entry["is_quantized"] = False
+        return entry
+
+    def _get_plugin_info(self, track_index, device_index, chain_index=None,
+                         bank=None):
+        """Report what a VST/AU plugin or Max for Live device actually exposes.
+
+        A plugin is a black box to Live: only the parameters the plugin
+        publishes (or that were mapped by hand in Configure mode) exist in the
+        API. This says which of them there are, how the plugin groups them into
+        banks, and which of its own programs/presets is selected.
+        """
+        try:
+            track, device = self._external_device_at(
+                track_index, device_index, chain_index)
+
+            class_name = getattr(device, "class_name", "")
+            all_params = list(getattr(device, "parameters", []))
+            info = {
+                "track": track.name,
+                "device": device.name,
+                "class_name": class_name,
+                "is_plugin": class_name == "PluginDevice",
+                "is_max_device": class_name == "MaxDevice",
+                "parameter_count": len(all_params),
+            }
+
+            presets = []
+            try:
+                presets = [str(p) for p in getattr(device, "presets", [])]
+            except Exception:
+                presets = []
+            info["presets"] = presets
+            info["preset_count"] = len(presets)
+            info["selected_preset_index"] = None
+            info["selected_preset"] = None
+            if presets and hasattr(device, "selected_preset_index"):
+                try:
+                    idx = int(device.selected_preset_index)
+                    info["selected_preset_index"] = idx
+                    if 0 <= idx < len(presets):
+                        info["selected_preset"] = presets[idx]
+                except Exception:
+                    pass
+
+            bank_count = 0
+            if hasattr(device, "get_bank_count"):
+                try:
+                    bank_count = int(device.get_bank_count())
+                except Exception:
+                    bank_count = 0
+            info["bank_count"] = bank_count
+
+            bank_names = []
+            if bank_count and hasattr(device, "get_bank_name"):
+                for i in range(bank_count):
+                    try:
+                        bank_names.append(str(device.get_bank_name(i)))
+                    except Exception:
+                        bank_names.append("Bank {0}".format(i + 1))
+            info["bank_names"] = bank_names
+
+            if bank is not None:
+                b = int(bank)
+                if not hasattr(device, "get_bank_parameters") or not bank_count:
+                    raise ValueError(
+                        "'{0}' does not expose parameter banks. Only VST/AU "
+                        "plugins and Max devices do.".format(device.name))
+                if b < 0 or b >= bank_count:
+                    raise ValueError("Bank {0} out of range (0-{1})".format(
+                        b, bank_count - 1))
+                raw = list(device.get_bank_parameters(b))
+                params = []
+                for entry in raw:
+                    # Live returns INDICES into device.parameters, -1 = empty
+                    if isinstance(entry, int):
+                        if entry < 0 or entry >= len(all_params):
+                            params.append(None)
+                            continue
+                        p_index = entry
+                        p = all_params[entry]
+                    else:
+                        p = entry
+                        p_index = None
+                        for j, cand in enumerate(all_params):
+                            if cand is p:
+                                p_index = j
+                                break
+                    if p is None:
+                        params.append(None)
+                        continue
+                    try:
+                        params.append(self._describe_device_parameter(p, p_index))
+                    except Exception:
+                        params.append(None)
+                info["bank"] = b
+                info["bank_name"] = bank_names[b] if b < len(bank_names) else None
+                info["bank_parameters"] = params
+
+            io_summary = {}
+            for label, collection in self._device_io_buses(device):
+                if collection is None:
+                    continue
+                try:
+                    io_summary[label] = len(tuple(collection))
+                except Exception:
+                    pass
+            info["device_io_buses"] = io_summary
+            info["has_sidechain_input"] = hasattr(
+                device, "available_input_routing_types")
+
+            return info
+        except Exception as e:
+            self.log_message("Error getting plugin info: " + str(e))
+            raise
+
+    def _select_plugin_preset(self, track_index, device_index, chain_index=None,
+                              preset=None, preset_index=None):
+        """Select a VST/AU program or Max for Live preset by name or number.
+
+        `presets` is a read-only tuple of names and `selected_preset_index` is
+        the writable int — so a name is always resolved against the tuple
+        rather than assigned.
+        """
+        try:
+            track, device = self._external_device_at(
+                track_index, device_index, chain_index)
+
+            presets = []
+            try:
+                presets = [str(p) for p in getattr(device, "presets", [])]
+            except Exception:
+                presets = []
+            if not presets or not hasattr(device, "selected_preset_index"):
+                raise ValueError(
+                    "'{0}' exposes no selectable preset list. Only VST/AU "
+                    "plugins and some Max devices do; load stock Live patches "
+                    "through the browser instead.".format(device.name))
+
+            target = None
+            if preset is not None:
+                wanted = str(preset).strip().lower()
+                for i, name in enumerate(presets):
+                    if name.strip().lower() == wanted:
+                        target = i
+                        break
+                if target is None:
+                    partial = [i for i, name in enumerate(presets)
+                               if wanted in name.strip().lower()]
+                    if len(partial) == 1:
+                        target = partial[0]
+                    elif len(partial) > 1:
+                        raise ValueError("'{0}' is ambiguous, matches: {1}".format(
+                            preset, ", ".join(presets[i] for i in partial[:12])))
+                if target is None:
+                    raise ValueError(
+                        "Preset '{0}' not found on '{1}'. First few: {2}".format(
+                            preset, device.name, ", ".join(presets[:12])))
+            elif preset_index is not None:
+                target = int(preset_index)
+            else:
+                raise ValueError("Provide either preset or preset_index")
+
+            if target < 0 or target >= len(presets):
+                raise ValueError("Preset index {0} out of range (0-{1})".format(
+                    target, len(presets) - 1))
+
+            device.selected_preset_index = target
+            try:
+                now = int(device.selected_preset_index)
+            except Exception:
+                now = target
+            return {
+                "track": track.name,
+                "device": device.name,
+                "preset": presets[now] if 0 <= now < len(presets) else None,
+                "preset_index": now,
+                "preset_count": len(presets),
+            }
+        except Exception as e:
+            self.log_message("Error selecting plugin preset: " + str(e))
+            raise
+
+    def _get_device_io(self, track_index, device_index, chain_index=None):
+        """List every audio/MIDI bus a device exposes, and how each is routed.
+
+        Max for Live devices expose audio_inputs / audio_outputs /
+        midi_inputs / midi_outputs as Device.IO objects. Native Live devices
+        that can be sidechained (Compressor, Gate, Auto Filter) instead expose
+        input_routing_type directly on the device.
+        """
+        try:
+            track, device = self._external_device_at(
+                track_index, device_index, chain_index)
+
+            buses = []
+            for label, collection in self._device_io_buses(device):
+                if collection is None:
+                    continue
+                for i, io_obj in enumerate(tuple(collection)):
+                    entry = {"bus": label, "index": i,
+                             "name": getattr(io_obj, "name", None)}
+                    entry.update(self._describe_device_io(io_obj))
+                    buses.append(entry)
+
+            sidechain = None
+            if hasattr(device, "available_input_routing_types"):
+                sidechain = {}
+                try:
+                    sidechain["routing_type"] = device.input_routing_type.display_name
+                except Exception:
+                    sidechain["routing_type"] = None
+                try:
+                    sidechain["routing_channel"] = \
+                        device.input_routing_channel.display_name
+                except Exception:
+                    sidechain["routing_channel"] = None
+                try:
+                    sidechain["available_types"] = [
+                        x.display_name for x in device.available_input_routing_types]
+                except Exception:
+                    sidechain["available_types"] = []
+                try:
+                    sidechain["available_channels"] = [
+                        x.display_name
+                        for x in device.available_input_routing_channels]
+                except Exception:
+                    sidechain["available_channels"] = []
+
+            return {
+                "track": track.name,
+                "device": device.name,
+                "class_name": getattr(device, "class_name", ""),
+                "buses": buses,
+                "sidechain_input": sidechain,
+            }
+        except Exception as e:
+            self.log_message("Error getting device IO: " + str(e))
+            raise
+
+    def _set_device_io_routing(self, track_index, device_index, bus=None,
+                               bus_index=0, chain_index=None,
+                               routing_type=None, routing_channel=None):
+        """Point one of a Max device's audio/MIDI buses at a source or target.
+
+        routing_type and routing_channel are Live objects, so the requested
+        display name is resolved against available_routing_types /
+        available_routing_channels on that same bus and the resulting element
+        is assigned. The type is resolved and assigned first, because
+        assigning it rewrites available_routing_channels.
+        """
+        try:
+            track, device = self._external_device_at(
+                track_index, device_index, chain_index)
+
+            key = str(bus).strip().lower()
+            aliases = {
+                "audio_in": "audio_in", "audio_input": "audio_in",
+                "audio_inputs": "audio_in", "in": "audio_in",
+                "audio_out": "audio_out", "audio_output": "audio_out",
+                "audio_outputs": "audio_out", "out": "audio_out",
+                "midi_in": "midi_in", "midi_input": "midi_in",
+                "midi_inputs": "midi_in",
+                "midi_out": "midi_out", "midi_output": "midi_out",
+                "midi_outputs": "midi_out",
+            }
+            if key in ("sidechain", "sidechain_input"):
+                raise ValueError(
+                    "Sidechain input lives on the device itself, not on a "
+                    "Device.IO bus. Use set_device_sidechain for Compressor, "
+                    "Gate and Auto Filter.")
+            if key not in aliases:
+                raise ValueError(
+                    "Unknown bus '{0}'. Use audio_in, audio_out, midi_in "
+                    "or midi_out.".format(bus))
+            key = aliases[key]
+
+            collection = None
+            for label, coll in self._device_io_buses(device):
+                if label == key:
+                    collection = coll
+                    break
+            if collection is None:
+                raise ValueError(
+                    "'{0}' exposes no {1} buses. Only Max for Live devices "
+                    "expose Device.IO routing.".format(device.name, key))
+
+            buses = tuple(collection)
+            bi = int(bus_index)
+            if bi < 0 or bi >= len(buses):
+                raise ValueError("{0} bus {1} out of range (0-{2}) on '{3}'".format(
+                    key, bi, len(buses) - 1 if buses else 0, device.name))
+            io_obj = buses[bi]
+
+            changed = {}
+            if routing_type is not None:
+                if not hasattr(io_obj, "available_routing_types"):
+                    raise ValueError(
+                        "{0}[{1}] on '{2}' exposes no routing types".format(
+                            key, bi, device.name))
+                match = self._match_routing_option(
+                    io_obj.available_routing_types, routing_type,
+                    "{0}[{1}] routing_type".format(key, bi))
+                io_obj.routing_type = match
+                changed["routing_type"] = io_obj.routing_type.display_name
+            if routing_channel is not None:
+                if not hasattr(io_obj, "available_routing_channels"):
+                    raise ValueError(
+                        "{0}[{1}] on '{2}' exposes no routing channels".format(
+                            key, bi, device.name))
+                match = self._match_routing_option(
+                    io_obj.available_routing_channels, routing_channel,
+                    "{0}[{1}] routing_channel".format(key, bi))
+                io_obj.routing_channel = match
+                changed["routing_channel"] = io_obj.routing_channel.display_name
+
+            if not changed:
+                raise ValueError(
+                    "Nothing to change: pass routing_type and/or routing_channel")
+
+            return {
+                "track": track.name,
+                "device": device.name,
+                "bus": key,
+                "bus_index": bi,
+                "changed": changed,
+            }
+        except Exception as e:
+            self.log_message("Error setting device IO routing: " + str(e))
+            raise
+
+    def _looper_at(self, track_index, device_index=None):
+        """Find a Looper on a track — by index, else the first one found."""
+        track = self._track_at(track_index)
+        devices = tuple(track.devices)
+        if device_index is not None:
+            if device_index < 0 or device_index >= len(devices):
+                raise ValueError(
+                    "device_index out of range (0-{0}) on '{1}'".format(
+                        len(devices) - 1, track.name))
+            looper = devices[device_index]
+        else:
+            looper = None
+            for d in devices:
+                if d.class_name == "Looper" or "looper" in d.name.lower():
+                    looper = d
+                    break
+        if looper is None:
+            raise ValueError("No Looper found on '{0}'".format(track.name))
+        return track, looper
+
+    def _looper_state(self, looper):
+        """Snapshot of a Looper: transport state, size, tempo, settings."""
+        info = {"device": looper.name}
+        try:
+            info["device_class"] = looper.class_name
+        except Exception:
+            pass
+        try:
+            for p in looper.parameters:
+                if p.name != "State":
+                    continue
+                info["state_display"] = str(p)
+                info["state_value"] = p.value
+                if getattr(p, "is_quantized", False):
+                    items = [str(v) for v in p.value_items]
+                    info["state_options"] = items
+                    idx = int(round(p.value))
+                    if 0 <= idx < len(items):
+                        info["state"] = items[idx]
+                break
+        except Exception:
+            pass
+        for attr in ("loop_length", "tempo", "overdub_after_record"):
+            if not hasattr(looper, attr):
+                continue
+            try:
+                info[attr] = self._describe_value(getattr(looper, attr))
+            except Exception:
+                pass
+        if hasattr(looper, "record_length_list") and \
+                hasattr(looper, "record_length_index"):
+            try:
+                names = [str(n) for n in looper.record_length_list]
+                info["record_length_options"] = names
+                idx = int(looper.record_length_index)
+                info["record_length_index"] = idx
+                if 0 <= idx < len(names):
+                    info["record_length"] = names[idx]
+            except Exception:
+                pass
+        info["available_actions"] = [
+            a for a in ("record", "overdub", "play", "stop", "clear", "undo",
+                        "double_length", "half_length", "double_speed",
+                        "half_speed", "export_to_clip_slot")
+            if hasattr(looper, a)]
+        info["settable"] = [
+            a for a in ("record_length", "overdub_after_record", "tempo")
+            if hasattr(looper, a) or
+            hasattr(looper, a + "_index")]
+        return info
+
+    def _control_looper(self, track_index, device_index=None, action="info",
+                        scene_index=None):
+        """Drive a Looper like a loop pedal — record, overdub, play, export."""
+        try:
+            track, looper = self._looper_at(track_index, device_index)
+
+            if action == "info":
+                result = self._looper_state(looper)
+                result["track"] = track.name
+                return result
+
+            if not hasattr(looper, action):
+                raise ValueError(
+                    "Looper '{0}' has no action '{1}'. Available: {2}".format(
+                        looper.name, action, ", ".join(
+                            self._looper_state(looper)["available_actions"])))
+
+            if action == "export_to_clip_slot":
+                if scene_index is not None:
+                    scenes = tuple(self._song.scenes)
+                    if scene_index < 0 or scene_index >= len(scenes):
+                        raise ValueError(
+                            "scene_index out of range (0-{0})".format(
+                                len(scenes) - 1))
+                    try:
+                        self._song.view.selected_track = track
+                    except Exception as se:
+                        self.log_message(
+                            "Could not select looper track: " + str(se))
+                    self._song.view.selected_scene = scenes[scene_index]
+                looper.export_to_clip_slot()
+                result = self._looper_state(looper)
+                result["track"] = track.name
+                result["action"] = action
+                result["done"] = True
+                result["exported_to_track"] = track.name
+                if scene_index is not None:
+                    result["exported_to_scene"] = scene_index
+                return result
+
+            getattr(looper, action)()
+            result = self._looper_state(looper)
+            result["track"] = track.name
+            result["action"] = action
+            result["done"] = True
+            return result
+        except Exception as e:
+            self.log_message("Error controlling looper: " + str(e))
+            raise
+
+    def _configure_looper(self, track_index, device_index=None,
+                          record_length=None, overdub_after_record=None,
+                          tempo=None):
+        """Set a Looper's record length (by name), overdub behaviour, tempo."""
+        try:
+            track, looper = self._looper_at(track_index, device_index)
+            changed = {}
+            unsupported = []
+            read_only = []
+
+            if record_length is not None:
+                if not (hasattr(looper, "record_length_list") and
+                        hasattr(looper, "record_length_index")):
+                    unsupported.append("record_length")
+                else:
+                    names = [str(n) for n in looper.record_length_list]
+                    wanted = str(record_length).strip().lower()
+                    target = None
+                    for i, n in enumerate(names):
+                        if n.strip().lower() == wanted:
+                            target = i
+                            break
+                    if target is None:
+                        for i, n in enumerate(names):
+                            if wanted in n.strip().lower():
+                                target = i
+                                break
+                    if target is None:
+                        raise ValueError(
+                            "Unknown record_length '{0}'. Available: "
+                            "{1}".format(record_length, ", ".join(names)))
+                    looper.record_length_index = target
+                    now = int(looper.record_length_index)
+                    changed["record_length_index"] = now
+                    if 0 <= now < len(names):
+                        changed["record_length"] = names[now]
+                    if now != target:
+                        changed["record_length_requested"] = names[target]
+
+            if overdub_after_record is not None:
+                if not hasattr(looper, "overdub_after_record"):
+                    unsupported.append("overdub_after_record")
+                else:
+                    try:
+                        looper.overdub_after_record = bool(overdub_after_record)
+                        changed["overdub_after_record"] = \
+                            looper.overdub_after_record
+                    except Exception as oe:
+                        self.log_message(
+                            "Looper overdub_after_record not writable: " +
+                            str(oe))
+                        read_only.append("overdub_after_record")
+
+            if tempo is not None:
+                if not hasattr(looper, "tempo"):
+                    unsupported.append("tempo")
+                else:
+                    try:
+                        looper.tempo = float(tempo)
+                        changed["tempo"] = looper.tempo
+                    except Exception as te:
+                        self.log_message(
+                            "Looper tempo not writable: " + str(te))
+                        read_only.append("tempo")
+
+            result = self._looper_state(looper)
+            result["track"] = track.name
+            result["changed"] = changed
+            if read_only:
+                result["read_only"] = read_only
+            if unsupported:
+                result["unsupported"] = unsupported
+            return result
+        except Exception as e:
+            self.log_message("Error configuring looper: " + str(e))
+            raise
+
+
+    # ---------------------------------------------------------------
+    # Rack family: RackDevice / Chain / DrumChain / DrumPad /
+    # ChainMixerDevice.  A rack is the only place in Live where signal
+    # topology, macro control and drum mapping all live on one object,
+    # so these helpers all start from the same resolve step.
+    #
+    # Every LOM member touched here is hasattr/getattr guarded: a Drum
+    # Rack has no chain_selector, an Instrument Rack has no drum_pads,
+    # and older Live builds lack the variation API entirely.  Without
+    # the guards those calls raise a bare AttributeError with no hint
+    # of what actually went wrong.
+    # ---------------------------------------------------------------
+
+    def _rack_device(self, track_index, device_index, require_pads=False):
+        """Resolve a device and confirm it really is a rack."""
+        track, device = self._resolve_device(track_index, device_index)
+        if not getattr(device, "can_have_chains", False):
+            raise ValueError("'{0}' is not a rack".format(device.name))
+        if require_pads and not getattr(device, "can_have_drum_pads", False):
+            raise ValueError("'{0}' is not a Drum Rack".format(device.name))
+        return track, device
+
+    def _param_enum_pair(self, param):
+        """Describe a quantized (enum) parameter as an index + name list.
+
+        Quantized parameters in Live are enums: the float value is an index
+        into value_items, and that ordering is NOT guaranteed across Live
+        versions or device variants.  Always report and resolve by name.
+        """
+        out = {"index": None, "list": [], "name": None}
+        try:
+            out["list"] = [str(i) for i in param.value_items]
+        except Exception:
+            out["list"] = []
+        try:
+            out["index"] = int(round(param.value))
+        except Exception:
+            out["index"] = None
+        idx = out["index"]
+        if out["list"] and idx is not None and 0 <= idx < len(out["list"]):
+            out["name"] = out["list"][idx]
+        else:
+            try:
+                out["name"] = str(param)
+            except Exception:
+                out["name"] = None
+        return out
+
+    def _set_param_enum(self, param, wanted):
+        """Set a quantized parameter from a name, a bool, or an index.
+
+        Returns the resolved name.  Never assumes 0 = off / 1 = on: the
+        value_items list is the authority, and only when the device does
+        not expose one do we fall back to param.min / param.max.
+        """
+        try:
+            items = [str(i) for i in param.value_items]
+        except Exception:
+            items = []
+
+        if isinstance(wanted, bool):
+            if items:
+                target = "on" if wanted else "off"
+                for i, item in enumerate(items):
+                    if item.strip().lower() == target:
+                        param.value = float(i)
+                        return items[i]
+            param.value = param.max if wanted else param.min
+            return str(param)
+
+        if isinstance(wanted, str):
+            if not items:
+                raise ValueError(
+                    "'{0}' has no named values to match '{1}'".format(
+                        param.name, wanted))
+            for i, item in enumerate(items):
+                if item.strip().lower() == wanted.strip().lower():
+                    param.value = float(i)
+                    return items[i]
+            raise ValueError(
+                "No value named '{0}' on '{1}'. Available: {2}".format(
+                    wanted, param.name, ", ".join(items)))
+
+        idx = int(wanted)
+        if items:
+            if idx < 0 or idx >= len(items):
+                raise IndexError(
+                    "Value index {0} out of range on '{1}' (0-{2}: {3})".format(
+                        idx, param.name, len(items) - 1, ", ".join(items)))
+            param.value = float(idx)
+            return items[idx]
+        param.value = float(idx)
+        return str(param)
+
+    def _drum_pad_at(self, device, note):
+        """Find a DrumPad by its MIDI note (36 = C1 = bottom-left pad)."""
+        if not getattr(device, "can_have_drum_pads", False):
+            raise ValueError(
+                "'{0}' is not a Drum Rack, so it has no pads".format(
+                    device.name))
+        target = int(note)
+        for pad in device.drum_pads:
+            if pad.note == target:
+                return pad
+        raise ValueError("No drum pad at note {0} on '{1}'".format(
+            target, device.name))
+
+    def _rack_chain_at(self, device, chain_index=None, chain_name=None,
+                       pad_note=None, return_chain=False):
+        """Resolve a single Chain inside a rack.
+
+        pad_note selects a Drum Rack pad's chain, return_chain selects from
+        the rack's internal return chains, otherwise the main chain list is
+        used. chain_name wins over chain_index when both are given.
+        """
+        if pad_note is not None:
+            pad = self._drum_pad_at(device, pad_note)
+            chains = list(pad.chains)
+            label = "pad {0} chain".format(pad.note)
+            if not chains:
+                raise ValueError("Drum pad {0} ('{1}') is empty".format(
+                    pad.note, pad.name))
+        elif return_chain:
+            chains = list(getattr(device, "return_chains", []))
+            label = "return chain"
+        else:
+            chains = list(device.chains)
+            label = "chain"
+        if not chains:
+            raise ValueError("'{0}' has no {1}s".format(device.name, label))
+        if chain_name is not None:
+            for chain in chains:
+                if chain.name == chain_name:
+                    return chain, label
+            raise ValueError(
+                "No {0} named '{1}' in '{2}'. Available: {3}".format(
+                    label, chain_name, device.name,
+                    ", ".join(c.name for c in chains)))
+        idx = 0 if chain_index is None else int(chain_index)
+        if idx < 0 or idx >= len(chains):
+            raise IndexError("{0} index {1} out of range (0-{2})".format(
+                label.capitalize(), idx, len(chains) - 1))
+        return chains[idx], label
+
+    def _describe_chain(self, chain, index=None, with_devices=True):
+        """Serialise a Chain / DrumChain (and its ChainMixerDevice)."""
+        info = {"index": index, "name": chain.name}
+        for attr in ("mute", "solo", "color_index", "out_note",
+                     "choke_group"):
+            try:
+                info[attr] = getattr(chain, attr)
+            except Exception:
+                pass
+        if with_devices:
+            try:
+                info["devices"] = [d.name for d in chain.devices]
+            except Exception:
+                info["devices"] = []
+        mixer = getattr(chain, "mixer_device", None)
+        if mixer is not None:
+            try:
+                info["volume"] = str(mixer.volume)
+            except Exception:
+                pass
+            try:
+                info["panning"] = str(mixer.panning)
+            except Exception:
+                pass
+            try:
+                act = self._param_enum_pair(mixer.chain_activator)
+                info["chain_activator_index"] = act["index"]
+                info["chain_activator_name"] = act["name"]
+                info["chain_activator_list"] = act["list"]
+            except Exception:
+                pass
+            try:
+                info["sends"] = [str(s) for s in mixer.sends]
+            except Exception:
+                pass
+        return info
+
+    def _get_rack_map(self, track_index, device_index, include_devices=True,
+                      pads="filled"):
+        """One read of everything a rack exposes: macros, chains, pads.
+
+        pads: 'filled' (pads holding something), 'visible' (the 16 currently
+        on screen) or 'none'.
+        """
+        try:
+            track, device = self._rack_device(track_index, device_index)
+            info = {"track": track.name, "device": device.name,
+                    "class_name": device.class_name}
+            for attr in ("visible_macro_count", "has_macro_mappings",
+                         "variation_count", "selected_variation_index",
+                         "is_showing_chains", "can_show_chains",
+                         "has_drum_pads"):
+                try:
+                    info[attr] = getattr(device, attr)
+                except Exception:
+                    pass
+            try:
+                info["macros_mapped"] = list(device.macros_mapped)
+            except Exception:
+                pass
+            try:
+                info["macros"] = [
+                    {"index": i, "name": p.name, "value": p.value,
+                     "display": str(p)}
+                    for i, p in enumerate(device.parameters)
+                    if "Macro" in p.name]
+            except Exception:
+                pass
+            try:
+                selector = device.chain_selector
+                info["chain_selector"] = {"value": selector.value,
+                                          "min": selector.min,
+                                          "max": selector.max,
+                                          "display": str(selector)}
+            except Exception:
+                pass
+            try:
+                info["chains"] = [
+                    self._describe_chain(c, ci, include_devices)
+                    for ci, c in enumerate(device.chains)]
+            except Exception:
+                info["chains"] = []
+            try:
+                info["return_chains"] = [
+                    self._describe_chain(c, ci, include_devices)
+                    for ci, c in enumerate(device.return_chains)]
+            except Exception:
+                info["return_chains"] = []
+            info["chain_count"] = len(info.get("chains", []))
+
+            if pads != "none" and getattr(device, "can_have_drum_pads", False):
+                pad_objects = (device.visible_drum_pads if pads == "visible"
+                               else device.drum_pads)
+                pad_list = []
+                for pad in pad_objects:
+                    if pads == "filled" and not pad.chains:
+                        continue
+                    entry = {"note": pad.note, "name": pad.name}
+                    for attr in ("mute", "solo", "choke_group", "out_note"):
+                        try:
+                            entry[attr] = getattr(pad, attr)
+                        except Exception:
+                            pass
+                    # choke_group / out_note live on DrumChain in some Live
+                    # builds, on DrumPad in others -- read whichever answers.
+                    for chain in pad.chains:
+                        for attr in ("choke_group", "out_note"):
+                            if attr not in entry:
+                                try:
+                                    entry[attr] = getattr(chain, attr)
+                                except Exception:
+                                    pass
+                    entry["devices"] = [d.name for c in pad.chains
+                                        for d in c.devices]
+                    pad_list.append(entry)
+                info["pads"] = pad_list
+                info["pad_filter"] = pads
+            return info
+        except Exception as e:
+            self.log_message("Error getting rack map: " + str(e))
+            raise
+
+    def _manage_rack(self, track_index, device_index, action="info",
+                     value=None, count=1, chain_index=None):
+        """Inspect and control a rack: macros, chain selector, chain list.
+
+        Supersedes the earlier _manage_rack. All previous actions still
+        work; the variation actions now delegate to
+        _manage_rack_variations so there is a single implementation.
+        """
+        try:
+            track, device = self._rack_device(track_index, device_index)
+
+            if action == "info":
+                return self._get_rack_map(track_index, device_index)
+
+            if action in ("add_macro", "remove_macro"):
+                if not hasattr(device, action):
+                    raise ValueError(
+                        "'{0}' does not support {1} in this Live "
+                        "version".format(device.name, action))
+                wanted = max(1, int(count))
+                applied = 0
+                for _ in range(wanted):
+                    try:
+                        if action == "add_macro":
+                            device.add_macro()
+                        else:
+                            device.remove_macro()
+                        applied += 1
+                    except Exception as inner:
+                        self.log_message(
+                            "Stopped {0} after {1}: {2}".format(
+                                action, applied, str(inner)))
+                        break
+                return {"device": device.name, "action": action,
+                        "applied": applied, "requested": wanted,
+                        "visible_macro_count": getattr(
+                            device, "visible_macro_count", None)}
+
+            if action == "randomize_macros":
+                if not hasattr(device, "randomize_macros"):
+                    raise ValueError(
+                        "'{0}' cannot randomize macros".format(device.name))
+                device.randomize_macros()
+                return {"device": device.name, "action": "randomize_macros",
+                        "macros": [{"name": p.name, "display": str(p)}
+                                   for p in device.parameters
+                                   if "Macro" in p.name]}
+
+            if action == "chain_selector":
+                if value is None:
+                    raise ValueError("chain_selector requires a value 0.0-1.0")
+                selector = getattr(device, "chain_selector", None)
+                if selector is None:
+                    raise ValueError(
+                        "'{0}' has no chain selector (Drum Racks do "
+                        "not)".format(device.name))
+                target = selector.min + (selector.max - selector.min) * \
+                    max(0.0, min(1.0, float(value)))
+                selector.value = target
+                return {"device": device.name,
+                        "chain_selector": selector.value,
+                        "display": str(selector)}
+
+            if action in ("show_chains", "hide_chains"):
+                if not getattr(device, "can_show_chains", False):
+                    raise ValueError(
+                        "'{0}' cannot show its chains".format(device.name))
+                device.is_showing_chains = (action == "show_chains")
+                return {"device": device.name, "action": action,
+                        "is_showing_chains": device.is_showing_chains}
+
+            if action == "insert_chain":
+                if not hasattr(device, "insert_chain"):
+                    raise ValueError(
+                        "'{0}' does not expose insert_chain in this Live "
+                        "version".format(device.name))
+                before = len(device.chains)
+                pos = before if chain_index is None else int(chain_index)
+                last_error = None
+                inserted = False
+                for args in ((pos,), ()):
+                    try:
+                        device.insert_chain(*args)
+                        inserted = True
+                        break
+                    except Exception as inner:
+                        last_error = inner
+                if not inserted:
+                    raise ValueError(
+                        "insert_chain is not callable on '{0}': {1}".format(
+                            device.name, str(last_error)))
+                return {"device": device.name, "action": "insert_chain",
+                        "chain_count": len(device.chains),
+                        "was": before,
+                        "chains": [c.name for c in device.chains]}
+
+            if action in ("store_variation", "recall_variation",
+                          "delete_variation", "recall_last_variation"):
+                legacy = {"store_variation": "store",
+                          "recall_variation": "recall",
+                          "delete_variation": "delete",
+                          "recall_last_variation": "recall_last"}
+                return self._manage_rack_variations(
+                    track_index, device_index, legacy[action],
+                    None if value is None else int(value))
+
+            raise ValueError("Unknown rack action '{0}'".format(action))
+        except Exception as e:
+            self.log_message("Error managing rack: " + str(e))
+            raise
+
+    def _manage_rack_variations(self, track_index, device_index,
+                                action="list", variation_index=None):
+        """Store / recall / delete a rack's macro variations (snapshots)."""
+        try:
+            track, device = self._rack_device(track_index, device_index)
+            if not hasattr(device, "variation_count"):
+                raise ValueError(
+                    "'{0}' has no macro variations (needs Live 11 or "
+                    "later)".format(device.name))
+
+            def require(method):
+                if not hasattr(device, method):
+                    raise ValueError(
+                        "'{0}' does not expose {1} in this Live "
+                        "version".format(device.name, method))
+
+            def state(extra=None):
+                out = {"device": device.name,
+                       "variation_count": device.variation_count,
+                       "selected_variation_index": getattr(
+                           device, "selected_variation_index", None)}
+                if extra:
+                    out.update(extra)
+                return out
+
+            if variation_index is not None and action in ("recall", "delete",
+                                                          "select"):
+                idx = int(variation_index)
+                if idx < 0 or idx >= device.variation_count:
+                    raise IndexError(
+                        "Variation index {0} out of range (0-{1})".format(
+                            idx, device.variation_count - 1))
+                device.selected_variation_index = idx
+
+            if action == "list":
+                return state({"action": "list"})
+            if action == "store":
+                require("store_variation")
+                device.store_variation()
+                return state({"action": "store"})
+            if action == "select":
+                if variation_index is None:
+                    raise ValueError("select requires a variation_index")
+                return state({"action": "select"})
+            if action == "recall":
+                require("recall_selected_variation")
+                device.recall_selected_variation()
+                return state({"action": "recall"})
+            if action == "recall_last":
+                require("recall_last_used_variation")
+                device.recall_last_used_variation()
+                return state({"action": "recall_last"})
+            if action == "delete":
+                require("delete_selected_variation")
+                device.delete_selected_variation()
+                return state({"action": "delete"})
+            raise ValueError(
+                "Unknown variation action '{0}'".format(action))
+        except Exception as e:
+            self.log_message("Error managing rack variations: " + str(e))
+            raise
+
+    def _set_chain_state(self, track_index, device_index, chain_index=None,
+                         chain_name=None, pad_note=None, return_chain=False,
+                         name=None, color_index=None, mute=None, solo=None,
+                         volume=None, panning=None, chain_activator=None,
+                         send_index=None, send_value=None):
+        """Set name / colour / mute / solo / mixer on one chain in a rack.
+
+        Omitted values are left alone. volume, panning and send_value are
+        normalized 0.0-1.0 across the parameter's own min..max, matching how
+        sends and mixer extras behave elsewhere. chain_activator is a
+        quantized (enum) parameter and is resolved by NAME, never by an
+        assumed 0/1 ordering.
+        """
+        try:
+            # pad_note reaches into device.drum_pads, which only exists on a
+            # Drum Rack -- require it up front instead of raising a bare
+            # AttributeError from inside the lookup.
+            track, device = self._rack_device(
+                track_index, device_index, require_pads=pad_note is not None)
+            chain, label = self._rack_chain_at(
+                device, chain_index, chain_name, pad_note, return_chain)
+            changed = {}
+
+            def set_param(param, val, key):
+                target = param.min + (param.max - param.min) * \
+                    max(0.0, min(1.0, float(val)))
+                param.value = target
+                changed[key] = str(param)
+
+            if name is not None:
+                chain.name = str(name)
+                changed["name"] = chain.name
+            if color_index is not None:
+                chain.color_index = int(color_index)
+                changed["color_index"] = chain.color_index
+            if mute is not None:
+                chain.mute = bool(mute)
+                changed["mute"] = chain.mute
+            if solo is not None:
+                chain.solo = bool(solo)
+                changed["solo"] = chain.solo
+
+            if (volume is not None or panning is not None
+                    or chain_activator is not None or send_value is not None):
+                mixer = getattr(chain, "mixer_device", None)
+                if mixer is None:
+                    raise ValueError(
+                        "Chain '{0}' has no mixer".format(chain.name))
+                if volume is not None:
+                    set_param(mixer.volume, volume, "volume")
+                if panning is not None:
+                    set_param(mixer.panning, panning, "panning")
+                if chain_activator is not None:
+                    activator = getattr(mixer, "chain_activator", None)
+                    if activator is None:
+                        raise ValueError(
+                            "Chain '{0}' has no chain activator".format(
+                                chain.name))
+                    changed["chain_activator"] = self._set_param_enum(
+                        activator, chain_activator)
+                if send_value is not None:
+                    if send_index is None:
+                        raise ValueError(
+                            "send_value requires a send_index")
+                    sends = mixer.sends
+                    si = int(send_index)
+                    if si < 0 or si >= len(sends):
+                        raise IndexError(
+                            "Send index {0} out of range on chain "
+                            "'{1}' (0-{2})".format(
+                                si, chain.name, len(sends) - 1))
+                    set_param(sends[si], send_value,
+                              "send_{0}".format(si))
+
+            return {"device": device.name, "target": label,
+                    "chain": chain.name, "changed": changed}
+        except Exception as e:
+            self.log_message("Error setting chain state: " + str(e))
+            raise
+
+    def _manage_drum_pad(self, track_index, device_index, pad_note,
+                         name=None, mute=None, solo=None, choke_group=None,
+                         out_note=None, copy_to_note=None):
+        """Set name / mute / solo / choke group / out note on a drum pad.
+
+        choke_group and out_note are exposed on DrumPad in some Live builds
+        and on the pad's DrumChain in others, so both are attempted.
+        A choke group (1-16) makes pads cut each other off -- the open hat
+        / closed hat trick.
+        """
+        try:
+            track, device = self._rack_device(track_index, device_index,
+                                              require_pads=True)
+            pad = self._drum_pad_at(device, pad_note)
+            changed = {}
+
+            def set_on_pad_or_chains(attr, val, caster):
+                applied = False
+                try:
+                    setattr(pad, attr, caster(val))
+                    applied = True
+                except Exception:
+                    pass
+                for chain in pad.chains:
+                    try:
+                        setattr(chain, attr, caster(val))
+                        applied = True
+                    except Exception:
+                        pass
+                if not applied:
+                    raise ValueError(
+                        "Pad {0} does not accept {1}".format(pad.note, attr))
+                changed[attr] = caster(val)
+
+            if name is not None:
+                try:
+                    pad.name = str(name)
+                    changed["name"] = pad.name
+                except Exception:
+                    if not pad.chains:
+                        raise ValueError(
+                            "Pad {0} is empty, nothing to name".format(
+                                pad.note))
+                    pad.chains[0].name = str(name)
+                    changed["chain_name"] = pad.chains[0].name
+            if mute is not None:
+                pad.mute = bool(mute)
+                changed["mute"] = pad.mute
+            if solo is not None:
+                pad.solo = bool(solo)
+                changed["solo"] = pad.solo
+            if choke_group is not None:
+                set_on_pad_or_chains("choke_group", choke_group, int)
+            if out_note is not None:
+                set_on_pad_or_chains("out_note", out_note, int)
+
+            if copy_to_note is not None:
+                if not hasattr(device, "copy_pad"):
+                    raise ValueError(
+                        "'{0}' does not expose copy_pad in this Live "
+                        "version".format(device.name))
+                dest = self._drum_pad_at(device, copy_to_note)
+                last_error = None
+                copied = False
+                for args in ((pad.note, dest.note), (pad, dest)):
+                    try:
+                        device.copy_pad(args[0], args[1])
+                        copied = True
+                        break
+                    except Exception as inner:
+                        last_error = inner
+                if not copied:
+                    raise ValueError(
+                        "copy_pad from {0} to {1} failed: {2}".format(
+                            pad.note, dest.note, str(last_error)))
+                changed["copied_to_note"] = dest.note
+
+            return {"device": device.name, "note": pad.note,
+                    "pad": pad.name, "changed": changed}
+        except Exception as e:
+            self.log_message("Error managing drum pad: " + str(e))
+            raise
+
+    def _simpler_enum_names(self, obj, prop, fallback):
+        """Names for an int-valued Simpler/Sample property.
+
+        Prefers a companion list published by Live (so we never assume an
+        ordering Live could change), falls back to the static table.
+        """
+        for attr in SIMPLER_ENUM_LISTS.get(prop, ()):
+            try:
+                values = list(getattr(obj, attr))
+            except Exception:
+                continue
+            names = []
+            for v in values:
+                text = None
+                for name_attr in ("display_name", "name"):
+                    try:
+                        text = str(getattr(v, name_attr))
+                        break
+                    except Exception:
+                        continue
+                names.append(text if text is not None else str(v))
+            if names:
+                return tuple(n.strip().lower().replace(" ", "_")
+                             .replace("-", "_") for n in names)
+        return tuple(fallback)
+
+    def _simpler_enum_name(self, obj, prop, fallback):
+        """Bounds-checked name for obj.<prop>, or None.
+
+        Bounds are checked in BOTH directions: Python's negative indexing would
+        otherwise turn an unexpected -1 into a confident, wrong name.
+        """
+        try:
+            index = int(getattr(obj, prop))
+        except Exception:
+            return None
+        names = self._simpler_enum_names(obj, prop, fallback)
+        if 0 <= index < len(names):
+            return names[index]
+        return None
+
+    def _simpler_enum_report(self, obj, prop, fallback):
+        """'2 (slicing)' when the name is known, otherwise just '2'."""
+        value = getattr(obj, prop)
+        name = self._simpler_enum_name(obj, prop, fallback)
+        if name is None:
+            return value
+        return "{0} ({1})".format(value, name)
+
+    def _simpler_at(self, track_index, device_index, chain_path=None):
+        """Resolve a Simpler, optionally nested inside racks.
+
+        chain_path is a dotted list of alternating 0-based chain/device
+        indices, e.g. "0.0" means chains[0].devices[0] of the rack at
+        device_index. Drum racks count too: a drum pad's chain is one of the
+        rack's chains, so a Simpler under a pad is reachable the same way.
+        """
+        track = self._track_at(track_index)
+        devices = tuple(track.devices)
+        if device_index < 0 or device_index >= len(devices):
+            raise IndexError(
+                "Device index {0} out of range on track '{1}' (0-{2})".format(
+                    device_index, track.name, len(devices) - 1 if devices else 0))
+        device = devices[device_index]
+
+        if chain_path:
+            parts = [p for p in str(chain_path).split(".") if p != ""]
+            if len(parts) % 2 != 0:
+                raise ValueError(
+                    "chain_path must be pairs of chain.device indices, got "
+                    "'{0}'".format(chain_path))
+            for i in range(0, len(parts), 2):
+                ci = int(parts[i])
+                di = int(parts[i + 1])
+                if not getattr(device, "can_have_chains", False):
+                    raise ValueError(
+                        "'{0}' is not a rack, cannot follow chain_path "
+                        "'{1}'".format(device.name, chain_path))
+                chains = tuple(device.chains)
+                if ci < 0 or ci >= len(chains):
+                    raise IndexError(
+                        "Chain index {0} out of range on '{1}' (0-{2})".format(
+                            ci, device.name, len(chains) - 1 if chains else 0))
+                chain = chains[ci]
+                chain_devices = tuple(chain.devices)
+                if di < 0 or di >= len(chain_devices):
+                    raise IndexError(
+                        "Device index {0} out of range in chain '{1}' "
+                        "(0-{2})".format(di, chain.name,
+                                         len(chain_devices) - 1
+                                         if chain_devices else 0))
+                device = chain_devices[di]
+
+        # Identity gate: only Simpler carries BOTH of these. Sampler and the
+        # rest of the instruments carry neither, so they fail here with a
+        # readable message instead of an AttributeError deeper in.
+        if not (hasattr(device, "playback_mode") and hasattr(device, "sample")):
+            raise ValueError(
+                "'{0}' ({1}) is not a Simpler. Sampler and the other "
+                "instruments do not expose this API.".format(
+                    device.name, getattr(device, "class_name", "?")))
+        return track, device
+
+    def _simpler_sample(self, device):
+        """Return the Simpler's Sample, with the multisample case explained.
+
+        Live returns None for `sample` whenever multi_sample_mode is on — the
+        zones of a multisampled Simpler are not exposed to the API at all — and
+        also before any file has been dropped in.
+        """
+        sample = device.sample
+        if sample is None:
+            if getattr(device, "multi_sample_mode", False):
+                raise ValueError(
+                    "'{0}' is in multi-sample mode, so Live exposes no single "
+                    "Sample object. Load a one-shot/loop into a plain Simpler "
+                    "to edit sample, slices or warping.".format(device.name))
+            raise ValueError(
+                "'{0}' has no sample loaded yet.".format(device.name))
+        return sample
+
+    def _require_member(self, obj, attr, label):
+        """Fail early and readably when this Live build lacks a property."""
+        if not hasattr(obj, attr):
+            raise ValueError(
+                "This Live version's {0} does not expose '{1}'.".format(
+                    label, attr))
+
+    def _resolve_simpler_enum(self, obj, prop, value, fallback, label):
+        """Turn a name or an index into the int Live wants.
+
+        Names are resolved against Live's own list when the object publishes
+        one, and against the fallback table otherwise. A raw index always wins,
+        so a build whose ordering differs from the table is still drivable.
+        """
+        if isinstance(value, bool):
+            raise ValueError("{0} must be a name or an index".format(label))
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, float):
+            if value != int(value):
+                raise ValueError(
+                    "{0} index must be a whole number, got {1}".format(
+                        label, value))
+            return int(value)
+        names = self._simpler_enum_names(obj, prop, fallback)
+        text = str(value).strip().lower().replace(" ", "_").replace("-", "_")
+        if text.isdigit():
+            return int(text)
+        for i, name in enumerate(names):
+            if name == text:
+                return i
+        partial = [i for i, name in enumerate(names) if text in name]
+        if len(partial) == 1:
+            return partial[0]
+        raise ValueError(
+            "Unknown {0} '{1}'. Use one of: {2} — or a raw index.".format(
+                label, value, ", ".join(names)))
+
+    def _sample_frames_at(self, sample, frames=None, beats=None,
+                          label="position"):
+        """Resolve a point in the sample to frames, from frames or beats."""
+        if frames is not None:
+            return int(frames)
+        if beats is not None:
+            return int(sample.beat_to_sample_time(float(beats)))
+        raise ValueError("{0} needs a value in frames or in beats".format(label))
+
+    def _describe_simpler(self, device):
+        """Everything readable about a Simpler and its sample, in one dict."""
+        info = {"device": device.name,
+                "class_name": getattr(device, "class_name", None)}
+        for attr in ("playback_mode", "slicing_playback_mode", "pad_slicing",
+                     "multi_sample_mode", "voices", "retrigger",
+                     "pitch_bend_range", "note_pitch_bend_range",
+                     "playing_position", "playing_position_enabled",
+                     "can_warp_as", "can_warp_half", "can_warp_double"):
+            try:
+                info[attr] = self._describe_value(getattr(device, attr))
+            except Exception:
+                pass
+        # One try per name: an out-of-range value on one property must not
+        # silently swallow the other's name.
+        for prop, fallback in (
+                ("playback_mode", SIMPLER_PLAYBACK_MODES),
+                ("slicing_playback_mode", SIMPLER_SLICING_PLAYBACK_MODES)):
+            try:
+                name = self._simpler_enum_name(device, prop, fallback)
+                if name is not None:
+                    info[prop + "_name"] = name
+            except Exception:
+                pass
+
+        sample = device.sample
+        if sample is None:
+            info["sample"] = None
+            info["note"] = ("multi-sample mode — no Sample object"
+                            if getattr(device, "multi_sample_mode", False)
+                            else "no sample loaded")
+            return info
+
+        s = {}
+        for attr in ("file_path", "length", "sample_rate", "start_marker",
+                     "end_marker", "gain", "warping", "warp_mode",
+                     "slicing_style", "slicing_beat_division",
+                     "slicing_region_count", "slicing_sensitivity",
+                     "beats_granulation_resolution", "beats_transient_envelope",
+                     "beats_transient_loop_mode", "complex_pro_envelope",
+                     "complex_pro_formants", "texture_flux",
+                     "texture_grain_size", "tones_grain_size"):
+            try:
+                s[attr] = self._describe_value(getattr(sample, attr))
+            except Exception:
+                pass
+        try:
+            s["gain_display_string"] = sample.gain_display_string()
+        except Exception:
+            pass
+        for prop, fallback in (("warp_mode", SAMPLE_WARP_MODES),
+                               ("slicing_style", SAMPLE_SLICING_STYLES)):
+            try:
+                name = self._simpler_enum_name(sample, prop, fallback)
+                if name is not None:
+                    s[prop + "_name"] = name
+            except Exception:
+                pass
+        try:
+            slices = [int(x) for x in sample.slices]
+            s["slice_count"] = len(slices)
+            s["slices_frames"] = slices[:128]
+            s["slices_beats"] = [round(sample.sample_to_beat_time(x), 4)
+                                 for x in slices[:128]]
+        except Exception:
+            pass
+        try:
+            s["warp_markers"] = [{"beat_time": m.beat_time,
+                                  "sample_time": m.sample_time}
+                                 for m in sample.warp_markers][:64]
+        except Exception:
+            pass
+        info["sample"] = s
+        return info
+
+    def _get_simpler_info(self, track_index, device_index, chain_path=None):
+        """Report a Simpler's playback state, its sample and its slice grid.
+
+        The read that has to happen before any chop: slice positions come back
+        in both frames and beats, so the next call can speak whichever unit
+        suits, and start/end markers show what portion is actually in play.
+        """
+        try:
+            track, device = self._simpler_at(track_index, device_index,
+                                             chain_path)
+            info = self._describe_simpler(device)
+            info["track"] = track.name
+            return info
+        except Exception as e:
+            self.log_message("Error getting simpler info: " + str(e))
+            raise
+
+    def _set_simpler_playback(self, track_index, device_index, chain_path=None,
+                              playback_mode=None, slicing_playback_mode=None,
+                              pad_slicing=None, voices=None, retrigger=None,
+                              pitch_bend_range=None, note_pitch_bend_range=None):
+        """Set how a Simpler responds to notes. Omitted arguments are untouched.
+
+        multi_sample_mode, playing_position and playing_position_enabled are
+        read-only in Live and are reported by get_simpler_info instead.
+        """
+        try:
+            track, device = self._simpler_at(track_index, device_index,
+                                             chain_path)
+            changed = {}
+
+            if playback_mode is not None:
+                index = self._resolve_simpler_enum(
+                    device, "playback_mode", playback_mode,
+                    SIMPLER_PLAYBACK_MODES, "playback_mode")
+                device.playback_mode = index
+                changed["playback_mode"] = self._simpler_enum_report(
+                    device, "playback_mode", SIMPLER_PLAYBACK_MODES)
+
+            if slicing_playback_mode is not None:
+                self._require_member(device, "slicing_playback_mode", "Simpler")
+                index = self._resolve_simpler_enum(
+                    device, "slicing_playback_mode", slicing_playback_mode,
+                    SIMPLER_SLICING_PLAYBACK_MODES, "slicing_playback_mode")
+                device.slicing_playback_mode = index
+                changed["slicing_playback_mode"] = self._simpler_enum_report(
+                    device, "slicing_playback_mode",
+                    SIMPLER_SLICING_PLAYBACK_MODES)
+
+            if pad_slicing is not None:
+                self._require_member(device, "pad_slicing", "Simpler")
+                device.pad_slicing = bool(pad_slicing)
+                changed["pad_slicing"] = device.pad_slicing
+
+            if voices is not None:
+                device.voices = int(voices)
+                changed["voices"] = device.voices
+
+            if retrigger is not None:
+                device.retrigger = bool(retrigger)
+                changed["retrigger"] = device.retrigger
+
+            if pitch_bend_range is not None:
+                device.pitch_bend_range = int(pitch_bend_range)
+                changed["pitch_bend_range"] = device.pitch_bend_range
+
+            if note_pitch_bend_range is not None:
+                self._require_member(device, "note_pitch_bend_range", "Simpler")
+                device.note_pitch_bend_range = int(note_pitch_bend_range)
+                changed["note_pitch_bend_range"] = device.note_pitch_bend_range
+
+            return {"track": track.name, "device": device.name,
+                    "changed": changed,
+                    "multi_sample_mode": getattr(device, "multi_sample_mode",
+                                                 None)}
+        except Exception as e:
+            self.log_message("Error setting simpler playback: " + str(e))
+            raise
+
+    def _manage_simpler_sample(self, track_index, device_index, chain_path=None,
+                               action=None, start_frames=None, start_beats=None,
+                               end_frames=None, end_beats=None, gain=None,
+                               warping=None, warp_mode=None, warp_as_beats=None):
+        """Trim, gain, warp and reshape the sample loaded into a Simpler.
+
+        Markers are sample frames in the API; beats are converted through
+        Sample.beat_to_sample_time. gain is normalised 0.0-1.0 (0.4 reads as
+        0.0 dB), not decibels. crop is destructive and permanent.
+        """
+        try:
+            track, device = self._simpler_at(track_index, device_index,
+                                             chain_path)
+            sample = self._simpler_sample(device)
+            changed = {}
+
+            if warping is not None:
+                sample.warping = bool(warping)
+                changed["warping"] = sample.warping
+
+            if warp_mode is not None:
+                index = self._resolve_simpler_enum(
+                    sample, "warp_mode", warp_mode, SAMPLE_WARP_MODES,
+                    "warp_mode")
+                sample.warp_mode = index
+                changed["warp_mode"] = self._simpler_enum_report(
+                    sample, "warp_mode", SAMPLE_WARP_MODES)
+
+            if start_frames is not None or start_beats is not None:
+                sample.start_marker = self._sample_frames_at(
+                    sample, start_frames, start_beats, "start")
+                changed["start_marker"] = sample.start_marker
+
+            if end_frames is not None or end_beats is not None:
+                sample.end_marker = self._sample_frames_at(
+                    sample, end_frames, end_beats, "end")
+                changed["end_marker"] = sample.end_marker
+
+            if gain is not None:
+                sample.gain = float(gain)
+                changed["gain"] = sample.gain
+                try:
+                    changed["gain_display"] = sample.gain_display_string()
+                except Exception:
+                    pass
+
+            if action:
+                # getattr(..., True) so a build that simply does not publish
+                # the can_* flag still gets to try the call and let Live judge.
+                if action == "reverse":
+                    self._require_member(device, "reverse", "Simpler")
+                    device.reverse()
+                elif action == "crop":
+                    self._require_member(device, "crop", "Simpler")
+                    device.crop()
+                elif action == "guess_playback_length":
+                    self._require_member(device, "guess_playback_length",
+                                         "Simpler")
+                    device.guess_playback_length()
+                elif action == "warp_half":
+                    self._require_member(device, "warp_half", "Simpler")
+                    if not getattr(device, "can_warp_half", True):
+                        raise ValueError(
+                            "'{0}' cannot halve its warp length right "
+                            "now".format(device.name))
+                    device.warp_half()
+                elif action == "warp_double":
+                    self._require_member(device, "warp_double", "Simpler")
+                    if not getattr(device, "can_warp_double", True):
+                        raise ValueError(
+                            "'{0}' cannot double its warp length right "
+                            "now".format(device.name))
+                    device.warp_double()
+                elif action == "warp_as":
+                    self._require_member(device, "warp_as", "Simpler")
+                    if warp_as_beats is None:
+                        raise ValueError("warp_as needs warp_as_beats")
+                    if not getattr(device, "can_warp_as", True):
+                        raise ValueError(
+                            "'{0}' cannot be warped to a fixed length right "
+                            "now".format(device.name))
+                    device.warp_as(float(warp_as_beats))
+                else:
+                    raise ValueError(
+                        "Unknown sample action '{0}'. Use reverse, crop, "
+                        "guess_playback_length, warp_as, warp_half or "
+                        "warp_double.".format(action))
+                changed["action"] = action
+
+            result = {"track": track.name, "device": device.name,
+                      "changed": changed}
+            # The sample object is replaced by crop/reverse, so re-read.
+            fresh = device.sample
+            if fresh is not None:
+                for attr in ("start_marker", "end_marker", "length", "warping",
+                             "warp_mode"):
+                    try:
+                        result[attr] = getattr(fresh, attr)
+                    except Exception:
+                        pass
+                name = self._simpler_enum_name(fresh, "warp_mode",
+                                               SAMPLE_WARP_MODES)
+                if name is not None:
+                    result["warp_mode_name"] = name
+                try:
+                    result["gain_display"] = fresh.gain_display_string()
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            self.log_message("Error managing simpler sample: " + str(e))
+            raise
+
+    def _manage_simpler_slices(self, track_index, device_index, chain_path=None,
+                               action="info", at_frames=None, at_beats=None,
+                               to_frames=None, to_beats=None,
+                               slicing_style=None, beat_division=None,
+                               region_count=None, sensitivity=None):
+        """Chop a sample into slices — the loop-to-playable-rack move.
+
+        Slice positions are sample frames in Live's API; beats are converted
+        through Sample.beat_to_sample_time. insert/remove/move address a slice
+        by its POSITION, never by an ordinal, which is why the info action
+        reports both units.
+        """
+        try:
+            track, device = self._simpler_at(track_index, device_index,
+                                             chain_path)
+            sample = self._simpler_sample(device)
+            changed = {}
+
+            if slicing_style is not None:
+                self._require_member(sample, "slicing_style", "Sample")
+                index = self._resolve_simpler_enum(
+                    sample, "slicing_style", slicing_style,
+                    SAMPLE_SLICING_STYLES, "slicing_style")
+                sample.slicing_style = index
+                changed["slicing_style"] = self._simpler_enum_report(
+                    sample, "slicing_style", SAMPLE_SLICING_STYLES)
+
+            if beat_division is not None:
+                self._require_member(sample, "slicing_beat_division", "Sample")
+                sample.slicing_beat_division = int(beat_division)
+                changed["slicing_beat_division"] = sample.slicing_beat_division
+
+            if region_count is not None:
+                self._require_member(sample, "slicing_region_count", "Sample")
+                sample.slicing_region_count = int(region_count)
+                changed["slicing_region_count"] = sample.slicing_region_count
+
+            if sensitivity is not None:
+                self._require_member(sample, "slicing_sensitivity", "Sample")
+                sample.slicing_sensitivity = float(sensitivity)
+                changed["slicing_sensitivity"] = sample.slicing_sensitivity
+
+            if action == "add":
+                where = self._sample_frames_at(sample, at_frames, at_beats,
+                                               "slice position")
+                sample.insert_slice(where)
+                changed["added_at_frames"] = where
+            elif action == "remove":
+                where = self._sample_frames_at(sample, at_frames, at_beats,
+                                               "slice position")
+                sample.remove_slice(where)
+                changed["removed_at_frames"] = where
+            elif action == "move":
+                old = self._sample_frames_at(sample, at_frames, at_beats,
+                                             "slice position")
+                new = self._sample_frames_at(sample, to_frames, to_beats,
+                                             "new slice position")
+                sample.move_slice(old, new)
+                changed["moved"] = "{0} -> {1}".format(old, new)
+            elif action == "clear":
+                sample.clear_slices()
+                changed["cleared"] = True
+            elif action == "reset":
+                sample.reset_slices()
+                changed["reset"] = True
+            elif action != "info":
+                raise ValueError(
+                    "Unknown slice action '{0}'. Use info, add, remove, move, "
+                    "clear or reset.".format(action))
+
+            result = {
+                "track": track.name,
+                "device": device.name,
+                "changed": changed,
+                "playback_mode": getattr(device, "playback_mode", None),
+                "pad_slicing": getattr(device, "pad_slicing", None),
+                "slicing_style": getattr(sample, "slicing_style", None),
+                "slicing_beat_division": getattr(
+                    sample, "slicing_beat_division", None),
+                "slicing_region_count": getattr(
+                    sample, "slicing_region_count", None),
+                "slicing_sensitivity": getattr(
+                    sample, "slicing_sensitivity", None),
+            }
+            name = self._simpler_enum_name(device, "playback_mode",
+                                           SIMPLER_PLAYBACK_MODES)
+            if name is not None:
+                result["playback_mode_name"] = name
+            name = self._simpler_enum_name(sample, "slicing_style",
+                                           SAMPLE_SLICING_STYLES)
+            if name is not None:
+                result["slicing_style_name"] = name
+            try:
+                slices = [int(x) for x in sample.slices]
+                result["slice_count"] = len(slices)
+                result["slices_frames"] = slices[:128]
+                result["slices_beats"] = [
+                    round(sample.sample_to_beat_time(x), 4)
+                    for x in slices[:128]]
+            except Exception:
+                result["slice_count"] = 0
+            return result
+        except Exception as e:
+            self.log_message("Error managing simpler slices: " + str(e))
+            raise
+
+    # Take lanes
+
+    def _describe_take_lane(self, lane, index):
+        """Summarise one take lane for the client."""
+        info = {"index": index}
+        for attr in ("name", "is_included_in_playback", "has_clips"):
+            try:
+                info[attr] = self._describe_value(getattr(lane, attr))
+            except Exception:
+                pass
+        try:
+            info["clip_count"] = len(tuple(lane.clips))
+        except Exception:
+            pass
+        return info
+
+    def _take_lanes_of(self, track):
+        """Return the track's take lanes, or raise if this Live can't do them."""
+        if not hasattr(track, "take_lanes"):
+            raise ValueError(
+                "Track '{0}' has no take_lanes (needs Live 11.1 or newer)".format(
+                    track.name))
+        return tuple(track.take_lanes)
+
+    def _manage_take_lanes(self, track_index, action="info", lane_index=None,
+                           name=None, include_in_playback=None):
+        """Inspect, create and comp take lanes on a track.
+
+        Actions: info, create, rename, update, use_take.
+        'use_take' includes exactly one lane in playback and excludes the
+        rest, which is how you audition take 1 against take 3.
+        """
+        try:
+            track = self._track_at(track_index)
+            lanes = self._take_lanes_of(track)
+
+            if action == "info":
+                pass
+            elif action == "create":
+                if not hasattr(track, "create_take_lane"):
+                    raise ValueError(
+                        "Track '{0}' cannot create take lanes".format(track.name))
+                track.create_take_lane()
+                lanes = self._take_lanes_of(track)
+                if name and lanes:
+                    try:
+                        lanes[-1].name = name
+                    except (AttributeError, RuntimeError) as e:
+                        self.log_message("TakeLane.name assignment failed: " + str(e))
+            elif action in ("rename", "update", "use_take"):
+                if lane_index is None:
+                    raise ValueError("lane_index is required for '{0}'".format(action))
+                if lane_index < 0 or lane_index >= len(lanes):
+                    raise IndexError(
+                        "Take lane index out of range (track has {0})".format(len(lanes)))
+                lane = lanes[lane_index]
+                if action == "use_take":
+                    for i, other in enumerate(lanes):
+                        if not hasattr(other, "is_included_in_playback"):
+                            continue
+                        try:
+                            other.is_included_in_playback = (i == lane_index)
+                        except (AttributeError, RuntimeError) as e:
+                            self.log_message(
+                                "TakeLane.is_included_in_playback failed: " + str(e))
+                else:
+                    if name is not None:
+                        try:
+                            lane.name = name
+                        except (AttributeError, RuntimeError) as e:
+                            self.log_message(
+                                "TakeLane.name assignment failed: " + str(e))
+                    if include_in_playback is not None:
+                        if not hasattr(lane, "is_included_in_playback"):
+                            self.log_message(
+                                "TakeLane has no is_included_in_playback here")
+                        else:
+                            try:
+                                lane.is_included_in_playback = bool(include_in_playback)
+                            except (AttributeError, RuntimeError) as e:
+                                self.log_message(
+                                    "TakeLane.is_included_in_playback failed: " + str(e))
+            else:
+                raise ValueError(
+                    "Unknown action '{0}'. Use info, create, rename, "
+                    "update or use_take".format(action))
+
+            lanes = self._take_lanes_of(track)
+            return {
+                "track_name": track.name,
+                "action": action,
+                "take_lanes": [self._describe_take_lane(l, i)
+                               for i, l in enumerate(lanes)],
+            }
+        except Exception as e:
+            self.log_message("Error managing take lanes: " + str(e))
+            raise
+
+    # Cue points (locators)
+
+    def _resolve_cue_point(self, cue_index=None, name=None):
+        """Find a cue point by 0-based index or by exact/lowercase name."""
+        cues = tuple(self._song.cue_points)
+        if not cues:
+            raise ValueError("This Set has no cue points")
+        if cue_index is not None:
+            if cue_index < 0 or cue_index >= len(cues):
+                raise IndexError(
+                    "Cue point index out of range (Set has {0})".format(len(cues)))
+            return cues[cue_index]
+        if name:
+            for cp in cues:
+                if cp.name.lower() == str(name).lower():
+                    return cp
+            available = [cp.name for cp in cues]
+            raise ValueError("Cue point '{0}' not found. Available: {1}".format(
+                name, ", ".join(available)))
+        raise ValueError("Provide cue_index or name")
+
+    def _edit_cue_point(self, cue_index=None, name=None, new_name=None,
+                        time=None, jump=False):
+        """Rename, move or jump to an existing locator.
+
+        CuePoint.time is read-only in most Live builds; when the move is
+        refused it is reported back instead of failing the whole call.
+        """
+        try:
+            cp = self._resolve_cue_point(cue_index, name)
+            result = {"name": cp.name, "time": cp.time}
+            if new_name is not None:
+                try:
+                    cp.name = new_name
+                    result["name"] = cp.name
+                except (AttributeError, RuntimeError) as e:
+                    self.log_message("CuePoint.name assignment failed: " + str(e))
+                    result["rename_failed"] = str(e)
+            if time is not None:
+                try:
+                    cp.time = float(time)
+                    result["time"] = cp.time
+                except (AttributeError, RuntimeError, TypeError) as e:
+                    self.log_message("CuePoint.time assignment failed: " + str(e))
+                    result["move_failed"] = (
+                        "CuePoint.time is read-only here — delete this locator "
+                        "and create a new one at the target position")
+            if jump:
+                if not hasattr(cp, "jump"):
+                    result["jump_failed"] = (
+                        "CuePoint.jump is unavailable in this Live build")
+                else:
+                    cp.jump()
+                    result["jumped_to"] = self._song.current_song_time
+            return result
+        except Exception as e:
+            self.log_message("Error editing cue point: " + str(e))
+            raise
+
+    # Groove pool
+
+    def _groove_base_options(self, groove):
+        """Names accepted for Groove.base, the current value, and resolvability.
+
+        Returns (options, current, resolvable). ``resolvable`` is False when
+        this Live build reports ``base`` as a bare number with no accompanying
+        name list — in that case we refuse to guess an integer ordering.
+        """
+        options = []
+        current = None
+        try:
+            current_value = groove.base
+        except Exception:
+            return options, current, False
+
+        # Preferred: the _index/_list pair, when the build exposes one.
+        if hasattr(groove, "base_list") and hasattr(groove, "base_index"):
+            try:
+                options = [str(n) for n in groove.base_list]
+                idx = int(groove.base_index)
+                if 0 <= idx < len(options):
+                    current = options[idx]
+                return options, current, True
+            except Exception as e:
+                self.log_message(
+                    "Groove.base_list/base_index read failed: " + str(e))
+                options = []
+
+        # Fallback: a real enum object exposes named members of its own type.
+        # A plain int/float carries no names, so nothing is resolvable there.
+        cls = type(current_value)
+        if not isinstance(current_value, (int, float)):
+            for member in dir(cls):
+                if member.startswith("_"):
+                    continue
+                try:
+                    value = getattr(cls, member)
+                except Exception:
+                    continue
+                if isinstance(value, cls):
+                    options.append(member)
+                    if value == current_value:
+                        current = member
+        if current is None:
+            current = str(current_value)
+        return options, current, bool(options)
+
+    def _set_groove_base(self, groove, base):
+        """Set Groove.base from a display name. Never guesses an index."""
+        if hasattr(groove, "base_list") and hasattr(groove, "base_index"):
+            names = [str(n) for n in groove.base_list]
+            for i, n in enumerate(names):
+                if n.lower() == str(base).lower():
+                    groove.base_index = i
+                    return names[i]
+            raise ValueError("Base '{0}' not found. Available: {1}".format(
+                base, ", ".join(names) or "(none reported)"))
+
+        options, _, resolvable = self._groove_base_options(groove)
+        if not resolvable:
+            raise ValueError(
+                "This Live build reports Groove.base as an unnamed value, so it "
+                "cannot be set by name and this tool will not guess an index — "
+                "change the base in Live's Groove Pool instead")
+        current = groove.base
+        cls = type(current)
+        wanted = str(base).lower().replace(" ", "_")
+        for member in options:
+            if member.lower() == wanted:
+                groove.base = getattr(cls, member)
+                return member
+        raise ValueError("Base '{0}' not found. Available: {1}".format(
+            base, ", ".join(options)))
+
+    def _describe_groove(self, groove, index):
+        """Full read-out of one groove: base, and the four feel amounts."""
+        info = {"index": index}
+        try:
+            info["name"] = groove.name
+        except Exception:
+            pass
+        options, current, resolvable = self._groove_base_options(groove)
+        info["base"] = current
+        info["base_options"] = options
+        info["base_settable"] = resolvable
+        for attr in ("quantization_amount", "timing_amount", "random_amount",
+                     "velocity_amount"):
+            try:
+                info[attr] = self._describe_value(getattr(groove, attr))
+            except Exception:
+                pass
+        return info
+
+    def _is_integer_like(self, value):
+        """True for int/long but not bool or str — py2 and py3 safe."""
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return True
+        return hasattr(value, "__index__") and not hasattr(value, "lower")
+
+    def _manage_groove_pool(self, groove=None, base=None,
+                            quantization_amount=None, timing_amount=None,
+                            random_amount=None, velocity_amount=None,
+                            global_amount=None, new_name=None):
+        """Read the groove pool, and edit one groove's feel in place.
+
+        With no ``groove`` this is a report. With ``groove`` (name or 0-based
+        index) the omitted amounts are left alone. The groove is resolved
+        before anything is written, so a bad name changes nothing at all.
+        """
+        try:
+            try:
+                grooves = list(self._song.groove_pool.grooves)
+            except Exception:
+                return {"supported": False, "grooves": [],
+                        "groove_amount": getattr(self._song, "groove_amount", None)}
+
+            target = None
+            target_index = None
+            if groove is not None:
+                if not grooves:
+                    raise ValueError(
+                        "Groove pool is empty. Drag a groove in from the browser, "
+                        "or extract one from a clip, first")
+                if self._is_integer_like(groove):
+                    idx = int(groove)
+                    if idx < 0 or idx >= len(grooves):
+                        raise IndexError(
+                            "Groove index out of range (pool has {0})".format(
+                                len(grooves)))
+                    target, target_index = grooves[idx], idx
+                else:
+                    for i, g in enumerate(grooves):
+                        if g.name.lower() == str(groove).lower():
+                            target, target_index = g, i
+                            break
+                if target is None:
+                    raise ValueError("Groove '{0}' not found. Available: {1}".format(
+                        groove, ", ".join([g.name for g in grooves])))
+
+            # Only mutate once every argument has been validated.
+            if global_amount is not None:
+                if not hasattr(self._song, "groove_amount"):
+                    self.log_message("Song has no groove_amount in this Live build")
+                else:
+                    self._song.groove_amount = max(
+                        0.0, min(1.0, float(global_amount)))
+
+            if target is None:
+                return {
+                    "supported": True,
+                    "groove_amount": getattr(self._song, "groove_amount", None),
+                    "grooves": [self._describe_groove(g, i)
+                                for i, g in enumerate(grooves)],
+                }
+
+            changed = {}
+            if base is not None:
+                changed["base"] = self._set_groove_base(target, base)
+            for attr, value in (("quantization_amount", quantization_amount),
+                                ("timing_amount", timing_amount),
+                                ("random_amount", random_amount),
+                                ("velocity_amount", velocity_amount)):
+                if value is None:
+                    continue
+                if not hasattr(target, attr):
+                    self.log_message("Groove has no " + attr + " in this Live build")
+                    continue
+                try:
+                    setattr(target, attr, float(value))
+                    changed[attr] = getattr(target, attr)
+                except (AttributeError, RuntimeError, TypeError) as e:
+                    self.log_message(
+                        "Groove." + attr + " assignment failed: " + str(e))
+            if new_name is not None:
+                try:
+                    target.name = new_name
+                    changed["name"] = target.name
+                except (AttributeError, RuntimeError) as e:
+                    self.log_message("Groove.name assignment failed: " + str(e))
+
+            return {
+                "supported": True,
+                "groove_amount": getattr(self._song, "groove_amount", None),
+                "changed": changed,
+                "groove": self._describe_groove(target, target_index),
+            }
+        except Exception as e:
+            self.log_message("Error managing groove pool: " + str(e))
+            raise
+
+    # Application, views and modal dialogs
+
+    def _get_application_info(self):
+        """Live's version, its main views, and any modal dialog that is up."""
+        try:
+            app = self.application()
+            info = {}
+            parts = []
+            for getter, key in (("get_major_version", "major"),
+                                ("get_minor_version", "minor"),
+                                ("get_bugfix_version", "bugfix")):
+                try:
+                    value = getattr(app, getter)()
+                    info[key] = value
+                    parts.append(str(value))
+                except Exception:
+                    pass
+            if parts:
+                info["version"] = ".".join(parts)
+
+            views = []
+            try:
+                for view_name in tuple(app.view.available_main_views()):
+                    entry = {"name": view_name}
+                    try:
+                        entry["visible"] = app.view.is_view_visible(view_name)
+                    except Exception:
+                        pass
+                    views.append(entry)
+            except Exception as e:
+                self.log_message("available_main_views failed: " + str(e))
+            info["main_views"] = views
+            try:
+                info["focused_document_view"] = app.view.focused_document_view
+            except Exception:
+                pass
+
+            dialog = {}
+            for attr in ("open_dialog_count", "current_dialog_message",
+                         "current_dialog_button_count"):
+                try:
+                    dialog[attr] = self._describe_value(getattr(app, attr))
+                except Exception:
+                    pass
+            dialog["open"] = bool(dialog.get("open_dialog_count") or 0)
+            dialog["can_press"] = hasattr(app, "press_current_dialog_button")
+            info["dialog"] = dialog
+            return info
+        except Exception as e:
+            self.log_message("Error getting application info: " + str(e))
+            raise
+
+    def _press_dialog_button(self, button_index=0):
+        """Dismiss Live's current modal dialog by pressing one of its buttons."""
+        try:
+            app = self.application()
+            count = 0
+            try:
+                count = int(app.open_dialog_count)
+            except Exception:
+                pass
+            if not count:
+                return {"dialog_open": False, "pressed": None,
+                        "message": "No dialog is open"}
+            if not hasattr(app, "press_current_dialog_button"):
+                raise ValueError(
+                    "This Live build has no "
+                    "Application.press_current_dialog_button — dismiss the "
+                    "dialog by hand")
+            message = ""
+            try:
+                message = app.current_dialog_message
+            except Exception:
+                pass
+            app.press_current_dialog_button(int(button_index))
+            remaining = 0
+            try:
+                remaining = int(app.open_dialog_count)
+            except Exception:
+                pass
+            return {"dialog_open": bool(remaining), "pressed": int(button_index),
+                    "dismissed_message": message, "open_dialog_count": remaining}
+        except Exception as e:
+            self.log_message("Error pressing dialog button: " + str(e))
+            raise
+
+    def _require_view_member(self, view, member):
+        """Raise a readable error when this build's View lacks a method."""
+        if not hasattr(view, member):
+            raise ValueError(
+                "This Live build's Application.View has no '{0}'".format(member))
+
+    def _control_live_view(self, action, view_name=None, direction="down",
+                           modifier=False):
+        """Show, hide, focus, toggle, scroll or zoom any named Live view."""
+        try:
+            app = self.application()
+            view = app.view
+            NAV = {"up": 0, "down": 1, "left": 2, "right": 3}
+            if action in ("show", "hide", "focus", "toggle", "scroll", "zoom"):
+                if not view_name:
+                    raise ValueError("view_name is required for '{0}'".format(action))
+            else:
+                raise ValueError(
+                    "Unknown action '{0}'. Use show, hide, focus, toggle, "
+                    "scroll or zoom".format(action))
+
+            available = []
+            try:
+                available = list(view.available_main_views())
+            except Exception:
+                pass
+            if available and view_name not in available:
+                for candidate in available:
+                    if candidate.lower() == str(view_name).lower():
+                        view_name = candidate
+                        break
+
+            if action == "show":
+                self._require_view_member(view, "show_view")
+                view.show_view(view_name)
+            elif action == "hide":
+                self._require_view_member(view, "hide_view")
+                view.hide_view(view_name)
+            elif action == "focus":
+                self._require_view_member(view, "focus_view")
+                view.focus_view(view_name)
+            elif action == "toggle":
+                self._require_view_member(view, "is_view_visible")
+                self._require_view_member(view, "show_view")
+                self._require_view_member(view, "hide_view")
+                if view.is_view_visible(view_name):
+                    view.hide_view(view_name)
+                else:
+                    view.show_view(view_name)
+            elif action == "scroll":
+                if direction not in NAV:
+                    raise ValueError("direction must be up, down, left or right")
+                self._require_view_member(view, "scroll_view")
+                view.scroll_view(NAV[direction], view_name, bool(modifier))
+            elif action == "zoom":
+                if direction not in NAV:
+                    raise ValueError("direction must be up, down, left or right")
+                self._require_view_member(view, "zoom_view")
+                view.zoom_view(NAV[direction], view_name, bool(modifier))
+
+            result = {"action": action, "view": view_name}
+            try:
+                result["visible"] = view.is_view_visible(view_name)
+            except Exception:
+                pass
+            try:
+                result["focused_document_view"] = view.focused_document_view
+            except Exception:
+                pass
+            return result
+        except Exception as e:
+            self.log_message("Error controlling Live view: " + str(e))
+            raise
+
+    # Tuning systems
+
+    def _describe_tuning_system(self, tuning):
+        """Name a TuningSystem object (or report 12-TET when there is none)."""
+        if tuning is None:
+            return {"name": "12-TET (default)", "custom": False}
+        info = {"custom": True}
+        for attr in ("name", "id"):
+            try:
+                info[attr] = self._describe_value(getattr(tuning, attr))
+            except Exception:
+                pass
+        if "name" not in info:
+            info["name"] = self._describe_value(tuning)
+        return info
+
+    def _collect_tuning_items(self, node, out, depth=0):
+        """Walk a browser folder collecting loadable tuning items."""
+        if depth > 6 or len(out) >= 256:
+            return
+        try:
+            children = list(node.children)
+        except Exception:
+            children = []
+        for child in children:
+            if len(out) >= 256:
+                return
+            try:
+                if getattr(child, "is_loadable", False):
+                    out.append(child)
+                else:
+                    self._collect_tuning_items(child, out, depth + 1)
+            except Exception:
+                continue
+
+    def _available_tuning_items(self):
+        """Tuning files exposed by Live 12's browser, if this build has them."""
+        app = self.application()
+        browser = getattr(app, "browser", None)
+        if browser is None:
+            return []
+        root = getattr(browser, "tunings", None)
+        if root is None:
+            return []
+        items = []
+        self._collect_tuning_items(root, items)
+        return items
+
+    def _manage_tuning_system(self, action="info", name=None):
+        """Report, load or clear the Set's tuning system.
+
+        Live types Song.tuning_system as an object, so it cannot be assigned a
+        string — a custom tuning is applied by loading it from the browser,
+        and cleared by assigning None (back to 12-TET).
+        """
+        try:
+            if not hasattr(self._song, "tuning_system"):
+                return {"supported": False,
+                        "message": "This Live build has no Song.tuning_system"}
+            items = []
+            try:
+                items = self._available_tuning_items()
+            except Exception as e:
+                self.log_message("Listing browser tunings failed: " + str(e))
+
+            if action == "info":
+                pass
+            elif action == "clear":
+                self._song.tuning_system = None
+            elif action == "load":
+                if not name:
+                    raise ValueError("name is required to load a tuning system")
+                if not items:
+                    raise ValueError(
+                        "No tunings in the browser — add .ascl/.scl files to the "
+                        "User Library first")
+                target = None
+                for item in items:
+                    if item.name.lower() == str(name).lower():
+                        target = item
+                        break
+                if target is None:
+                    for item in items:
+                        if str(name).lower() in item.name.lower():
+                            target = item
+                            break
+                if target is None:
+                    raise ValueError("Tuning '{0}' not found. Available: {1}".format(
+                        name, ", ".join([i.name for i in items[:40]])))
+                browser = getattr(self.application(), "browser", None)
+                if browser is None or not hasattr(browser, "load_item"):
+                    raise ValueError(
+                        "This Live build's browser cannot load items")
+                browser.load_item(target)
+            else:
+                raise ValueError(
+                    "Unknown action '{0}'. Use info, load or clear".format(action))
+
+            return {
+                "supported": True,
+                "action": action,
+                "current": self._describe_tuning_system(self._song.tuning_system),
+                "available": [i.name for i in items[:64]],
+            }
+        except Exception as e:
+            self.log_message("Error managing tuning system: " + str(e))
+            raise
+
     # Generic Live Object Model access
 
     def _resolve_lom_path(self, path):
@@ -3255,115 +6425,7 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error moving device: " + str(e))
             raise
 
-    def _manage_rack(self, track_index, device_index, action="info", value=None):
-        """Inspect and control a rack: macros, variations, chain selector."""
-        try:
-            track = self._track_at(track_index)
-            device = track.devices[device_index]
-            if not getattr(device, "can_have_chains", False):
-                raise ValueError("'{0}' is not a rack".format(device.name))
 
-            if action == "info":
-                info = {"device": device.name}
-                for attr in ("variation_count", "selected_variation_index",
-                             "visible_macro_count", "has_macro_mappings",
-                             "is_showing_chains"):
-                    try:
-                        info[attr] = getattr(device, attr)
-                    except Exception:
-                        pass
-                try:
-                    info["chains"] = [c.name for c in device.chains]
-                except Exception:
-                    pass
-                try:
-                    info["macros"] = [
-                        {"name": p.name, "value": p.value}
-                        for p in device.parameters if "Macro" in p.name]
-                except Exception:
-                    pass
-                return info
-            if action == "add_macro":
-                device.add_macro()
-                return {"device": device.name, "action": "add_macro",
-                        "visible_macro_count": device.visible_macro_count}
-            if action == "remove_macro":
-                device.remove_macro()
-                return {"device": device.name, "action": "remove_macro",
-                        "visible_macro_count": device.visible_macro_count}
-            if action == "randomize_macros":
-                device.randomize_macros()
-                return {"device": device.name, "action": "randomize_macros"}
-            if action == "store_variation":
-                device.store_variation()
-                return {"device": device.name, "action": "store_variation",
-                        "variation_count": device.variation_count}
-            if action == "recall_variation":
-                if value is not None:
-                    device.selected_variation_index = int(value)
-                device.recall_selected_variation()
-                return {"device": device.name, "action": "recall_variation",
-                        "selected_variation_index": device.selected_variation_index}
-            if action == "delete_variation":
-                device.delete_selected_variation()
-                return {"device": device.name, "action": "delete_variation",
-                        "variation_count": device.variation_count}
-            if action == "chain_selector":
-                if value is None:
-                    raise ValueError("chain_selector requires a value")
-                selector = device.chain_selector
-                target = selector.min + (selector.max - selector.min) * \
-                    max(0.0, min(1.0, float(value)))
-                selector.value = target
-                return {"device": device.name, "chain_selector": selector.value}
-            raise ValueError("Unknown rack action '{0}'".format(action))
-        except Exception as e:
-            self.log_message("Error managing rack: " + str(e))
-            raise
-
-    def _control_looper(self, track_index, device_index=None, action="info"):
-        """Control a Looper device — record, overdub, play, stop, clear, export."""
-        try:
-            track = self._track_at(track_index)
-            devices = tuple(track.devices)
-            looper = None
-            if device_index is not None:
-                looper = devices[device_index]
-            else:
-                for d in devices:
-                    if d.class_name == "Looper" or "looper" in d.name.lower():
-                        looper = d
-                        break
-            if looper is None:
-                raise ValueError("No Looper found on '{0}'".format(track.name))
-
-            if action == "info":
-                info = {"device": looper.name}
-                for attr in ("loop_length", "tempo", "record_length_index"):
-                    try:
-                        info[attr] = getattr(looper, attr)
-                    except Exception:
-                        pass
-                info["available_actions"] = [
-                    a for a in ("record", "overdub", "play", "stop", "clear",
-                                "undo", "double_length", "half_length",
-                                "double_speed", "half_speed",
-                                "export_to_clip_slot")
-                    if hasattr(looper, a)]
-                return info
-
-            if not hasattr(looper, action):
-                raise ValueError(
-                    "Looper has no action '{0}'. Available: {1}".format(
-                        action, ", ".join(
-                            a for a in dir(looper)
-                            if not a.startswith("_") and callable(
-                                getattr(looper, a, None)))))
-            getattr(looper, action)()
-            return {"device": looper.name, "action": action, "done": True}
-        except Exception as e:
-            self.log_message("Error controlling looper: " + str(e))
-            raise
 
     def _set_song_scale(self, root_note=None, scale_name=None,
                         swing_amount=None, clip_trigger_quantization=None):

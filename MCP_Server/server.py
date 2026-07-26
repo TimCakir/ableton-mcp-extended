@@ -1049,6 +1049,1710 @@ def set_device_sidechain(
 
 
 @mcp.tool()
+def get_drift_modulation(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+) -> str:
+    """Read Drift's modulation matrix, voicing and pitch bend range.
+
+    Reach for this before rewiring Drift: it lists what each of the three
+    matrix slots and the dedicated filter / LFO / pitch / shape sources are
+    currently routed to, AND every legal option per slot with its exact
+    spelling. Live's option lists differ between versions, so read first,
+    then pass the names straight back into set_drift_modulation.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        r = ableton.send_command("get_drift_modulation", {
+            "track_index": ti, "device_index": di,
+        })
+        lines = [f"'{r.get('device')}' on '{r.get('track')}'"]
+        slots = r.get("slots") or {}
+        options = r.get("options") or {}
+        for key, value in slots.items():
+            choices = options.get(key) or []
+            suffix = ""
+            if choices:
+                shown = ", ".join(str(c) for c in choices[:20])
+                if len(choices) > 20:
+                    shown += ", ... (+{0} more)".format(len(choices) - 20)
+                suffix = f"  (options: {shown})"
+            lines.append(f"  {key}: {value}{suffix}")
+        if r.get("pitch_bend_range") is not None:
+            lines.append(f"  pitch_bend_range: {r.get('pitch_bend_range')}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error reading Drift modulation: {str(e)}")
+        return f"Error reading Drift modulation: {str(e)}"
+
+
+@mcp.tool()
+def set_drift_modulation(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    source_1: str | None = None,
+    target_1: str | None = None,
+    source_2: str | None = None,
+    target_2: str | None = None,
+    source_3: str | None = None,
+    target_3: str | None = None,
+    filter_source_1: str | None = None,
+    filter_source_2: str | None = None,
+    lfo_source: str | None = None,
+    pitch_source_1: str | None = None,
+    pitch_source_2: str | None = None,
+    shape_source: str | None = None,
+    voice_count: str | int | None = None,
+    voice_mode: str | None = None,
+    pitch_bend_range: int | None = None,
+) -> str:
+    """Rewire Drift's modulation matrix and voice handling, all by NAME.
+
+    This is where a Drift patch stops being static: route the envelope to
+    pitch for a bass pluck, an LFO to filter for movement under a pad, or
+    velocity to shape so playing harder opens the tone. The three general
+    slots are source/target pairs; filter, LFO, pitch and shape have their
+    own dedicated source picks with their own hard-wired destinations.
+
+    Voicing lives here too — go mono with glide for an acid line, or raise
+    the voice count for chords and long tails. Pitch bend range matters the
+    moment you play Drift from a keyboard or automate bends in a clip.
+
+    Names are resolved against Live's own option lists (exact, then
+    case-insensitive, then partial), so run get_drift_modulation first to
+    see the valid spellings. Anything omitted is left untouched, and any
+    slot this Live version does not expose is reported as "<not supported>"
+    rather than failing the whole call.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - source_1..3 / target_1..3: general matrix slots, e.g. source "LFO",
+      target "Filter Freq".
+    - filter_source_1 / filter_source_2 / lfo_source / pitch_source_1 /
+      pitch_source_2 / shape_source: dedicated modulation sources.
+    - voice_count: polyphony, as the label Live shows, e.g. "4" or 4.
+    - voice_mode: e.g. "Poly", "Mono", "Stereo".
+    - pitch_bend_range: in semitones, e.g. 2 or 12.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        payload: dict = {"track_index": ti, "device_index": di}
+        for key, val in (
+            ("source_1", source_1), ("target_1", target_1),
+            ("source_2", source_2), ("target_2", target_2),
+            ("source_3", source_3), ("target_3", target_3),
+            ("filter_source_1", filter_source_1),
+            ("filter_source_2", filter_source_2),
+            ("lfo_source", lfo_source),
+            ("pitch_source_1", pitch_source_1),
+            ("pitch_source_2", pitch_source_2),
+            ("shape_source", shape_source),
+            ("voice_count", str(voice_count) if voice_count is not None
+             else None),
+            ("voice_mode", voice_mode),
+            ("pitch_bend_range", pitch_bend_range),
+        ):
+            if val is not None:
+                payload[key] = val
+        if len(payload) == 2:
+            return "No Drift changes requested"
+        r = ableton.send_command("set_drift_modulation", payload)
+        lines = [f"'{r.get('device')}' on '{r.get('track')}'"]
+        changed = r.get("changed") or {}
+        if changed:
+            lines.append("  changed: " + ", ".join(
+                f"{k}={v}" for k, v in changed.items()))
+        slots = r.get("slots") or {}
+        if slots:
+            lines.append("  now: " + ", ".join(
+                f"{k}={v}" for k, v in slots.items()))
+        if r.get("pitch_bend_range") is not None:
+            lines.append(f"  pitch_bend_range: {r.get('pitch_bend_range')}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error setting Drift modulation: {str(e)}")
+        return f"Error setting Drift modulation: {str(e)}"
+
+@mcp.tool()
+def get_device_modes(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_index: int = 0,
+) -> str:
+    """List every mode switch a device exposes, with its exact option names.
+
+    Some of Live's best instruments hide their character in enum lists rather
+    than knobs: Spectral Resonator's Mode (Chord / Wall / Tube / Beam …),
+    Hybrid Reverb's IR category and file, Roar's routing (Serial / Parallel /
+    Mid-Side / Multiband), Shifter's Pitch / Ring / Frequency-shift mode,
+    Meld's engine per voice, EQ Eight's edit and global modes. None of these
+    are automatable parameters, so set_device_parameter cannot reach them.
+
+    Call this first — the option names and their ordering differ per device
+    and per Live version, and set_device_mode matches against exactly these
+    strings. Plain numeric extras (polyphony, pitch bend range, voice counts,
+    IR attack/decay/size) are reported underneath as values.
+
+    Parameters:
+    - track_index / device_index: 1-based location of the device.
+    - chain_index: Chain number inside a rack (1-based, 0 = no chain). Reads
+      the first device in that chain.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        ci = _optional_to_zero_based(chain_index, "chain_index")
+        r = ableton.send_command("get_device_modes", {
+            "track_index": ti,
+            "device_index": di,
+            "chain_index": ci,
+        })
+        lines = [
+            f"'{r.get('device')}' ({r.get('class_name')}) on '{r.get('track')}'"
+        ]
+        modes = r.get("modes") or []
+        if modes:
+            lines.append("")
+            lines.append("Modes (set by name with set_device_mode):")
+            for m in modes:
+                options = m.get("options") or []
+                shown = ", ".join(str(o) for o in options[:24])
+                if len(options) > 24:
+                    shown += f", … (+{len(options) - 24} more)"
+                lines.append(f"  {m['name']} = {m.get('current')}")
+                lines.append(f"    options: {shown}")
+        values = r.get("values") or []
+        if values:
+            lines.append("")
+            lines.append("Values:")
+            for v in values:
+                lines.append(f"  {v['name']} = {v.get('value')}")
+        if not modes and not values:
+            lines.append("")
+            lines.append(
+                "This device exposes no modes beyond the standard Device "
+                "members — everything about it lives in its parameters "
+                "(use get_device_parameters / set_device_parameter)."
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting device modes: {str(e)}")
+        return f"Error getting device modes: {str(e)}"
+
+
+@mcp.tool()
+def set_device_mode(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    mode: str | None = None,
+    value: str | int | float | bool | None = None,
+    settings: dict[str, str | int | float | bool] | None = None,
+    chain_index: int = 0,
+) -> str:
+    """Set a device's mode switches by NAME — the character choices, not knobs.
+
+    Reach for this when a sound needs to change identity rather than degree:
+    Spectral Resonator from Chord to Tube, or from Poly to Mono so it tracks
+    a bassline; Hybrid Reverb swapping its impulse response from a hall to a
+    plate or a piece of metal; Roar going Mid-Side so distortion only hits
+    the sides; Shifter switching from pitch-shift to ring modulation; Meld
+    picking a different engine; EQ Eight going Stereo -> Mid/Side or turning
+    on oversampling before a master bounce.
+
+    These live in Live's enum lists, not in the automatable parameter list,
+    so set_device_parameter cannot touch them. Values are matched
+    case-insensitively against the device's own option strings (a unique
+    partial match is accepted), so run get_device_modes first to see the
+    exact names — the ordering is never assumed.
+
+    The same call also sets plain numeric or on/off members that sit beside
+    those lists: polyphony, pitch_bend_range, poly_voices, unison_voices,
+    ir_attack_time, ir_decay_time, ir_size_factor, ir_time_shaping_on,
+    env_listen, oversample.
+
+    Parameters:
+    - track_index / device_index: 1-based location of the device.
+    - mode / value: one setting, e.g. mode="mod_mode", value="Wall", or
+      mode="polyphony", value=4.
+    - settings: several at once, applied in order, e.g.
+      {"ir_category": "Halls", "ir_file": "Concert Hall", "ir_decay_time": 0.6}.
+      Order matters where one list depends on another (pick ir_category
+      before ir_file — the file list is re-read after each write). Omitted
+      members are left unchanged. If one setting fails, the error names the
+      settings that were already applied.
+    - chain_index: Chain number inside a rack (1-based, 0 = no chain). Targets
+      the first device in that chain.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        ci = _optional_to_zero_based(chain_index, "chain_index")
+        combined: dict = {}
+        if mode is not None:
+            if value is None:
+                raise ValueError("mode needs a value")
+            combined[mode] = value
+        if settings:
+            combined.update(settings)
+        if not combined:
+            raise ValueError(
+                "Pass mode + value, or a settings dict of mode -> value"
+            )
+        r = ableton.send_command("set_device_mode", {
+            "track_index": ti,
+            "device_index": di,
+            "chain_index": ci,
+            "settings": combined,
+        })
+        changed = r.get("changed") or {}
+        if not changed:
+            return f"'{r.get('device')}': nothing changed"
+        return f"'{r.get('device')}' on '{r.get('track')}': " + ", ".join(
+            f"{k} = {v}" for k, v in changed.items())
+    except Exception as e:
+        logger.error(f"Error setting device mode: {str(e)}")
+        return f"Error setting device mode: {str(e)}"
+
+@mcp.tool()
+def get_plugin_info(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_index: int = 0,
+    bank: int = 0,
+) -> str:
+    """Report what a VST/AU plugin or Max for Live device exposes to Live.
+
+    Reach for this before trying to automate a third-party plugin. A plugin is
+    a black box: Live only sees the parameters the plugin publishes, so the
+    knob you can see in the plugin's own window may simply not exist here
+    until you map it by hand in Live's Configure mode. This tool tells you
+    what really is reachable — the parameter count, the plugin's own bank
+    grouping (the pages Push and MIDI controllers page through), and which of
+    the plugin's internal programs/presets is currently selected.
+
+    Bank listings print each slot's real parameter number, which is what
+    set_device_parameter's parameter_index takes, and values normalized
+    0.0-1.0, which is what its value takes.
+
+    Everything else about a VST stays opaque: no preset browsing by folder,
+    no reading the plugin's GUI state, no saving new plugin presets.
+
+    Parameters:
+    - track_index / device_index: 1-based location of the plugin.
+    - chain_index: Chain number inside a rack (1-based, 0 = not in a rack).
+      device_index then addresses the rack, and its chain's first device is used.
+    - bank: 1-based bank whose parameters you want listed. 0 = list bank
+      names only, which is the cheap first call on a big synth.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        ci = _optional_to_zero_based(chain_index, "chain_index")
+        payload: dict = {"track_index": ti, "device_index": di, "chain_index": ci}
+        if bank:
+            payload["bank"] = _to_zero_based(bank, "bank")
+        r = ableton.send_command("get_plugin_info", payload)
+
+        lines = [
+            f"'{r.get('device')}' on '{r.get('track')}' "
+            f"({r.get('class_name')})",
+            f"  parameters: {r.get('parameter_count')}",
+        ]
+        if not (r.get("is_plugin") or r.get("is_max_device")):
+            lines.append(
+                "  note: this is a stock Live device, not a VST/AU or M4L device"
+            )
+
+        count = r.get("preset_count") or 0
+        if count:
+            sel = r.get("selected_preset_index")
+            where = f"{sel + 1}/{count}" if isinstance(sel, int) else f"?/{count}"
+            lines.append(
+                f"  preset: '{r.get('selected_preset')}' ({where})"
+            )
+            names = r.get("presets") or []
+            shown = ", ".join(names[:20])
+            more = f" ... (+{len(names) - 20} more)" if len(names) > 20 else ""
+            lines.append(f"  presets: {shown}{more}")
+        else:
+            lines.append("  presets: none exposed")
+
+        bank_names = r.get("bank_names") or []
+        if bank_names:
+            lines.append(f"  banks ({r.get('bank_count')}): " + ", ".join(
+                f"{i + 1}:{n}" for i, n in enumerate(bank_names)))
+        elif r.get("bank_count"):
+            lines.append(f"  banks: {r.get('bank_count')} (unnamed)")
+        else:
+            lines.append("  banks: none exposed")
+
+        if r.get("bank_parameters") is not None:
+            label = r.get("bank_name") or f"bank {(r.get('bank') or 0) + 1}"
+            lines.append(f"\n  {label} (slot -> parameter_index):")
+            for i, p in enumerate(r["bank_parameters"], start=1):
+                if p is None:
+                    lines.append(f"    slot {i}: -")
+                    continue
+                idx = p.get("index")
+                pi = f"#{idx + 1}" if isinstance(idx, int) else "#?"
+                quant = " [quantized]" if p.get("is_quantized") else ""
+                lines.append(
+                    f"    slot {i}: param {pi} {p['name']} = "
+                    f"{p['display_value']} (normalized {p['value']:.3f})"
+                    f"{quant}")
+            lines.append(
+                "    set with set_device_parameter(parameter_index=<param #>, "
+                "value=<0.0-1.0>)")
+
+        buses = r.get("device_io_buses") or {}
+        if buses:
+            lines.append("\n  device IO buses: " + ", ".join(
+                f"{k}={v}" for k, v in buses.items())
+                + "  (inspect with get_device_io)")
+        if r.get("has_sidechain_input"):
+            lines.append("  sidechain input available (use set_device_sidechain)")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting plugin info: {str(e)}")
+        return f"Error getting plugin info: {str(e)}"
+
+
+@mcp.tool()
+def select_plugin_preset(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    preset: str | None = None,
+    preset_index: int | None = None,
+    chain_index: int = 0,
+) -> str:
+    """Load a VST/AU program or Max for Live preset by name or number.
+
+    The fast way to audition a third-party synth: ask get_plugin_info for the
+    preset list, then jump straight to "Deep Bass 3" instead of clicking
+    next/previous through 128 programs. Also how you recall a specific patch
+    reproducibly when building a live set. Use navigate_device_preset instead
+    when you just want to step to the next or previous one.
+
+    Only the plugin's own program list is reachable — Live's browser presets
+    and .vstpreset/.fxp files on disk are not, and there is no way to save a
+    new preset back into the plugin from here.
+
+    Parameters:
+    - track_index / device_index: 1-based location of the plugin.
+    - preset: Preset name; case-insensitive, a unique substring is enough.
+    - preset_index: 1-based preset number, as an alternative to preset.
+    - chain_index: Chain number inside a rack (1-based, 0 = not in a rack).
+    """
+    try:
+        if preset is None and preset_index is None:
+            return "Provide either preset (name) or preset_index (1-based)."
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        ci = _optional_to_zero_based(chain_index, "chain_index")
+        payload: dict = {"track_index": ti, "device_index": di, "chain_index": ci}
+        if preset is not None:
+            payload["preset"] = preset
+        if preset_index is not None:
+            payload["preset_index"] = _to_zero_based(preset_index, "preset_index")
+        r = ableton.send_command("select_plugin_preset", payload)
+        return (
+            f"'{r.get('device')}' on '{r.get('track')}' loaded preset "
+            f"'{r.get('preset')}' ({(r.get('preset_index') or 0) + 1}/"
+            f"{r.get('preset_count')})"
+        )
+    except Exception as e:
+        logger.error(f"Error selecting plugin preset: {str(e)}")
+        return f"Error selecting plugin preset: {str(e)}"
+
+
+@mcp.tool()
+def get_device_io(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_index: int = 0,
+) -> str:
+    """List a device's audio/MIDI buses and how each one is currently routed.
+
+    Max for Live devices can have extra inputs and outputs beyond the signal
+    chain they sit in — a sidechain input on an M4L compressor, a second
+    output feeding a different track, a MIDI output driving another
+    instrument. Those buses are invisible in the LOM until you look here, and
+    this is the call that tells you which bus names and channel names
+    set_device_io_routing will accept.
+
+    Native Live devices have no such buses. The ones that can be sidechained
+    (Compressor, Gate, Auto Filter) expose a single device-level input
+    instead, reported separately below and set with set_device_sidechain.
+
+    Parameters:
+    - track_index / device_index: 1-based location of the device.
+    - chain_index: Chain number inside a rack (1-based, 0 = not in a rack).
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        ci = _optional_to_zero_based(chain_index, "chain_index")
+        r = ableton.send_command("get_device_io", {
+            "track_index": ti, "device_index": di, "chain_index": ci,
+        })
+        lines = [
+            f"IO for '{r.get('device')}' on '{r.get('track')}' "
+            f"({r.get('class_name')}):"
+        ]
+        buses = r.get("buses") or []
+        if not buses:
+            lines.append("  no Device.IO buses (only Max for Live devices have them)")
+        for b in buses:
+            name = f" '{b['name']}'" if b.get("name") else ""
+            lines.append(
+                f"\n  {b['bus']}[{b['index'] + 1}]{name}: "
+                f"type={b.get('routing_type')} channel={b.get('routing_channel')}"
+            )
+            for label, key in (("types", "available_types"),
+                               ("channels", "available_channels")):
+                vals = b.get(key) or []
+                if vals:
+                    shown = ", ".join(vals[:24])
+                    more = f" ... (+{len(vals) - 24} more)" if len(vals) > 24 else ""
+                    lines.append(f"    available {label}: {shown}{more}")
+        sc = r.get("sidechain_input")
+        if sc:
+            lines.append(
+                f"\n  sidechain input: type={sc.get('routing_type')} "
+                f"channel={sc.get('routing_channel')} "
+                f"(set with set_device_sidechain)"
+            )
+            vals = sc.get("available_types") or []
+            if vals:
+                lines.append("    available sources: " + ", ".join(vals[:24]))
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting device IO: {str(e)}")
+        return f"Error getting device IO: {str(e)}"
+
+
+@mcp.tool()
+def set_device_io_routing(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    bus: str,
+    routing_type: str | None = None,
+    routing_channel: str | None = None,
+    bus_index: int = 1,
+    chain_index: int = 0,
+) -> str:
+    """Route one of a Max for Live device's audio or MIDI buses.
+
+    This is how you wire an M4L device into the rest of the Set: feed an M4L
+    sidechain/analysis input from the kick track, send an M4L device's second
+    audio output to its own track for parallel processing, or point an M4L
+    sequencer's MIDI output at another instrument. Anything that in the UI is
+    the little routing chooser on the device itself rather than on the track.
+
+    Names match case-insensitively and a unique substring is enough, but the
+    options depend on the device and on which tracks exist — call
+    get_device_io first rather than guessing. Passing both routing_type and
+    routing_channel is safe: the type is applied first, then the channel is
+    matched against the choices that type leaves available. Native Live
+    devices have no such buses; for Compressor/Gate/Auto Filter sidechain use
+    set_device_sidechain.
+
+    Parameters:
+    - track_index / device_index: 1-based location of the device.
+    - bus: "audio_in", "audio_out", "midi_in" or "midi_out".
+    - routing_type: Source or destination, e.g. "DRUMS", "Ext. In", "No Input".
+    - routing_channel: Channel within that type, e.g. "Pre FX", "1/2".
+    - bus_index: 1-based, when the device has more than one bus of that kind.
+    - chain_index: Chain number inside a rack (1-based, 0 = not in a rack).
+    """
+    try:
+        if routing_type is None and routing_channel is None:
+            return "Provide routing_type and/or routing_channel."
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        ci = _optional_to_zero_based(chain_index, "chain_index")
+        payload: dict = {
+            "track_index": ti,
+            "device_index": di,
+            "chain_index": ci,
+            "bus": bus,
+            "bus_index": _to_zero_based(bus_index, "bus_index"),
+        }
+        if routing_type is not None:
+            payload["routing_type"] = routing_type
+        if routing_channel is not None:
+            payload["routing_channel"] = routing_channel
+        r = ableton.send_command("set_device_io_routing", payload)
+        changed = r.get("changed") or {}
+        detail = ", ".join(f"{k}={v}" for k, v in changed.items())
+        return (
+            f"'{r.get('device')}' on '{r.get('track')}' "
+            f"{r.get('bus')}[{(r.get('bus_index') or 0) + 1}]: {detail}"
+        )
+    except Exception as e:
+        logger.error(f"Error setting device IO routing: {str(e)}")
+        return f"Error setting device IO routing: {str(e)}"
+
+@mcp.tool()
+def control_looper(
+    ctx: Context,
+    track_index: int,
+    action: str = "info",
+    device_index: int | None = None,
+    scene_index: int | None = None,
+) -> str:
+    """Drive a Looper like a foot pedal — record, overdub, play, stop, export.
+
+    This is the live-performance loop: hit `record` to lay a guitar or vocal
+    pass, `overdub` to stack the next layer, `play` to let it run under the
+    song, `undo` to drop the last overdub when a harmony misses, and `clear`
+    to reset between songs. `half_speed`/`double_speed` are the octave trick —
+    sing a line, halve the speed and it becomes a bass part. `half_length`/
+    `double_length` reinterpret the same audio against a longer or shorter
+    bar count. `export_to_clip_slot` bounces the loop into Session so a live
+    take turns into a clip you can keep.
+
+    Every call returns the Looper's state afterwards (State, loop_length,
+    record_length, tempo) so you can see whether it is recording or playing.
+    Actions the device does not expose are rejected with the list it does
+    expose, in `available_actions`.
+
+    Parameters:
+    - track_index: 1-based track holding the Looper.
+    - action: info, record, overdub, play, stop, clear, undo,
+      double_length, half_length, double_speed, half_speed,
+      export_to_clip_slot.
+    - device_index: 1-based, if the track has more than one Looper.
+    - scene_index: 1-based scene to export into (export_to_clip_slot only).
+      Omit to use whatever clip slot is currently selected.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "action": action,
+        }
+        if device_index is not None:
+            payload["device_index"] = _to_zero_based(
+                device_index, "device_index")
+        if scene_index is not None:
+            payload["scene_index"] = _to_zero_based(scene_index, "scene_index")
+        r = ableton.send_command("control_looper", payload)
+        if not isinstance(r, dict):
+            return str(r)
+        return "\n".join(f"{k}: {v}" for k, v in r.items())
+    except Exception as e:
+        logger.error(f"Error controlling looper: {str(e)}")
+        return f"Error controlling looper: {str(e)}"
+
+
+@mcp.tool()
+def configure_looper(
+    ctx: Context,
+    track_index: int,
+    device_index: int | None = None,
+    record_length: str | None = None,
+    overdub_after_record: bool | None = None,
+    tempo: float | None = None,
+) -> str:
+    """Set up a Looper before the gig — record length, overdub behaviour, tempo.
+
+    Reach for this when soundchecking rather than mid-song. `record_length`
+    decides whether the Looper records freely until you stop it or punches out
+    automatically after a fixed number of bars — set it to a bar count when the
+    duo needs loops that always land on the phrase, and leave it free when the
+    intro is rubato. `overdub_after_record` makes the Looper slide straight
+    into overdub when the first pass ends, so the guitarist can keep both hands
+    on the instrument instead of reaching back to trigger the next layer.
+
+    Pass a record length by NAME exactly as Live shows it; the available names
+    come back in every response as `record_length_options` (and from
+    control_looper's `info`). Never guess a number — the ordering differs
+    between Live builds. Anything omitted is left unchanged. Settings this
+    Live build refuses come back under `read_only`; settings this device does
+    not have at all come back under `unsupported`.
+
+    Parameters:
+    - track_index: 1-based track holding the Looper.
+    - device_index: 1-based, if the track has more than one Looper.
+    - record_length: display name from `record_length_options`,
+      e.g. "none", "1 bar", "4 bars" (case-insensitive, partial match allowed).
+    - overdub_after_record: True to jump into overdub the moment recording ends.
+    - tempo: the Looper's tempo in BPM.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {
+            "track_index": _to_zero_based(track_index, "track_index"),
+        }
+        if device_index is not None:
+            payload["device_index"] = _to_zero_based(
+                device_index, "device_index")
+        if record_length is not None:
+            payload["record_length"] = record_length
+        if overdub_after_record is not None:
+            payload["overdub_after_record"] = overdub_after_record
+        if tempo is not None:
+            payload["tempo"] = tempo
+        r = ableton.send_command("configure_looper", payload)
+        if not isinstance(r, dict):
+            return str(r)
+        return "\n".join(f"{k}: {v}" for k, v in r.items())
+    except Exception as e:
+        logger.error(f"Error configuring looper: {str(e)}")
+        return f"Error configuring looper: {str(e)}"
+
+# NOTE: manage_rack below SUPERSEDES the existing manage_rack tool (~line 1192) —
+# DELETE that one and put this in its place. Old call sites keep working (same
+# action names, same params), with one deliberate correction: the variation index
+# passed as `value` is now 1-based like every other index in this server.
+
+
+@mcp.tool()
+def get_rack_map(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    pads: str = "filled",
+    include_devices: bool = True,
+) -> str:
+    """Read a whole rack in one shot: macros, chains, return chains, drum pads.
+
+    Reach for this before touching anything inside a rack — it is the map that
+    tells you which chain index is the sub bass, which pad note the hi-hat sits
+    on, whether the pads are already choked, and how many macro variations are
+    stored. Much cheaper than probing chain by chain.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - pads: 'filled' (only pads holding samples, default), 'visible' (the 16
+      pads currently on screen) or 'none'.
+    - include_devices: list the devices inside each chain.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        r = ableton.send_command("get_rack_map", {
+            "track_index": ti,
+            "device_index": di,
+            "pads": pads,
+            "include_devices": include_devices,
+        })
+
+        lines = [f"{r.get('device')} ({r.get('class_name')}) on '{r.get('track')}'"]
+        lines.append(
+            f"  macros visible: {r.get('visible_macro_count')} | "
+            f"mapped: {r.get('has_macro_mappings')} | "
+            f"variations: {r.get('variation_count')} "
+            f"(selected {r.get('selected_variation_index')})"
+        )
+        for m in r.get("macros", []):
+            lines.append(f"    macro {m['index']}: {m['name']} = {m['display']}")
+        sel = r.get("chain_selector")
+        if sel:
+            lines.append(f"  chain selector: {sel.get('display')}")
+
+        def chain_lines(items: list, label: str) -> None:
+            if not items:
+                return
+            lines.append(f"  {label} ({len(items)}):")
+            for c in items:
+                flags = "".join([
+                    " [muted]" if c.get("mute") else "",
+                    " [solo]" if c.get("solo") else "",
+                    "" if c.get("chain_activator_name") in (None, "On")
+                    else f" [{c.get('chain_activator_name')}]",
+                ])
+                devs = ", ".join(c.get("devices", [])) or "empty"
+                mix = c.get("volume")
+                mix_str = f" vol {mix}" if mix else ""
+                idx = c.get("index")
+                num = "?" if idx is None else idx + 1
+                lines.append(
+                    f"    {num}. {c['name']}{flags}{mix_str} → {devs}"
+                )
+
+        chain_lines(r.get("chains", []), "chains")
+        chain_lines(r.get("return_chains", []), "return chains")
+
+        pad_list = r.get("pads")
+        if pad_list is not None:
+            lines.append(f"  drum pads ({r.get('pad_filter')}, {len(pad_list)}):")
+            for p in pad_list:
+                flags = "".join([
+                    " [muted]" if p.get("mute") else "",
+                    " [solo]" if p.get("solo") else "",
+                ])
+                choke = p.get("choke_group")
+                choke_str = f" choke {choke}" if choke else ""
+                devs = ", ".join(p.get("devices", [])) or "empty"
+                lines.append(
+                    f"    note {p['note']}: {p['name']}{flags}{choke_str} → {devs}"
+                )
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting rack map: {str(e)}")
+        return f"Error getting rack map: {str(e)}"
+
+
+@mcp.tool()
+def manage_rack(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    action: str = "info",
+    value: float | None = None,
+    count: int = 1,
+    chain_index: int | None = None,
+) -> str:
+    """Shape a rack: macro count, macro randomisation, chain selector, chain list.
+
+    This is the "performance surface" tool. Add macros when you want fewer,
+    bigger knobs to automate or MIDI-map; randomize_macros when you want a
+    sound-design accident to react to; chain_selector when a rack is being used
+    as a morph/switch between layers (the Live way to A/B whole sound worlds
+    from one automation lane). show_chains reveals the chain list in the UI so
+    you can see what you are addressing.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - action: info, add_macro, remove_macro, randomize_macros, chain_selector,
+      show_chains, hide_chains, insert_chain, and the legacy variation actions
+      (store_variation, recall_variation, delete_variation,
+      recall_last_variation) which forward to manage_rack_variations.
+    - value: 0.0-1.0 for chain_selector; for recall_variation /
+      delete_variation it is the 1-based variation number (same base as
+      manage_rack_variations).
+    - count: how many macros to add/remove (default 1). Live caps at 16.
+    - chain_index: 1-based insert position for insert_chain (default: end).
+    """
+    _VARIATION_ACTIONS = (
+        "recall_variation", "delete_variation",
+    )
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        payload: dict = {
+            "track_index": ti,
+            "device_index": di,
+            "action": action,
+            "count": count,
+        }
+        if value is not None:
+            if action in _VARIATION_ACTIONS:
+                # `value` is a variation index here, and every index this
+                # server exposes is 1-based.
+                payload["value"] = _to_zero_based(int(value), "value")
+            else:
+                payload["value"] = value
+        if chain_index is not None:
+            payload["chain_index"] = _to_zero_based(chain_index, "chain_index")
+        r = ableton.send_command("manage_rack", payload)
+        return "\n".join(f"{k}: {v}" for k, v in r.items())
+    except Exception as e:
+        logger.error(f"Error managing rack: {str(e)}")
+        return f"Error managing rack: {str(e)}"
+
+
+@mcp.tool()
+def manage_rack_variations(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    action: str = "list",
+    variation_index: int | None = None,
+) -> str:
+    """Store and recall macro variations — snapshots of every macro at once.
+
+    Use this to build arrangement states inside a single rack: store one
+    variation for the intro filter position, one for the drop, one for the
+    breakdown, then recall them live instead of drawing eight automation
+    lanes. recall_last flips back to whatever you were on, which is the
+    fastest A/B when you are dialling a sound in.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - action: list, store, select, recall, recall_last, delete.
+    - variation_index: 1-based variation to select/recall/delete.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        di = _to_zero_based(device_index, "device_index")
+        payload: dict = {
+            "track_index": ti,
+            "device_index": di,
+            "action": action,
+        }
+        if variation_index is not None:
+            payload["variation_index"] = _to_zero_based(
+                variation_index, "variation_index"
+            )
+        r = ableton.send_command("manage_rack_variations", payload)
+        return "\n".join(f"{k}: {v}" for k, v in r.items())
+    except Exception as e:
+        logger.error(f"Error managing rack variations: {str(e)}")
+        return f"Error managing rack variations: {str(e)}"
+
+
+@mcp.tool()
+def set_chain_state(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_index: int | None = None,
+    chain_name: str | None = None,
+    pad_note: int | None = None,
+    return_chain: bool = False,
+    name: str | None = None,
+    color_index: int | None = None,
+    mute: bool | None = None,
+    solo: bool | None = None,
+    volume: float | None = None,
+    panning: float | None = None,
+    chain_activator: bool | str | None = None,
+    send_index: int | None = None,
+    send_value: float | None = None,
+) -> str:
+    """Mix and label one chain inside a rack. Omitted values are left alone.
+
+    A rack chain has its own little mixer, and that is where layered sounds
+    actually get balanced — pull the sub layer down 3 dB, pan the two detuned
+    saws apart, mute the noise layer for the verse, feed a chain into the
+    rack's internal return for reverb. Naming and colouring chains is what
+    makes a big instrument rack navigable a month later.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - chain_index: 1-based chain to address (default: the first one).
+    - chain_name: address the chain by name instead; wins over chain_index.
+    - pad_note: address a Drum Rack pad's chain by MIDI note (36 = C1, the
+      bottom-left pad). NOT an index — pass the note number as-is. The device
+      must be a Drum Rack.
+    - return_chain: True to address the rack's internal return chains.
+    - name / color_index: rename and recolour the chain.
+    - mute / solo: chain-level mute and solo.
+    - volume / panning: 0.0-1.0 normalized over the parameter's own range
+      (panning 0.0 = hard left, 0.5 = centre).
+    - chain_activator: the chain on/off switch. Pass True/False, or the exact
+      value name from get_rack_map's chain_activator_list — it is a quantized
+      enum, so it is resolved by name rather than by a raw number.
+    - send_index (1-based) + send_value (0.0-1.0): level into one of the
+      rack's internal return chains. Both are required together.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "device_index": _to_zero_based(device_index, "device_index"),
+            "return_chain": return_chain,
+        }
+        if chain_index is not None:
+            payload["chain_index"] = _to_zero_based(chain_index, "chain_index")
+        if send_index is not None:
+            payload["send_index"] = _to_zero_based(send_index, "send_index")
+        if pad_note is not None:
+            # A MIDI note, not an index — never zero-based converted.
+            payload["pad_note"] = pad_note
+        for key, val in (
+            ("chain_name", chain_name), ("name", name),
+            ("color_index", color_index), ("mute", mute), ("solo", solo),
+            ("volume", volume), ("panning", panning),
+            ("chain_activator", chain_activator), ("send_value", send_value),
+        ):
+            if val is not None:
+                payload[key] = val
+        result = ableton.send_command("set_chain_state", payload)
+        changed = result.get("changed", {})
+        if not changed:
+            return f"No changes requested for chain '{result.get('chain')}'"
+        detail = ", ".join(f"{k}={v}" for k, v in changed.items())
+        return f"Set {result.get('target')} '{result.get('chain')}': {detail}"
+    except Exception as e:
+        logger.error(f"Error setting chain state: {str(e)}")
+        return f"Error setting chain state: {str(e)}"
+
+
+@mcp.tool()
+def manage_drum_pad(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    pad_note: int,
+    name: str | None = None,
+    mute: bool | None = None,
+    solo: bool | None = None,
+    choke_group: int | None = None,
+    out_note: int | None = None,
+    copy_to_note: int | None = None,
+) -> str:
+    """Name, mute, choke and copy pads in a Drum Rack.
+
+    Choke groups are the reason to reach for this: put the closed hat, open
+    hat and pedal hat on the same choke group (1-16) and they cut each other
+    off like a real hi-hat instead of ringing over one another. Same trick for
+    808 sub slides and for cymbal chokes. copy_to_note duplicates a pad's
+    whole chain onto another note — the fast way to build a velocity-layered
+    or pitched variant next to the original. out_note re-maps what note the
+    pad's chain sends onward, which matters when a pad feeds an external
+    sampler or a second drum rack.
+
+    Parameters:
+    - track_index / device_index: 1-based; the device must be a Drum Rack.
+    - pad_note: MIDI note of the pad (36 = C1 = bottom-left). NOT an index.
+    - name: rename the pad (falls back to renaming its chain).
+    - mute / solo: pad-level mute and solo.
+    - choke_group: 1-16, or 0 for no choking.
+    - out_note: MIDI note the pad's chain outputs.
+    - copy_to_note: MIDI note of the destination pad to copy this pad onto.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "device_index": _to_zero_based(device_index, "device_index"),
+            # MIDI notes below, never index-converted.
+            "pad_note": pad_note,
+        }
+        for key, val in (
+            ("name", name), ("mute", mute), ("solo", solo),
+            ("choke_group", choke_group), ("out_note", out_note),
+            ("copy_to_note", copy_to_note),
+        ):
+            if val is not None:
+                payload[key] = val
+        result = ableton.send_command("manage_drum_pad", payload)
+        changed = result.get("changed", {})
+        if not changed:
+            return (
+                f"No changes requested for pad {result.get('note')} "
+                f"('{result.get('pad')}')"
+            )
+        detail = ", ".join(f"{k}={v}" for k, v in changed.items())
+        return f"Pad {result.get('note')} '{result.get('pad')}': {detail}"
+    except Exception as e:
+        logger.error(f"Error managing drum pad: {str(e)}")
+        return f"Error managing drum pad: {str(e)}"
+
+def _simpler_chain_path(chain_path: str) -> str | None:
+    """Convert a 1-based 'chain.device' path to the 0-based form Live wants.
+
+    "1.1" (first chain, first device) becomes "0.0". Empty means the Simpler
+    sits directly on the track.
+    """
+    if not chain_path:
+        return None
+    parts = [p for p in str(chain_path).split(".") if p != ""]
+    if not parts:
+        return None
+    if len(parts) % 2 != 0:
+        raise ValueError(
+            f"chain_path must be pairs of chain.device indices, got '{chain_path}'"
+        )
+    return ".".join(
+        str(_to_zero_based(int(p), "chain_path segment")) for p in parts
+    )
+
+
+@mcp.tool()
+def get_simpler_info(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_path: str = "",
+) -> str:
+    """Read a Simpler's playback state, its sample and its slice grid.
+
+    Reach for this before any chop or edit: it tells you whether the Simpler is
+    in Classic/One-Shot/Slicing mode, where the start and end markers sit, how
+    loud the sample is, whether it's warped, and exactly where every slice
+    falls — in both sample frames and beats, so the follow-up call can speak
+    whichever unit is convenient. Also the way to find out that a Simpler is
+    multisampled, in which case Live exposes no editable sample at all.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - chain_path: Optional 1-based "chain.device" pairs to reach a Simpler
+      nested inside a rack — e.g. "1.1" for the first device of the first
+      chain, "1.1.1.1" one level deeper. Drum pads count as chains.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "device_index": _to_zero_based(device_index, "device_index"),
+        }
+        cp = _simpler_chain_path(chain_path)
+        if cp is not None:
+            payload["chain_path"] = cp
+        r = ableton.send_command("get_simpler_info", payload)
+
+        lines = [
+            f"{r.get('device')} on '{r.get('track')}' ({r.get('class_name')})",
+            f"  playback: {r.get('playback_mode_name', r.get('playback_mode'))}"
+            f" | slicing playback: "
+            f"{r.get('slicing_playback_mode_name', r.get('slicing_playback_mode'))}"
+            f" | pad slicing: {r.get('pad_slicing')}",
+            f"  voices: {r.get('voices')} | retrigger: {r.get('retrigger')}"
+            f" | pitch bend: {r.get('pitch_bend_range')}"
+            f" | per-note bend: {r.get('note_pitch_bend_range')}",
+            f"  multi-sample: {r.get('multi_sample_mode')}"
+            f" | playing position: {r.get('playing_position')}"
+            f" (live: {r.get('playing_position_enabled')})",
+            f"  can warp as/half/double: {r.get('can_warp_as')}/"
+            f"{r.get('can_warp_half')}/{r.get('can_warp_double')}",
+        ]
+        s = r.get("sample")
+        if not s:
+            lines.append(f"  sample: none — {r.get('note')}")
+            return "\n".join(lines)
+
+        lines.append(f"  sample: {s.get('file_path')}")
+        lines.append(
+            f"    {s.get('length')} frames @ {s.get('sample_rate')} Hz"
+            f" | markers {s.get('start_marker')}-{s.get('end_marker')}"
+            f" | gain {s.get('gain')} ({s.get('gain_display_string')})"
+        )
+        lines.append(
+            f"    warping: {s.get('warping')}"
+            f" | warp mode: {s.get('warp_mode_name', s.get('warp_mode'))}"
+            f" | warp markers: {len(s.get('warp_markers') or [])}"
+        )
+        lines.append(
+            f"    slicing: {s.get('slicing_style_name', s.get('slicing_style'))}"
+            f" | division idx {s.get('slicing_beat_division')}"
+            f" | regions {s.get('slicing_region_count')}"
+            f" | sensitivity {s.get('slicing_sensitivity')}"
+        )
+        lines.append(f"    slices: {s.get('slice_count', 0)}")
+        if s.get("slices_frames"):
+            lines.append(f"      frames: {s['slices_frames']}")
+            lines.append(f"      beats:  {s.get('slices_beats')}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting simpler info: {str(e)}")
+        return f"Error getting simpler info: {str(e)}"
+
+
+@mcp.tool()
+def set_simpler_playback(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_path: str = "",
+    playback_mode: str | None = None,
+    slicing_playback_mode: str | None = None,
+    pad_slicing: bool | None = None,
+    voices: int | None = None,
+    retrigger: bool | None = None,
+    pitch_bend_range: int | None = None,
+    note_pitch_bend_range: int | None = None,
+) -> str:
+    """Set how a Simpler responds to notes. Omitted values are left alone.
+
+    This is the "what kind of instrument is this" switch. Reach for it when a
+    one-shot should stop retriggering mid-tail (playback_mode="one_shot"), when
+    a chopped loop needs each slice on its own key ("slicing" plus
+    pad_slicing=True), when a stacked pad is eating polyphony (voices), or when
+    a bass patch should be strictly monophonic (voices=1, retrigger=True).
+    slicing_playback_mode decides whether slices choke each other (mono), stack
+    (poly), or pass through (thru).
+
+    Names are resolved against Live's own list when it publishes one and
+    against the documented ordering otherwise, so a raw index is accepted too
+    and Live rejects anything out of range.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - chain_path: Optional 1-based "chain.device" pairs for a Simpler nested in
+      a rack or under a drum pad.
+    - playback_mode: classic, one_shot or slicing (or 0-2).
+    - slicing_playback_mode: mono, poly or thru (or 0-2).
+    - pad_slicing: True lays the slices out across the keyboard/pads.
+    - voices: 1-32.
+    - retrigger: True restarts the sample on a repeated note.
+    - pitch_bend_range: semitones, clamps at 24.
+    - note_pitch_bend_range: MPE per-note bend range in semitones.
+
+    multi_sample_mode, playing_position and playing_position_enabled are
+    read-only in Live — read them with get_simpler_info.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "device_index": _to_zero_based(device_index, "device_index"),
+        }
+        cp = _simpler_chain_path(chain_path)
+        if cp is not None:
+            payload["chain_path"] = cp
+        for key, val in (
+            ("playback_mode", playback_mode),
+            ("slicing_playback_mode", slicing_playback_mode),
+            ("pad_slicing", pad_slicing),
+            ("voices", voices),
+            ("retrigger", retrigger),
+            ("pitch_bend_range", pitch_bend_range),
+            ("note_pitch_bend_range", note_pitch_bend_range),
+        ):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("set_simpler_playback", payload)
+        changed = r.get("changed", {})
+        if not changed:
+            return f"No changes requested for '{r.get('device')}'"
+        detail = ", ".join(f"{k}={v}" for k, v in changed.items())
+        return f"Set '{r.get('device')}' on '{r.get('track')}': {detail}"
+    except Exception as e:
+        logger.error(f"Error setting simpler playback: {str(e)}")
+        return f"Error setting simpler playback: {str(e)}"
+
+
+@mcp.tool()
+def manage_simpler_sample(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_path: str = "",
+    action: str = "",
+    start_beats: float | None = None,
+    end_beats: float | None = None,
+    start_frames: int | None = None,
+    end_frames: int | None = None,
+    gain: float | None = None,
+    warping: bool | None = None,
+    warp_mode: str | None = None,
+    warp_as_beats: float | None = None,
+) -> str:
+    """Trim, gain, warp and reshape the sample inside a Simpler.
+
+    The tidy-up pass on a raw sample: cut the silence off the front of a vocal
+    chop (start_beats), stop a one-shot before its tail (end_beats), match a
+    loop to the Set's tempo (warping=True plus warp_as_beats=8 to declare it as
+    8 beats long), pick a stretch algorithm that suits the material
+    (warp_mode="beats" for drums, "complex_pro" for full mixes and vocals,
+    "repitch" for the tape-slowdown sound), level a sample against its
+    neighbours (gain), or flip it for a reverse-cymbal riser (action="reverse").
+    action="crop" permanently discards everything outside the markers, so run
+    it only once the markers are right.
+
+    Markers are sample frames in Live's API — pass beats and they get converted
+    for you. gain is normalised 0.0-1.0, NOT decibels: 0.4 is unity (0.0 dB).
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - chain_path: Optional 1-based "chain.device" pairs for a nested Simpler.
+    - action: reverse, crop, guess_playback_length, warp_as, warp_half,
+      warp_double. Omit to only set properties.
+    - start_beats / end_beats: playback region, in beats from the file start.
+    - start_frames / end_frames: the same, in raw sample frames.
+    - gain: 0.0-1.0 (0.4 = 0.0 dB).
+    - warping: True to lock the sample to the Set's tempo.
+    - warp_mode: beats, tones, texture, repitch, complex, rex, complex_pro
+      (or a raw 0-6 index).
+    - warp_as_beats: required by action="warp_as"; the sample's length in beats.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "device_index": _to_zero_based(device_index, "device_index"),
+        }
+        cp = _simpler_chain_path(chain_path)
+        if cp is not None:
+            payload["chain_path"] = cp
+        if action:
+            payload["action"] = action
+        for key, val in (
+            ("start_beats", start_beats),
+            ("end_beats", end_beats),
+            ("start_frames", start_frames),
+            ("end_frames", end_frames),
+            ("gain", gain),
+            ("warping", warping),
+            ("warp_mode", warp_mode),
+            ("warp_as_beats", warp_as_beats),
+        ):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("manage_simpler_sample", payload)
+        changed = r.get("changed", {})
+        head = (
+            f"'{r.get('device')}' on '{r.get('track')}': "
+            + (", ".join(f"{k}={v}" for k, v in changed.items())
+               if changed else "nothing changed")
+        )
+        tail = (
+            f"  now: markers {r.get('start_marker')}-{r.get('end_marker')} "
+            f"of {r.get('length')} frames | warping {r.get('warping')} "
+            f"| warp mode {r.get('warp_mode_name', r.get('warp_mode'))} "
+            f"| gain {r.get('gain_display')}"
+        )
+        return f"{head}\n{tail}"
+    except Exception as e:
+        logger.error(f"Error managing simpler sample: {str(e)}")
+        return f"Error managing simpler sample: {str(e)}"
+
+
+@mcp.tool()
+def manage_simpler_slices(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_path: str = "",
+    action: str = "info",
+    at_beats: float | None = None,
+    to_beats: float | None = None,
+    at_frames: int | None = None,
+    to_frames: int | None = None,
+    slicing_style: str | None = None,
+    beat_division: int | None = None,
+    region_count: int | None = None,
+    sensitivity: float | None = None,
+) -> str:
+    """Chop a sample into slices — how a loop becomes a playable instrument.
+
+    The core move: drop a breakbeat or vocal loop into a Simpler, put it in
+    Slicing mode (set_simpler_playback playback_mode="slicing",
+    pad_slicing=True), then decide where the cuts land. slicing_style="transient"
+    lets Live find the hits and sensitivity tunes how many it finds;
+    "beat" cuts on a fixed musical grid (beat_division); "region" cuts into
+    region_count equal pieces; "manual" freezes the grid so add/remove/move can
+    place every slice by hand. Use that manual mode to nudge a lazy snare onto
+    the beat, or to delete a cut that landed mid-hat.
+
+    Slices are addressed by POSITION, never by an ordinal — pass at_beats (or
+    at_frames) for the slice you mean. Run this with action="info" first to see
+    where they currently are; it lists them in both units.
+
+    Parameters:
+    - track_index / device_index: 1-based.
+    - chain_path: Optional 1-based "chain.device" pairs for a nested Simpler.
+    - action: info, add, remove, move, clear, reset. "clear" empties the grid,
+      "reset" rebuilds it from the current slicing settings.
+    - at_beats / at_frames: position of the slice to add, remove or move.
+    - to_beats / to_frames: destination for action="move".
+    - slicing_style: transient, beat, region or manual (or 0-3).
+    - beat_division: grid step index for "beat" style, 0-10. Live publishes no
+      names for these, so it is an index into Simpler's Division menu.
+    - region_count: 2-64 equal regions for "region" style.
+    - sensitivity: 0.0-1.0 transient detection threshold for "transient" style.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "device_index": _to_zero_based(device_index, "device_index"),
+            "action": action,
+        }
+        cp = _simpler_chain_path(chain_path)
+        if cp is not None:
+            payload["chain_path"] = cp
+        for key, val in (
+            ("at_beats", at_beats),
+            ("to_beats", to_beats),
+            ("at_frames", at_frames),
+            ("to_frames", to_frames),
+            ("slicing_style", slicing_style),
+            ("beat_division", beat_division),
+            ("region_count", region_count),
+            ("sensitivity", sensitivity),
+        ):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("manage_simpler_slices", payload)
+        changed = r.get("changed", {})
+        lines = [
+            f"'{r.get('device')}' on '{r.get('track')}': "
+            + (", ".join(f"{k}={v}" for k, v in changed.items())
+               if changed else "read only"),
+            f"  playback_mode "
+            f"{r.get('playback_mode_name', r.get('playback_mode'))} "
+            f"| pad_slicing {r.get('pad_slicing')} "
+            f"| style {r.get('slicing_style_name', r.get('slicing_style'))} "
+            f"| division {r.get('slicing_beat_division')} | regions "
+            f"{r.get('slicing_region_count')} | sensitivity "
+            f"{r.get('slicing_sensitivity')}",
+            f"  {r.get('slice_count', 0)} slices",
+        ]
+        if r.get("slices_frames"):
+            lines.append(f"    frames: {r['slices_frames']}")
+            lines.append(f"    beats:  {r.get('slices_beats')}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error managing simpler slices: {str(e)}")
+        return f"Error managing simpler slices: {str(e)}"
+
+@mcp.tool()
+def manage_take_lanes(
+    ctx: Context,
+    track_index: int,
+    action: str = "info",
+    lane_index: int | None = None,
+    name: str | None = None,
+    include_in_playback: bool | None = None,
+) -> str:
+    """Inspect, create and comp the take lanes on a track.
+
+    Reach for this while tracking a singer: each pass lands in its own take
+    lane, and afterwards you audition them by including one lane in playback
+    at a time ("use_take") instead of muting clips by hand. Naming lanes
+    ("verse - close mic", "take 3 - the good one") is what makes a comping
+    session survive a break.
+
+    Parameters:
+    - track_index: 1-based track being recorded.
+    - action: info, create, rename, update, use_take.
+    - lane_index: 1-based take lane, for rename / update / use_take.
+    - name: New lane name (also names a lane created with 'create').
+    - include_in_playback: For 'update' — include or exclude just this lane.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "action": action,
+        }
+        if lane_index is not None:
+            payload["lane_index"] = _to_zero_based(lane_index, "lane_index")
+        if name is not None:
+            payload["name"] = name
+        if include_in_playback is not None:
+            payload["include_in_playback"] = include_in_playback
+        r = ableton.send_command("manage_take_lanes", payload)
+        lanes = r.get("take_lanes") or []
+        if not lanes:
+            return (
+                f"Track '{r.get('track_name')}' has no take lanes yet. "
+                "Record over an armed arrangement track, or use action='create'."
+            )
+        lines = [f"Take lanes on '{r.get('track_name')}' (action: {r.get('action')}):"]
+        for lane in lanes:
+            mark = "*" if lane.get("is_included_in_playback") else " "
+            lines.append(
+                f" {mark} {lane.get('index', 0) + 1}. {lane.get('name')} "
+                f"— {lane.get('clip_count', 0)} clip(s)"
+            )
+        lines.append("(* = included in playback)")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error managing take lanes: {str(e)}")
+        return f"Error managing take lanes: {str(e)}"
+
+
+@mcp.tool()
+def edit_cue_point(
+    ctx: Context,
+    cue_index: int | None = None,
+    name: str | None = None,
+    new_name: str | None = None,
+    bar: int | None = None,
+    beat: float = 0.0,
+    jump: bool = False,
+) -> str:
+    """Rename, move or jump to an existing locator.
+
+    Locators are the map of an arrangement — "intro", "drop", "breakdown".
+    Use this when the sections have shifted and the labels no longer match,
+    or to park playback on a section before rehearsing it. Identify the
+    locator by its list position or by its current name. Complements
+    create_cue_point / delete_cue_point / jump_to_cue_point, which cannot
+    rename or move an existing locator.
+
+    Parameters:
+    - cue_index: 1-based position in the locator list.
+    - name: Current locator name, as an alternative to cue_index.
+    - new_name: Rename it to this.
+    - bar / beat: Move it here (1-based bar). Live often makes locator time
+      read-only — if so, delete and re-create instead.
+    - jump: Also move playback to this locator.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {"jump": jump}
+        if cue_index is not None:
+            payload["cue_index"] = _to_zero_based(cue_index, "cue_index")
+        if name is not None:
+            payload["name"] = name
+        if new_name is not None:
+            payload["new_name"] = new_name
+        if bar is not None:
+            payload["time"] = _convert_bar_to_beat(bar, beat)
+        r = ableton.send_command("edit_cue_point", payload)
+        return "\n".join(f"{k}: {v}" for k, v in r.items())
+    except Exception as e:
+        logger.error(f"Error editing cue point: {str(e)}")
+        return f"Error editing cue point: {str(e)}"
+
+
+@mcp.tool()
+def manage_groove_pool(
+    ctx: Context,
+    groove: str | None = None,
+    base: str | None = None,
+    quantization_amount: float | None = None,
+    timing_amount: float | None = None,
+    random_amount: float | None = None,
+    velocity_amount: float | None = None,
+    global_amount: float | None = None,
+    new_name: str | None = None,
+) -> str:
+    """Read the groove pool and edit how a groove actually feels.
+
+    Assigning a groove to a clip is only half of it — the swing lives in
+    these four amounts. Timing is how far notes are pulled toward the groove,
+    quantize is how hard they are first snapped to the grid, random adds
+    human scatter, velocity transfers the groove's accents. Turn timing down
+    to about 50% when a borrowed MPC groove drags the whole track. Call with
+    no arguments for a full read-out of the pool.
+
+    Parameters:
+    - groove: Groove name (or its 1-based pool position as a string).
+    - base: Grid the groove is measured against, e.g. "eighth", "sixteenth".
+      Only settable when this Live build reports base names — see
+      base_settable in the read-out.
+    - quantization_amount / timing_amount / random_amount / velocity_amount:
+      0.0-1.0 (velocity may be bipolar). Omitted = unchanged.
+    - global_amount: Set's master Groove Amount, 0.0-1.0.
+    - new_name: Rename the groove.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {}
+        if groove is not None:
+            text = str(groove).strip()
+            payload["groove"] = (
+                _to_zero_based(int(text), "groove") if text.isdigit() else groove
+            )
+        for key, value in (
+            ("base", base),
+            ("quantization_amount", quantization_amount),
+            ("timing_amount", timing_amount),
+            ("random_amount", random_amount),
+            ("velocity_amount", velocity_amount),
+            ("global_amount", global_amount),
+            ("new_name", new_name),
+        ):
+            if value is not None:
+                payload[key] = value
+        r = ableton.send_command("manage_groove_pool", payload)
+        if not r.get("supported", True):
+            return "This Live build does not expose the groove pool."
+
+        lines = [f"Global groove amount: {r.get('groove_amount')}"]
+        if r.get("changed"):
+            lines.append(
+                "Changed: "
+                + ", ".join(f"{k}={v}" for k, v in r["changed"].items())
+            )
+        entries = r.get("grooves")
+        if entries is None:
+            entries = [r.get("groove")] if r.get("groove") else []
+        if not entries:
+            return "\n".join(lines + ["Groove pool is empty."])
+        for g in entries:
+            lines.append(
+                f"  {g.get('index', 0) + 1}. {g.get('name')} — base {g.get('base')}, "
+                f"quantize {g.get('quantization_amount')}, "
+                f"timing {g.get('timing_amount')}, "
+                f"random {g.get('random_amount')}"
+                + (
+                    f", velocity {g['velocity_amount']}"
+                    if g.get("velocity_amount") is not None
+                    else ""
+                )
+            )
+        first = entries[0] or {}
+        options = first.get("base_options") or []
+        if options:
+            lines.append("Base options: " + ", ".join(options))
+        elif first.get("base_settable") is False:
+            lines.append(
+                "This Live build does not report groove base names, so 'base' "
+                "cannot be set from here."
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error managing groove pool: {str(e)}")
+        return f"Error managing groove pool: {str(e)}"
+
+
+@mcp.tool()
+def get_application_info(ctx: Context) -> str:
+    """Report Live's version, its main views, and any modal dialog that is open.
+
+    Check this first when automation mysteriously stops responding: a "Save
+    changes?" or missing-file dialog blocks everything until it is dismissed.
+    Also the honest way to know which features exist before using them, since
+    take lanes, tuning systems and Live 12 devices are all version-gated.
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command("get_application_info")
+        lines = [f"Ableton Live {r.get('version', 'unknown')}"]
+        views = r.get("main_views") or []
+        if views:
+            lines.append(
+                "Main views: "
+                + ", ".join(
+                    f"{v['name']}{'*' if v.get('visible') else ''}" for v in views
+                )
+                + "  (* = visible)"
+            )
+        if r.get("focused_document_view"):
+            lines.append(f"Focused view: {r['focused_document_view']}")
+        dialog = r.get("dialog") or {}
+        if dialog.get("open"):
+            lines.append(
+                f"DIALOG OPEN — \"{dialog.get('current_dialog_message')}\" with "
+                f"{dialog.get('current_dialog_button_count')} button(s). "
+                + (
+                    "Dismiss it with dismiss_live_dialog before automating further."
+                    if dialog.get("can_press", True)
+                    else "This build cannot press it remotely — dismiss it by hand."
+                )
+            )
+        else:
+            lines.append("No modal dialog open.")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting application info: {str(e)}")
+        return f"Error getting application info: {str(e)}"
+
+
+@mcp.tool()
+def dismiss_live_dialog(ctx: Context, button_index: int = 1) -> str:
+    """Press a button on Live's current modal dialog to unblock automation.
+
+    Live puts up modal dialogs for missing files, plugin scans and unsaved
+    changes, and while one is up every other command silently does nothing.
+    Run get_application_info first to read the message and the button count,
+    then press the button you want.
+
+    Parameters:
+    - button_index: 1-based button on the dialog. 1 is usually the default
+      (OK / Save); the last one is usually Cancel.
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command(
+            "press_dialog_button",
+            {"button_index": _to_zero_based(button_index, "button_index")},
+        )
+        if r.get("pressed") is None:
+            return "No dialog is open — nothing to dismiss."
+        remaining = (
+            " Another dialog is still open."
+            if r.get("dialog_open")
+            else " No dialogs remain."
+        )
+        return f"Dismissed: \"{r.get('dismissed_message')}\".{remaining}"
+    except Exception as e:
+        logger.error(f"Error dismissing dialog: {str(e)}")
+        return f"Error dismissing dialog: {str(e)}"
+
+
+@mcp.tool()
+def control_live_view(
+    ctx: Context,
+    action: str = "show",
+    view_name: str = "Session",
+    direction: str = "down",
+    modifier: bool = False,
+) -> str:
+    """Show, hide, focus, toggle, scroll or zoom any of Live's main views.
+
+    Use this to set the screen up before a take — hide the Browser and
+    Detail panes so the Session grid fills the display, or focus the Detail
+    view so the right device is under your hands. Complements
+    set_ableton_view (which only switches) by adding hide, focus and toggle.
+
+    Parameters:
+    - action: show, hide, focus, toggle, scroll, zoom.
+    - view_name: Browser, Arranger, Session, Detail, Detail/Clip,
+      Detail/DeviceChain. Run get_application_info for this build's exact list.
+    - direction: up, down, left, right — for scroll and zoom.
+    - modifier: Pass the modifier key with a scroll/zoom (larger step).
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command(
+            "control_live_view",
+            {
+                "action": action,
+                "view_name": view_name,
+                "direction": direction,
+                "modifier": modifier,
+            },
+        )
+        return "\n".join(f"{k}: {v}" for k, v in r.items())
+    except Exception as e:
+        logger.error(f"Error controlling Live view: {str(e)}")
+        return f"Error controlling Live view: {str(e)}"
+
+
+@mcp.tool()
+def manage_tuning_system(
+    ctx: Context, action: str = "info", name: str | None = None
+) -> str:
+    """Report, load or clear the Set's tuning system (microtuning).
+
+    Live 12 can retune the whole Set from an .ascl/.scl file — just
+    intonation, maqam, gamelan, historical temperaments. Reach for this when
+    a piece should not be in 12-tone equal temperament, or to confirm which
+    tuning a Set was written in before editing its MIDI. Live types this as
+    an object, so a custom tuning is applied by loading it from the browser
+    rather than by name assignment; 'clear' returns the Set to 12-TET.
+
+    Parameters:
+    - action: info, load, clear.
+    - name: Tuning to load, matched against the browser's Tunings folder.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {"action": action}
+        if name is not None:
+            payload["name"] = name
+        r = ableton.send_command("manage_tuning_system", payload)
+        if not r.get("supported", True):
+            return f"Tuning systems unavailable: {r.get('message')}"
+        current = r.get("current") or {}
+        lines = [f"Current tuning: {current.get('name')}"]
+        available = r.get("available") or []
+        lines.append(
+            "Browser tunings: " + (", ".join(available) if available else
+                                   "(none — add .ascl/.scl files to the User Library)")
+        )
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error managing tuning system: {str(e)}")
+        return f"Error managing tuning system: {str(e)}"
+
+
+@mcp.tool()
 def get_meters(ctx: Context) -> str:
     """Read output level meters for every track and the master.
 
@@ -1188,70 +2892,6 @@ def move_device(
         return f"Error moving device: {str(e)}"
 
 
-@mcp.tool()
-def manage_rack(
-    ctx: Context,
-    track_index: int,
-    device_index: int,
-    action: str = "info",
-    value: float | None = None,
-) -> str:
-    """Inspect and control a rack: macros, variations, chain selector.
-
-    Macro variations are snapshots of all macro positions — the fastest way
-    to build performable presets, and recallable live.
-
-    Parameters:
-    - track_index / device_index: 1-based.
-    - action: info, add_macro, remove_macro, randomize_macros,
-      store_variation, recall_variation, delete_variation, chain_selector.
-    - value: Variation index for recall_variation, or 0.0-1.0 for
-      chain_selector.
-    """
-    try:
-        ableton = get_ableton_connection()
-        ti = _to_zero_based(track_index, "track_index")
-        di = _to_zero_based(device_index, "device_index")
-        payload: dict = {"track_index": ti, "device_index": di, "action": action}
-        if value is not None:
-            payload["value"] = value
-        r = ableton.send_command("manage_rack", payload)
-        return "\n".join(f"{k}: {v}" for k, v in r.items())
-    except Exception as e:
-        logger.error(f"Error managing rack: {str(e)}")
-        return f"Error managing rack: {str(e)}"
-
-
-@mcp.tool()
-def control_looper(
-    ctx: Context,
-    track_index: int,
-    action: str = "info",
-    device_index: int | None = None,
-) -> str:
-    """Control a Looper device — record, overdub, play, stop, clear, undo, export.
-
-    For a live duo this is the loop pedal, driven from the Set rather than
-    a footswitch.
-
-    Parameters:
-    - track_index: 1-based track holding the Looper.
-    - action: info, record, overdub, play, stop, clear, undo,
-      double_length, half_length, double_speed, half_speed,
-      export_to_clip_slot.
-    - device_index: 1-based, if the track has more than one Looper.
-    """
-    try:
-        ableton = get_ableton_connection()
-        ti = _to_zero_based(track_index, "track_index")
-        payload: dict = {"track_index": ti, "action": action}
-        if device_index is not None:
-            payload["device_index"] = _to_zero_based(device_index, "device_index")
-        r = ableton.send_command("control_looper", payload)
-        return "\n".join(f"{k}: {v}" for k, v in r.items())
-    except Exception as e:
-        logger.error(f"Error controlling looper: {str(e)}")
-        return f"Error controlling looper: {str(e)}"
 
 
 @mcp.tool()

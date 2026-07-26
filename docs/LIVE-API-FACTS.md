@@ -136,6 +136,23 @@ Prefer wording like "`create_automation_envelope` refuses arrangement clips" ove
 "arrangement automation is impossible": the first stays true, the second was wrong
 within a version and blocked real work in the meantime.
 
+**The question that keeps working: "how does a human do this in Live, and is
+_that_ path exposed?"** Every entry below was recorded as impossible because one
+obvious API call failed. None of them were.
+
+| Written off as | The call that failed | What a human does instead | Reachable? |
+|---|---|---|---|
+| Arrangement automation | `create_automation_envelope` | arm record, move the fader | yes |
+| Section metering | `start_playback` "always bar 1" | drag the start marker | yes — `start_time` |
+| Rendering audio | no export call | resample onto an audio track | yes |
+| Freeze | `is_frozen` has no setter | bounce the track, disable the original | yes, in effect |
+| Editing arranged clips | — | — | it was already built, just stale |
+
+Four of the five were **real-time transport tricks**, not data-model calls. That
+is the shape of this API: it is thin on offline operations and rich in things you
+can drive the transport into doing. When an offline call is missing, look for the
+real-time route before concluding anything.
+
 ### Repeated destructive calls can trip the permission classifier
 Deleting many tracks in a row gets blocked. Ask the user to do bulk deletion by
 hand — it is faster for them anyway.
@@ -149,14 +166,32 @@ hand — it is faster for them anyway.
 | **Clip envelopes on arrangement clips** | `create_automation_envelope` on an arrangement clip → *"Not a session clip"*. Verified again on 12.4.1 with a correctly-resolved same-track parameter, so not a lookup artefact. **This is a limit on clip envelopes only — see below, arrangement automation itself is writable.** |
 | **Envelopes surviving duplication** | `duplicate_clip_to_arrangement` **strips clip envelopes**. `has_envelopes` reads False on every copy. Re-placing does not help. |
 | **Creating group tracks** | `song` exposes only `create_midi_track`, `create_audio_track`, `create_return_track`, `create_scene`. Existing groups can be folded (`fold_state`), never created. |
-| **Freeze / flatten** | `is_frozen` / `can_be_frozen` are readable; no method to trigger. |
-| **Rendering / exporting audio** | Not in the API. |
+| **Freeze / flatten** | `is_frozen` / `can_be_frozen` are readable; setting `is_frozen` raises *"property of 'Track' object has no setter"*. No method triggers it. **But `bounce_to_audio(source="<track>")` achieves the same end** — resample the track, then disable the original. |
+| **Rendering / exporting audio** | No render or export call exists. **This does not mean audio cannot be produced** — see the resampling entry below. |
 | **Follow actions** | Not exposed on `Clip` or `ClipSlot` in 12.4.1 — `Clip` has `launch_mode` and `launch_quantization` but no `follow_action` member, and `ClipSlot` has none either. |
 | **VST/AU internals** | Opaque unless mapped via Live's Configure mode. Banks and presets are reachable. |
 
 ---
 
 ## Corrected assumptions (all of these were wrongly believed impossible)
+
+- **Audio can be rendered, by resampling in real time.** "Rendering / exporting
+  audio: not in the API" was true of *export* and false of the goal. An audio
+  track accepts **`Resampling`** (the main bus) or **any individual track** as
+  its INPUT, so arming one and rolling the transport writes a real file into
+  `Samples/Recorded`. Verified: bars 33-35 produced an 843 KB 48 kHz stereo
+  AIFF, 4.39 s, **peak −8.5 dBFS, RMS −20.9 dBFS** — measured off the SSND
+  chunk, because a plausible file size is not evidence of audio. Wrapped as
+  **`bounce_to_audio`**. One mechanism covers mixdown, stem export, and a
+  freeze/flatten stand-in. Real time: 32 bars costs 32 bars.
+- **`song.file_path` and `song.name` say which Set is open.** Live swaps
+  documents silently and every call then addresses the new one. An afternoon
+  went into "the arrangement is empty" that was really "you are looking at the
+  template". `get_build_info` now reports both, next to the build check.
+- **`song.exclusive_arm` / `exclusive_solo` are readable and writable.** This is
+  the mechanism behind the arm theft documented above — it reads `True` here.
+- **`Song.delete_return_track` exists.** Return tracks were creatable but not
+  deletable purely because it was never wrapped.
 
 - **Arrangement automation is writable.** Previously recorded here as flatly
   impossible. Two true facts — Live refuses clip envelopes on arrangement clips,

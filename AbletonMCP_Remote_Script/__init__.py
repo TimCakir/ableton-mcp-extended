@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.11"
+BUILD_ID = "2026-07-26.12"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -415,6 +415,7 @@ class AbletonMCP(ControlSurface):
                                  "record_arrangement_automation",
                                  "record_over_range",
                                  "bounce_to_audio",
+                                 "delete_return_track",
                                  "cancel_automation_record",
                                  "play_section",
                                  "call_lom", "set_device_sidechain",
@@ -809,6 +810,9 @@ class AbletonMCP(ControlSurface):
                                 params.get("to_beat", 0.0),
                                 params.get("arm_track", True),
                                 params.get("return_to_start", True))
+                        elif command_type == "delete_return_track":
+                            result = self._delete_return_track(
+                                params.get("return_index", 0))
                         elif command_type == "bounce_to_audio":
                             result = self._bounce_to_audio(
                                 params.get("from_beat", 0.0),
@@ -6955,6 +6959,15 @@ class AbletonMCP(ControlSurface):
         stale copy of this file, not to a real limit.
         """
         info = {"remote_script_build": BUILD_ID, "script_file": __file__}
+        # Which Set is open. Live swaps documents without telling anyone, and
+        # an afternoon went into "the arrangement is empty" that was really
+        # "you are looking at the template". song.file_path answers it in one
+        # line, so it belongs in the same place as the build check.
+        for attr in ("name", "file_path"):
+            try:
+                info["set_" + attr] = getattr(self._song, attr)
+            except Exception:
+                pass
         try:
             app = self.application()
             parts = []
@@ -7201,7 +7214,19 @@ class AbletonMCP(ControlSurface):
                 if now > start_beat + 1e-6:
                     current["rolling"] = True
                 if not current["rolling"]:
-                    current["waiting"] += 1
+                    # A count-in delays the roll by up to 4 bars and Live
+                    # reports it, so don't spend the patience budget waiting
+                    # for something that is working as configured. This Set
+                    # has count_in_duration set, which would otherwise have
+                    # aborted a pass as "never_started" before the count
+                    # finished.
+                    counting_in = False
+                    try:
+                        counting_in = bool(song.is_counting_in)
+                    except Exception:
+                        pass
+                    if not counting_in:
+                        current["waiting"] += 1
                     if current["waiting"] > 40:          # ~4 s of ticks
                         self.log_message(
                             "automation record: transport never rolled")
@@ -7256,6 +7281,23 @@ class AbletonMCP(ControlSurface):
                 "beats": beats, "estimated_seconds": seconds,
                 "note": "Recording in real time. Poll "
                         "get_automation_record_status until status is 'done'."}
+
+    def _delete_return_track(self, return_index):
+        """Delete a return track by its position among the returns.
+
+        The API could create return tracks but never remove them, purely
+        because `delete_return_track` was never wrapped — it has been on
+        Song the whole time.
+        """
+        song = self._song
+        returns = tuple(song.return_tracks)
+        if return_index < 0 or return_index >= len(returns):
+            raise IndexError(
+                "Return index {0} out of range (0-{1})".format(
+                    return_index, len(returns) - 1))
+        name = returns[return_index].name
+        song.delete_return_track(return_index)
+        return {"deleted": name, "remaining": len(song.return_tracks)}
 
     def _bounce_to_audio(self, from_beat, to_beat, source="Resampling",
                          name=None):
@@ -7422,7 +7464,19 @@ class AbletonMCP(ControlSurface):
                 if now > from_beat + 1e-6:
                     current["rolling"] = True
                 if not current["rolling"]:
-                    current["waiting"] += 1
+                    # A count-in delays the roll by up to 4 bars and Live
+                    # reports it, so don't spend the patience budget waiting
+                    # for something that is working as configured. This Set
+                    # has count_in_duration set, which would otherwise have
+                    # aborted a pass as "never_started" before the count
+                    # finished.
+                    counting_in = False
+                    try:
+                        counting_in = bool(song.is_counting_in)
+                    except Exception:
+                        pass
+                    if not counting_in:
+                        current["waiting"] += 1
                     if current["waiting"] > 40:          # ~4 s of ticks
                         self.log_message(
                             "take recording: transport never rolled")

@@ -37,7 +37,7 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-07-26.11"
+SERVER_BUILD_ID = "2026-07-26.12"
 
 @dataclass
 class AbletonConnection:
@@ -3331,6 +3331,31 @@ def record_over_range(
 
 
 @mcp.tool()
+def delete_return_track(ctx: Context, return_index: int) -> str:
+    """Delete a return track.
+
+    Return tracks could be created but never removed — `delete_return_track`
+    has been on Song the whole time and simply was not wrapped.
+
+    Parameters:
+    - return_index: Position among the RETURN tracks (1-based), not the
+      combined track list. Call get_session_overview to see them; returns are
+      listed after the session tracks.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ri = _to_zero_based(return_index, "return_index")
+        r = ableton.send_command("delete_return_track", {"return_index": ri})
+        return (
+            f"Deleted return track '{r.get('deleted')}' "
+            f"({r.get('remaining')} return(s) left)"
+        )
+    except Exception as e:
+        logger.error(f"Error deleting return track: {str(e)}")
+        return f"Error deleting return track: {str(e)}"
+
+
+@mcp.tool()
 def bounce_to_audio(
     ctx: Context,
     from_bar: int,
@@ -5271,6 +5296,8 @@ def get_build_info(ctx: Context) -> str:
 
         lines = [
             f"Live {r.get('live_version', '?')}",
+            f"  open Set : {r.get('set_name', '?')}",
+            f"             {r.get('set_file_path', '?')}",
             f"  remote script loaded by Live : {live_build}",
             f"  this MCP server process      : {server_build}",
             f"  repo on disk                 : {repo_build or '?'}",

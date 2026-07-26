@@ -14,7 +14,12 @@ read and edited in place.
 
 **Arrangement automation.** `record_arrangement_automation` writes real track
 automation by recording off the transport. The old belief that this was
-impossible is corrected in `LIVE-API-FACTS.md`.
+impossible is corrected in `LIVE-API-FACTS.md`. Verified end to end on 12.4.3
+against a real Set: 44 points over 8 beats, `automation_state` 0 → 1, replaying
+as a smooth interpolated ramp (0.75 mid-ramp, landing exactly on 0.95). The
+pass disarms every track first and restores the arm map, so it cannot punch out
+arranged material on whatever happened to be armed. `cancel_automation_record`
+stops it mid-pass and disarms the transport.
 
 **Section playback.** `play_section(from_bar, to_bar)` — `song.start_time` is
 writable, so a section can be auditioned and metered.

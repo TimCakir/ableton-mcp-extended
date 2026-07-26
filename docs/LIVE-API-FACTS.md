@@ -82,10 +82,19 @@ present and the playhead at beat 1.28, `volume` read `0.85` while stopped and
 `0.15` — the real value there — as soon as the transport rolled.
 
 So a parameter read that "proves" automation is absent proves nothing unless the
-transport was rolling. Check `song.is_playing` before drawing a conclusion from
-any parameter value; `start_playback` does not always leave it True, and a
-single read of `is_playing == False` has been observed while a queued command
-settled.
+transport was actually rolling.
+
+### `song.is_playing` lags `start_playing()` by several ticks
+
+Not one tick — several. Measured on 12.4.3: a recorder that treated two
+consecutive `is_playing == False` readings as "the user stopped" ended its pass
+after ~2 ticks having written nothing, and reported success. The same pass
+judged on `current_song_time` instead ran to completion with 44 points.
+
+**Never use `is_playing` as a liveness signal.** Use the playhead: wait for
+`current_song_time` to advance past where it started, and treat a position that
+stops advancing as the stop. `is_playing` is fine for a one-off "is something
+happening" question and useless for control flow.
 
 ### Creating a track silently disarms whatever was armed
 

@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.13"
+BUILD_ID = "2026-07-26.14"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -303,6 +303,8 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self._batch(
                     params.get("commands", []),
                     params.get("stop_on_error", True))
+            elif command_type == "get_performance_report":
+                response["result"] = self._get_performance_report()
             elif command_type == "get_build_info":
                 response["result"] = self._get_build_info()
             elif command_type == "get_automation_record_status":
@@ -417,6 +419,9 @@ class AbletonMCP(ControlSurface):
                                  "bounce_to_audio",
                                  "delete_return_track",
                                  "import_audio_file",
+                                 "insert_device",
+                                 "manage_song_data",
+                                 "set_song_options",
                                  "cancel_automation_record",
                                  "play_section",
                                  "call_lom", "set_device_sidechain",
@@ -811,6 +816,19 @@ class AbletonMCP(ControlSurface):
                                 params.get("to_beat", 0.0),
                                 params.get("arm_track", True),
                                 params.get("return_to_start", True))
+                        elif command_type == "insert_device":
+                            result = self._insert_device(
+                                params.get("track_index", 0),
+                                params.get("device_name", ""),
+                                params.get("position", None))
+                        elif command_type == "manage_song_data":
+                            result = self._manage_song_data(
+                                params.get("action", "get"),
+                                params.get("key", ""),
+                                params.get("value", None),
+                                params.get("track_index", None))
+                        elif command_type == "set_song_options":
+                            result = self._set_song_options(**params)
                         elif command_type == "import_audio_file":
                             result = self._import_audio_file(
                                 params.get("track_index", 0),
@@ -7350,6 +7368,106 @@ class AbletonMCP(ControlSurface):
                 "beats": beats, "estimated_seconds": seconds,
                 "note": "Recording in real time. Poll "
                         "get_automation_record_status until status is 'done'."}
+
+    def _insert_device(self, track_index, device_name, position=None):
+        """Insert a Live device at a position, instead of append-then-move.
+
+        Signature discovered from the C++ error rather than guessed:
+        `insert_device(TString DeviceName, int DeviceIndex=-1)`. Note it
+        takes a DEVICE NAME, not a browser URI — unlike load_browser_item.
+        """
+        track = self._track_at(track_index)
+        before = [d.name for d in tuple(track.devices)]
+        index = -1 if position is None else int(position)
+        track.insert_device(str(device_name), index)
+        after = [d.name for d in tuple(track.devices)]
+        if len(after) == len(before):
+            raise ValueError(
+                "Live did not insert '{0}'. insert_device takes a device "
+                "NAME as Live spells it (e.g. 'Reverb', 'EQ Eight'), not a "
+                "browser URI — load_instrument_or_effect takes the URI. "
+                "Chain is unchanged: {1}".format(device_name, after))
+        return {"track": track.name, "inserted": device_name,
+                "position": index, "chain": after}
+
+    def _get_performance_report(self):
+        """Per-track CPU load, so a heavy Set can be diagnosed not guessed.
+
+        `Track.performance_impact` reads 0 while stopped — roll the transport
+        first or every track looks free.
+        """
+        song = self._song
+        rows = []
+        for i, track in enumerate(tuple(song.tracks) + tuple(song.return_tracks)):
+            try:
+                rows.append({"index": i, "name": track.name,
+                             "impact": round(track.performance_impact, 5),
+                             "devices": len(track.devices),
+                             "frozen": bool(getattr(track, "is_frozen", False))})
+            except Exception:
+                pass
+        rows.sort(key=lambda r: r["impact"], reverse=True)
+        return {"is_playing": song.is_playing, "tracks": rows,
+                "total": round(sum(r["impact"] for r in rows), 5)}
+
+    def _manage_song_data(self, action, key, value=None, track_index=None):
+        """Read or write arbitrary data stored INSIDE the Live Set.
+
+        Song and Track both expose get_data/set_data, which persist in the
+        .als. That means notes, section plans or "what has already been
+        bounced" travel with the project and survive restarts, instead of
+        living in a sidecar file that goes stale the moment the Set is
+        moved or renamed.
+
+        Signature from the C++ error: get_data(key, default_value) — the
+        default is REQUIRED, not optional.
+        """
+        target = (self._track_at(track_index)
+                  if track_index is not None else self._song)
+        where = getattr(target, "name", "song") if track_index is not None else "song"
+        if action == "set":
+            target.set_data(str(key), value)
+            return {"action": "set", "scope": where, "key": key, "value": value}
+        if action == "get":
+            got = target.get_data(str(key), None)
+            return {"action": "get", "scope": where, "key": key, "value": got}
+        raise ValueError("action must be 'get' or 'set'")
+
+    def _set_song_options(self, **options):
+        """Global behaviour flags that were never wrapped.
+
+        `exclusive_arm` is the one that matters: it is the mechanism behind
+        arming a track silently disarming whatever was armed before, which
+        has bitten this integration more than once.
+        """
+        song = self._song
+        changed = {}
+        for name in ("exclusive_arm", "exclusive_solo", "select_on_launch",
+                     "tempo_follower_enabled", "is_ableton_link_enabled"):
+            val = options.get(name)
+            if val is not None:
+                try:
+                    setattr(song, name, bool(val))
+                    changed[name] = {"requested": bool(val),
+                                     "observed": getattr(song, name)}
+                except Exception as exc:
+                    changed[name] = {"error": str(exc)}
+        count_in = options.get("count_in_duration")
+        if count_in is not None:
+            try:
+                song.count_in_duration = int(count_in)
+                changed["count_in_duration"] = song.count_in_duration
+            except Exception as exc:
+                changed["count_in_duration"] = {"error": str(exc)}
+        current = {}
+        for name in ("exclusive_arm", "exclusive_solo", "select_on_launch",
+                     "tempo_follower_enabled", "is_ableton_link_enabled",
+                     "count_in_duration"):
+            try:
+                current[name] = getattr(song, name)
+            except Exception:
+                pass
+        return {"changed": changed, "current": current}
 
     def _delete_return_track(self, return_index):
         """Delete a return track by its position among the returns.

@@ -37,7 +37,7 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-07-26.13"
+SERVER_BUILD_ID = "2026-07-26.14"
 
 @dataclass
 class AbletonConnection:
@@ -3331,6 +3331,170 @@ def record_over_range(
 
 
 @mcp.tool()
+def insert_device(
+    ctx: Context,
+    track_index: int,
+    device_name: str,
+    position: int = 0,
+) -> str:
+    """Insert a Live device at a position in the chain.
+
+    Devices otherwise always append and then need `move_device`. Signature
+    was read off Live's own C++ error rather than guessed:
+    `insert_device(DeviceName, DeviceIndex=-1)`.
+
+    IMPORTANT: this takes a device NAME as Live spells it ("Reverb",
+    "EQ Eight", "Compressor"), NOT a browser URI. Use
+    `load_instrument_or_effect` for URIs, presets and third-party plugins.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    - device_name: Live device name, e.g. "EQ Eight".
+    - position: 1-based slot to insert at; 0 appends to the end.
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload: dict = {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "device_name": device_name,
+        }
+        if position:
+            payload["position"] = _to_zero_based(position, "position")
+        r = ableton.send_command("insert_device", payload)
+        return (
+            f"Inserted '{r.get('inserted')}' on '{r.get('track')}'\n"
+            f"Chain: {' -> '.join(r.get('chain') or [])}"
+        )
+    except Exception as e:
+        logger.error(f"Error inserting device: {str(e)}")
+        return f"Error inserting device: {str(e)}"
+
+
+@mcp.tool()
+def get_performance_report(ctx: Context) -> str:
+    """Per-track CPU load, ranked — diagnose a heavy Set instead of guessing.
+
+    NOTE: `performance_impact` reads 0 while the transport is stopped, so
+    every track looks free. Start playback (or `play_section`) first, then
+    call this.
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command("get_performance_report", {})
+        rows = r.get("tracks") or []
+        if not r.get("is_playing"):
+            head = ("Transport is STOPPED — these readings are all ~0 and "
+                    "mean nothing. Roll the transport and call again.\n")
+        else:
+            head = f"CPU by track (total {r.get('total')}):\n"
+        lines = [head]
+        for row in rows:
+            bar = "#" * int(min(row.get("impact", 0) * 200, 40))
+            frozen = " [frozen]" if row.get("frozen") else ""
+            lines.append(
+                f"  {row.get('name', '')[:18]:<18} {row.get('impact'):>8} "
+                f"{bar}{frozen}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting performance report: {str(e)}")
+        return f"Error getting performance report: {str(e)}"
+
+
+@mcp.tool()
+def manage_song_data(
+    ctx: Context,
+    action: str = "get",
+    key: str = "",
+    value: str | None = None,
+    track_index: int = 0,
+) -> str:
+    """Store or read arbitrary data INSIDE the Live Set itself.
+
+    Song and Track both expose get_data/set_data, and what you write
+    persists in the .als. So a section plan, mix notes, or a record of what
+    has already been bounced travels with the project and survives restarts
+    — unlike a sidecar file, which goes stale the moment the Set is renamed,
+    moved or copied to another machine.
+
+    Parameters:
+    - action: "get" or "set".
+    - key: Identifier to store under. Namespace it, e.g. "mcp.section_plan".
+    - value: Value to store (set only).
+    - track_index: Store against a TRACK (1-based) instead of the Song.
+    """
+    try:
+        if not key:
+            return "Error: key is required"
+        if action == "set" and value is None:
+            return "Error: value is required when action='set'"
+        ableton = get_ableton_connection()
+        payload: dict = {"action": action, "key": key}
+        if value is not None:
+            payload["value"] = value
+        if track_index:
+            payload["track_index"] = _to_zero_based(track_index, "track_index")
+        r = ableton.send_command("manage_song_data", payload)
+        if r.get("action") == "set":
+            return f"Stored '{key}' on {r.get('scope')}"
+        got = r.get("value")
+        if got is None:
+            return f"No value stored under '{key}' on {r.get('scope')}"
+        return f"{key} ({r.get('scope')}) = {got}"
+    except Exception as e:
+        logger.error(f"Error managing song data: {str(e)}")
+        return f"Error managing song data: {str(e)}"
+
+
+@mcp.tool()
+def set_song_options(
+    ctx: Context,
+    exclusive_arm: bool | None = None,
+    exclusive_solo: bool | None = None,
+    select_on_launch: bool | None = None,
+    tempo_follower_enabled: bool | None = None,
+    is_ableton_link_enabled: bool | None = None,
+    count_in_duration: int | None = None,
+) -> str:
+    """Global behaviour flags. Omitted values are left alone.
+
+    `exclusive_arm` is the important one: it is why arming a track silently
+    disarms whatever was armed before. Turning it off is the clean fix when
+    several tracks need arming, and it explains a class of "my arm state
+    changed by itself" surprises.
+
+    `count_in_duration` delays the transport when recording, which can make
+    a record pass look like it never started.
+
+    Parameters:
+    - exclusive_arm / exclusive_solo: One-at-a-time arm / solo.
+    - select_on_launch: Move the selection to a fired clip.
+    - tempo_follower_enabled / is_ableton_link_enabled: Sync options.
+    - count_in_duration: Index into Live's count-in choices (0 = none).
+    """
+    try:
+        ableton = get_ableton_connection()
+        payload = {k: v for k, v in {
+            "exclusive_arm": exclusive_arm,
+            "exclusive_solo": exclusive_solo,
+            "select_on_launch": select_on_launch,
+            "tempo_follower_enabled": tempo_follower_enabled,
+            "is_ableton_link_enabled": is_ableton_link_enabled,
+            "count_in_duration": count_in_duration,
+        }.items() if v is not None}
+        if not payload:
+            payload = {}
+        r = ableton.send_command("set_song_options", payload)
+        cur = r.get("current") or {}
+        lines = ["Song options:"]
+        for k, v in cur.items():
+            lines.append(f"  {k:<26} {v}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error setting song options: {str(e)}")
+        return f"Error setting song options: {str(e)}"
+
+
+@mcp.tool()
 def delete_return_track(ctx: Context, return_index: int) -> str:
     """Delete a return track.
 
@@ -5607,6 +5771,117 @@ def create_arrangement_midi_clip(
     except Exception as e:
         logger.error(f"Error creating arrangement MIDI clip: {str(e)}")
         return f"Error creating arrangement MIDI clip: {str(e)}"
+
+
+def _db(level: float) -> str:
+    """Live's normalised meter level as an approximate dB string."""
+    if level <= 0.0001:
+        return "-inf"
+    import math
+    # Live's meter taper: 0.85 reads as 0 dB on the fader scale.
+    return f"{20 * math.log10(level / 0.85):+.1f}"
+
+
+@mcp.tool()
+def measure_section(
+    ctx: Context,
+    from_bar: int,
+    to_bar: int = 0,
+    samples: int = 16,
+) -> str:
+    """Play a section and MEASURE it — peak, average and headroom per track.
+
+    `get_meters` on its own returns one instantaneous reading, which catches
+    whatever happened to be sounding at that millisecond. A kick that only
+    hits on beat 1 reads either "loudest in the mix" or "silent" depending on
+    when you asked. That makes single readings close to useless for mix
+    decisions.
+
+    This rolls the section and samples repeatedly, then reports per track:
+    peak, mean, and how often it was audible at all. Tracks that never rise
+    above the noise floor are called out — that is usually a routing mistake
+    or something buried, and it is invisible in a single sample.
+
+    Runs in real time: measuring 8 bars takes 8 bars.
+
+    Parameters:
+    - from_bar: Bar to start at (1-based).
+    - to_bar: Bar to stop at. Defaults to 4 bars after from_bar.
+    - samples: How many meter readings to take across the window.
+    """
+    try:
+        if to_bar and to_bar <= from_bar:
+            return "Error: to_bar must be greater than from_bar"
+        if not to_bar:
+            to_bar = from_bar + 4
+        samples = max(3, min(int(samples), 200))
+
+        ableton = get_ableton_connection()
+        num, denom = _get_time_signature()
+        info = ableton.send_command("get_session_info", {})
+        tempo = float(info.get("tempo", 120.0))
+        beats = bar_to_beat(to_bar, num, denom) - bar_to_beat(from_bar, num, denom)
+        window = beats * 60.0 / tempo
+        gap = window / samples
+
+        ableton.send_command("play_section", {
+            "from_beat": bar_to_beat(from_bar, num, denom),
+            "loop": False, "play": True})
+
+        collected: dict = {}
+        master_peak = 0.0
+        taken = 0
+        deadline = time.time() + window
+        while time.time() < deadline and taken < samples:
+            time.sleep(gap)
+            try:
+                m = ableton.send_command("get_meters", {})
+            except Exception:
+                break
+            taken += 1
+            for row in m.get("tracks") or []:
+                key = row.get("name")
+                lvl = float(row.get("output_meter_level") or 0.0)
+                slot = collected.setdefault(key, {"peak": 0.0, "sum": 0.0,
+                                                  "n": 0, "audible": 0})
+                slot["peak"] = max(slot["peak"], lvl)
+                slot["sum"] += lvl
+                slot["n"] += 1
+                if lvl > 0.01:
+                    slot["audible"] += 1
+            master_peak = max(
+                master_peak,
+                float((m.get("master") or {}).get("output_meter_level") or 0.0))
+
+        ableton.send_command("stop_playback", {})
+
+        if not taken:
+            return "No meter readings were taken — did the transport roll?"
+
+        lines = [
+            f"Bars {from_bar}-{to_bar - 1} ({beats:g} beats, {taken} samples)",
+            f"{'track':<16} {'peak':>8} {'avg':>8}  audible",
+        ]
+        silent = []
+        for name, s in collected.items():
+            mean = s["sum"] / max(s["n"], 1)
+            pct = 100 * s["audible"] / max(s["n"], 1)
+            if s["peak"] <= 0.01:
+                silent.append(name)
+            lines.append(
+                f"{name[:16]:<16} {_db(s['peak']):>8} {_db(mean):>8}  {pct:3.0f}%")
+        lines.append(f"{'MASTER':<16} {_db(master_peak):>8}")
+        if master_peak >= 1.0:
+            lines.append("\nMASTER IS CLIPPING — pull the mix down.")
+        if silent:
+            lines.append(
+                "\nNever audible in this section: " + ", ".join(silent) +
+                "\n  Expected if they do not play here; otherwise check "
+                "routing, mute state, or whether a clip exists at these bars.")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error measuring section: {str(e)}")
+        return f"Error measuring section: {str(e)}"
 
 
 @mcp.tool()

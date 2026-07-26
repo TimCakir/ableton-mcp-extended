@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.6"
+BUILD_ID = "2026-07-26.7"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -284,6 +284,10 @@ class AbletonMCP(ControlSurface):
                     params.get("track_index", 0))
             elif command_type == "get_grooves":
                 response["result"] = self._get_grooves()
+            elif command_type == "batch":
+                response["result"] = self._batch(
+                    params.get("commands", []),
+                    params.get("stop_on_error", True))
             elif command_type == "get_build_info":
                 response["result"] = self._get_build_info()
             elif command_type == "get_automation_record_status":
@@ -394,6 +398,7 @@ class AbletonMCP(ControlSurface):
                                  "manage_tuning_system",
                                  "write_arrangement_automation",
                                  "record_arrangement_automation",
+                                 "record_over_range",
                                  "cancel_automation_record",
                                  "play_section",
                                  "call_lom", "set_device_sidechain",
@@ -781,6 +786,13 @@ class AbletonMCP(ControlSurface):
                                 params.get("points", []),
                                 params.get("device_index", None),
                                 params.get("return_to_start", True))
+                        elif command_type == "record_over_range":
+                            result = self._record_over_range(
+                                params.get("track_index", 0),
+                                params.get("from_beat", 0.0),
+                                params.get("to_beat", 0.0),
+                                params.get("arm_track", True),
+                                params.get("return_to_start", True))
                         elif command_type == "cancel_automation_record":
                             result = self._cancel_automation_record()
                         elif command_type == "play_section":
@@ -959,7 +971,10 @@ class AbletonMCP(ControlSurface):
                             ti = params.get("track_index", 0)
                             ci = params.get("clip_index", None)
                             cn = params.get("clip_name", None)
-                            result = self._delete_arrangement_clip(ti, ci, cn)
+                            result = self._delete_arrangement_clip(
+                                ti, ci, cn,
+                                params.get("from_time", None),
+                                params.get("to_time", None))
                         elif command_type == "set_arrangement_clip_property":
                             ti = params.get("track_index", 0)
                             ci = params.get("clip_index", 0)
@@ -2095,12 +2110,53 @@ class AbletonMCP(ControlSurface):
         return self._add_notes_extended(
             track_index, clip_index, notes, replace=replace, arrangement=True)
 
-    def _delete_arrangement_clip(self, track_index, clip_index=None, clip_name=None):
-        """Delete an arrangement clip."""
+    def _delete_arrangement_clip(self, track_index, clip_index=None,
+                                 clip_name=None, from_time=None, to_time=None):
+        """Delete arrangement clips, by position/name or by time range.
+
+        Positional indexing into `arrangement_clips` is fragile in exactly the
+        way track indices are: the collection renumbers the moment anything is
+        removed, so deleting several clips by index walks off target after the
+        first one — and every call still reports success. A time range is both
+        stable under mutation and how arrangement edits are actually thought
+        about ("clear bars 33 to 49").
+        """
         try:
-            track, clip = self._resolve_arrangement_clip(track_index, clip_index, clip_name)
-            track.delete_clip(clip)
-            return {"deleted": True}
+            if from_time is None and to_time is None:
+                track, clip = self._resolve_arrangement_clip(
+                    track_index, clip_index, clip_name)
+                name = clip.name
+                track.delete_clip(clip)
+                return {"deleted": 1, "names": [name]}
+
+            track = self._track_at(track_index)
+            lo = float(from_time) if from_time is not None else float("-inf")
+            hi = float(to_time) if to_time is not None else float("inf")
+            if hi <= lo:
+                raise ValueError("to_time must be greater than from_time")
+
+            # Re-scan the collection after every delete rather than deleting
+            # from a snapshot: the proxies in a stale snapshot may no longer
+            # refer to what they did, which is the same trap one level down.
+            names = []
+            while True:
+                target = None
+                for clip in tuple(track.arrangement_clips):
+                    if lo <= clip.start_time < hi:
+                        target = clip
+                        break
+                if target is None:
+                    break
+                names.append(target.name)
+                track.delete_clip(target)
+                if len(names) > 5000:
+                    raise RuntimeError(
+                        "refusing to delete more than 5000 clips in one call")
+
+            return {"deleted": len(names), "names": names,
+                    "track": track.name,
+                    "from_time": None if from_time is None else lo,
+                    "to_time": None if to_time is None else hi}
         except Exception as e:
             self.log_message("Error deleting arrangement clip: " + str(e))
             raise
@@ -6805,6 +6861,67 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error reading clip automation: " + str(e))
             raise
 
+    # --- Many commands over one connection --------------------------------
+
+    def _batch(self, commands, stop_on_error=True):
+        """Run a list of commands in order over a single connection.
+
+        Every command is otherwise a full round trip: a socket exchange, and
+        above that a separate tool call with model latency attached. Building
+        one arrangement took roughly 260 of them, and that latency — not
+        Live — is what made large edits impractical.
+
+        Each entry is replayed through the normal `_process_command` path, so
+        threading, validation and error handling are identical to sending it
+        on its own. Only the round trips disappear. That is deliberate: a
+        second dispatch path would be a second place for the three-way
+        registration to rot.
+        """
+        if not isinstance(commands, (list, tuple)):
+            raise ValueError("'commands' must be a list")
+
+        results = []
+        succeeded = 0
+        failed = 0
+        for index, entry in enumerate(commands):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    "command {0} is not an object".format(index))
+            name = entry.get("command") or entry.get("type")
+            if not name:
+                raise ValueError(
+                    "command {0} has no 'command' name".format(index))
+            if name == "batch":
+                # Nesting would make a failure index meaningless and invites
+                # unbounded recursion from a single malformed payload.
+                raise ValueError("batch cannot contain another batch")
+
+            record = {"index": index, "command": name}
+            try:
+                reply = self._process_command(
+                    {"type": name, "params": entry.get("params") or {}})
+            except Exception as exc:
+                reply = {"status": "error", "message": str(exc)}
+
+            if reply.get("status") == "error":
+                failed += 1
+                record["status"] = "error"
+                record["message"] = reply.get("message", "unknown error")
+                results.append(record)
+                if stop_on_error:
+                    return {"ran": index + 1, "total": len(commands),
+                            "succeeded": succeeded, "failed": failed,
+                            "stopped_early": True, "results": results}
+            else:
+                succeeded += 1
+                record["status"] = "success"
+                record["result"] = reply.get("result")
+                results.append(record)
+
+        return {"ran": len(commands), "total": len(commands),
+                "succeeded": succeeded, "failed": failed,
+                "stopped_early": False, "results": results}
+
     # --- Build identity --------------------------------------------------
 
     def _get_build_info(self):
@@ -6892,6 +7009,24 @@ class AbletonMCP(ControlSurface):
                 song.start_time = restore.get("start_time", 0.0)
             except Exception:
                 pass
+        # Arming a track makes Live's exclusive arm disarm the others, and
+        # nothing reports it — so the whole arm map is captured and put back,
+        # disarming everything first so exclusive arm cannot fight the restore.
+        arm_map = restore.get("arm_map")
+        if arm_map:
+            tracks = tuple(song.tracks)
+            for index, armed in arm_map:
+                if index < len(tracks):
+                    try:
+                        tracks[index].arm = False
+                    except Exception:
+                        pass
+            for index, armed in arm_map:
+                if armed and index < len(tracks):
+                    try:
+                        tracks[index].arm = True
+                    except Exception:
+                        pass
         state["active"] = False
         state["status"] = status
         return state
@@ -7044,6 +7179,108 @@ class AbletonMCP(ControlSurface):
                 "from_beat": start_beat, "to_beat": end_beat,
                 "beats": beats, "estimated_seconds": seconds,
                 "note": "Recording in real time. Poll "
+                        "get_automation_record_status until status is 'done'."}
+
+    def _record_over_range(self, track_index, from_beat, to_beat,
+                           arm_track=True, return_to_start=True):
+        """Record a track's live input into the arrangement over a bar range.
+
+        Same transport pass as record_arrangement_automation, capturing audio
+        or MIDI from the track's input instead of writing a parameter: arm the
+        track, arm arrangement record, roll from `from_beat`, stop at
+        `to_beat`. Punching a take over bars 33-49 becomes one call rather
+        than a hand-timed record button.
+
+        Whatever the track is set to monitor is what gets recorded — check
+        input routing first if the result is silent.
+        """
+        state = getattr(self, "_auto_rec", None)
+        if state and state.get("active"):
+            raise RuntimeError(
+                "A transport pass is already running ({0} on {1}). Wait for "
+                "it or call cancel_automation_record.".format(
+                    state.get("parameter") or "recording",
+                    state.get("track")))
+
+        track = self._track_at(track_index)
+        from_beat = float(from_beat)
+        to_beat = float(to_beat)
+        if to_beat <= from_beat:
+            raise ValueError("to_beat must be greater than from_beat")
+        if arm_track and not getattr(track, "can_be_armed", False):
+            raise ValueError(
+                "'{0}' cannot be armed — group and return tracks have no "
+                "input to record".format(track.name))
+
+        song = self._song
+        arm_map = []
+        for index, other in enumerate(tuple(song.tracks)):
+            try:
+                arm_map.append((index, bool(other.arm)))
+            except Exception:
+                pass
+
+        restore = {"start_time": song.start_time, "loop": song.loop,
+                   "return_to_start": bool(return_to_start),
+                   "arm_map": arm_map}
+
+        if arm_track:
+            track.arm = True
+        song.loop = False
+        song.start_time = from_beat
+        song.record_mode = True
+        song.start_playing()
+
+        self._auto_rec = {
+            "active": True, "status": "recording",
+            "track": track.name, "parameter": "input (take)", "device": None,
+            "from_beat": from_beat, "to_beat": to_beat,
+            "position": from_beat, "samples": 0, "ticks": 0,
+            "restore": restore,
+        }
+
+        try:
+            expected_ticks = (to_beat - from_beat) * 60.0 / song.tempo * 10.0
+        except Exception:
+            expected_ticks = 600.0
+        max_ticks = int(expected_ticks * 3) + 100
+
+        def step():
+            current = getattr(self, "_auto_rec", None)
+            if not current or not current.get("active"):
+                return
+            try:
+                now = song.current_song_time
+                current["position"] = now
+                stopped = current["samples"] > 0 and not song.is_playing
+                if now >= to_beat or stopped:
+                    self._finish_auto_rec("done")
+                    return
+                current["ticks"] += 1
+                if current["ticks"] > max_ticks:
+                    self.log_message(
+                        "take recording ran past its tick budget; stopping")
+                    self._finish_auto_rec("timeout")
+                    return
+                current["samples"] += 1
+            except Exception as exc:
+                self.log_message("take recording step failed: " + str(exc))
+                self._finish_auto_rec("failed")
+                return
+            self.schedule_message(1, step)
+
+        self.schedule_message(1, step)
+
+        beats = to_beat - from_beat
+        try:
+            seconds = beats * 60.0 / song.tempo
+        except Exception:
+            seconds = None
+        return {"started": True, "track": track.name,
+                "from_beat": from_beat, "to_beat": to_beat,
+                "beats": beats, "estimated_seconds": seconds,
+                "armed": bool(arm_track),
+                "note": "Recording input in real time. Poll "
                         "get_automation_record_status until status is 'done'."}
 
     def _play_section(self, from_beat=0.0, to_beat=None, loop=False, play=True):

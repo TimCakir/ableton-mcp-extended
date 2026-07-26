@@ -37,7 +37,7 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-07-26.6"
+SERVER_BUILD_ID = "2026-07-26.7"
 
 @dataclass
 class AbletonConnection:
@@ -3278,6 +3278,59 @@ def record_arrangement_automation(
 
 
 @mcp.tool()
+def record_over_range(
+    ctx: Context,
+    track_index: int,
+    from_bar: int,
+    to_bar: int,
+    arm_track: bool = True,
+    return_to_start: bool = True,
+) -> str:
+    """Record a track's live input into the arrangement over a bar range.
+
+    Punches a take without hand-timing the record button: arms the track,
+    arms arrangement record, rolls from `from_bar` and stops at `to_bar`.
+    Runs in real time, so recording bars 33-49 takes 16 bars of wall clock.
+    Returns immediately — poll `get_automation_record_status`.
+
+    Whatever the track monitors is what lands. If the take comes back silent,
+    check input routing with `get_routing_options` first.
+
+    The arm state of every track is captured and restored afterwards, because
+    arming one track makes Live's exclusive arm silently disarm the others.
+
+    Parameters:
+    - track_index: Track number (1-based). Must be armable — group and return
+      tracks have no input.
+    - from_bar / to_bar: Bar range (1-based, to_bar exclusive).
+    - arm_track: Arm the track first. Set False if it is already armed and
+      you want its current state left alone.
+    - return_to_start: Put the arrangement start marker back afterwards.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        num, denom = _get_time_signature()
+        r = ableton.send_command("record_over_range", {
+            "track_index": ti,
+            "from_beat": bar_to_beat(from_bar, num, denom),
+            "to_beat": bar_to_beat(to_bar, num, denom),
+            "arm_track": arm_track,
+            "return_to_start": return_to_start,
+        })
+        secs = r.get("estimated_seconds")
+        secs_txt = f" (~{secs:.1f}s)" if isinstance(secs, (int, float)) else ""
+        return (
+            f"Recording input on '{r.get('track')}' over bars "
+            f"{from_bar}-{to_bar - 1}{secs_txt}. "
+            f"Poll get_automation_record_status until status is 'done'."
+        )
+    except Exception as e:
+        logger.error(f"Error recording over range: {str(e)}")
+        return f"Error recording over range: {str(e)}"
+
+
+@mcp.tool()
 def get_automation_record_status(ctx: Context) -> str:
     """Progress of an in-flight `record_arrangement_automation` pass.
 
@@ -5007,6 +5060,121 @@ def set_song_time(ctx: Context, bar: int = 0, beat: float = 0.0) -> str:
         return f"Error setting song time: {str(e)}"
 
 
+# Tool name -> wire command, for the handful that differ. Sending the tool
+# name in a batch would otherwise fail with "Unknown command", which is a
+# documented trap in LIVE-API-FACTS.md and pointless to make callers relearn.
+_BATCH_COMMAND_ALIASES = {
+    "duplicate_clip_to_arrangement": "duplicate_to_arrangement",
+    "load_instrument_or_effect": "load_browser_item",
+    "set_ableton_view": "set_view",
+}
+
+# Index fields converted from the 1-based convention every tool uses to the
+# 0-based one the Live API uses. Only values >= 1 are touched: 0 means "not
+# specified" / "all" / "resolve by name" in several commands, and negatives
+# mean "append at end" for track creation.
+_BATCH_INDEX_FIELDS = (
+    "track_index", "clip_index", "device_index", "scene_index", "chain_index",
+)
+
+
+def _prepare_batch_commands(commands: list,
+                            indices_are_one_based: bool = True) -> list:
+    """Normalise a batch payload: resolve aliases, rebase indices.
+
+    Split out from the tool so the index rule is directly testable — it is
+    the part most likely to silently write to the wrong track.
+    """
+    prepared = []
+    for i, entry in enumerate(commands):
+        if not isinstance(entry, dict):
+            raise ValueError(f"command {i + 1} is not an object")
+        name = entry.get("command") or entry.get("type")
+        if not name:
+            raise ValueError(f"command {i + 1} has no 'command' name")
+        name = _BATCH_COMMAND_ALIASES.get(name, name)
+        params = dict(entry.get("params") or {})
+        if indices_are_one_based:
+            for field in _BATCH_INDEX_FIELDS:
+                val = params.get(field)
+                # bool is an int subclass; never rebase a flag.
+                if isinstance(val, int) and not isinstance(val, bool):
+                    if val >= 1:
+                        params[field] = val - 1
+        prepared.append({"command": name, "params": params})
+    return prepared
+
+
+@mcp.tool()
+def batch(
+    ctx: Context,
+    commands: list,
+    stop_on_error: bool = True,
+    indices_are_one_based: bool = True,
+) -> str:
+    """Run many commands in one call instead of one call each.
+
+    Every other tool is a full round trip, and above the socket each one
+    costs a separate model turn. Building a single arrangement took roughly
+    260 of them — the latency, not Live, is what makes large edits
+    impractical. Use this for anything repetitive: placing clips across an
+    arrangement, setting levels on every track, renaming a batch of scenes.
+
+    Commands run in order, through exactly the same code path as sending
+    them individually.
+
+    Parameters:
+    - commands: list of {"command": <name>, "params": {...}}, e.g.
+      [{"command": "set_track_volume", "params": {"track_index": 3,
+        "volume": 0.8}},
+       {"command": "set_track_name", "params": {"track_index": 3,
+        "name": "BASS"}}]
+      Use the wire command name; the few tool names that differ from it
+      (duplicate_clip_to_arrangement, load_instrument_or_effect,
+      set_ableton_view) are translated automatically.
+    - stop_on_error: Stop at the first failure (default) rather than running
+      the rest. Anything already applied stays applied — undo in Live.
+    - indices_are_one_based: Keep the 1-based indices every other tool uses.
+      Only values >= 1 are converted, so 0 keeps its "all / by name / not
+      specified" meaning. Set False to pass raw Live indices straight
+      through.
+
+    NOTE: params here are the underlying command's, which are not always
+    identical to the tool's — bar numbers are not converted to beats, for
+    instance. For one-off calls prefer the dedicated tool.
+    """
+    try:
+        if not isinstance(commands, list):
+            return "Error: 'commands' must be a list"
+        if not commands:
+            return "Error: 'commands' is empty"
+
+        prepared = _prepare_batch_commands(commands, indices_are_one_based)
+
+        ableton = get_ableton_connection()
+        r = ableton.send_command("batch", {
+            "commands": prepared, "stop_on_error": stop_on_error})
+
+        ran = r.get("ran", 0)
+        total = r.get("total", 0)
+        ok = r.get("succeeded", 0)
+        bad = r.get("failed", 0)
+        lines = [f"Batch: {ok}/{total} succeeded, {bad} failed"
+                 + (f" (stopped early after {ran})"
+                    if r.get("stopped_early") else "")]
+        for record in r.get("results") or []:
+            if record.get("status") == "error":
+                lines.append(
+                    f"  #{record.get('index', 0) + 1} {record.get('command')}: "
+                    f"{record.get('message')}")
+        if bad == 0:
+            lines.append("  (all clean)")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error running batch: {str(e)}")
+        return f"Error running batch: {str(e)}"
+
+
 @mcp.tool()
 def get_build_info(ctx: Context) -> str:
     """Check that Live, this server, and the repo are running the same build.
@@ -5426,24 +5594,55 @@ def delete_arrangement_clip(
     track_index: int,
     clip_index: int = 0,
     clip_name: str = "",
+    from_bar: int = 0,
+    to_bar: int = 0,
 ) -> str:
-    """Delete an arrangement clip.
+    """Delete arrangement clips, by position/name or by bar range.
+
+    PREFER the bar range for anything but a single clip. `clip_index` is a
+    position in the track's arrangement list, and that list renumbers as soon
+    as a clip is removed — so deleting several by index hits the wrong clips
+    after the first one, and every call still reports success. It is the same
+    failure as stale track indices, one level down.
 
     Parameters:
     - track_index: Track number (1-based).
-    - clip_index: Clip position in arrangement (1-based).
+    - clip_index: Clip position in arrangement (1-based). Single clip only.
     - clip_name: Clip name (alternative to clip_index).
+    - from_bar / to_bar: Delete every clip STARTING in this bar range
+      (from_bar inclusive, to_bar exclusive), e.g. from_bar=33, to_bar=49
+      clears bars 33-48. Give one and the range is open-ended on the other
+      side. Takes precedence over clip_index / clip_name.
     """
     try:
         ableton = get_ableton_connection()
         ti = _to_zero_based(track_index, "track_index")
-        params = {"track_index": ti}
+        params: dict = {"track_index": ti}
+
+        if from_bar > 0 or to_bar > 0:
+            num, denom = _get_time_signature()
+            if from_bar > 0:
+                params["from_time"] = bar_to_beat(from_bar, num, denom)
+            if to_bar > 0:
+                params["to_time"] = bar_to_beat(to_bar, num, denom)
+            r = ableton.send_command("delete_arrangement_clip", params)
+            count = r.get("deleted", 0)
+            where = (f"bars {from_bar}-{to_bar - 1}" if from_bar and to_bar
+                     else (f"from bar {from_bar}" if from_bar
+                           else f"before bar {to_bar}"))
+            if not count:
+                return f"No arrangement clips {where} on track {track_index}"
+            return (
+                f"Deleted {count} arrangement clip(s) {where} on "
+                f"'{r.get('track')}'" + _ARRANGEMENT_TIP
+            )
+
         if clip_name:
             params["clip_name"] = clip_name
         elif clip_index > 0:
             params["clip_index"] = _to_zero_based(clip_index, "clip_index")
         else:
-            return "Error: provide clip_index or clip_name"
+            return "Error: provide clip_index, clip_name, or from_bar/to_bar"
 
         ableton.send_command("delete_arrangement_clip", params)
         ref = f"'{clip_name}'" if clip_name else f"#{clip_index}"

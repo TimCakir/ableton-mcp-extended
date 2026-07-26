@@ -364,6 +364,7 @@ class AbletonMCP(ControlSurface):
                                  "press_dialog_button",
                                  "control_live_view",
                                  "manage_tuning_system",
+                                 "write_arrangement_automation",
                                  "call_lom", "set_device_sidechain",
                                  "set_device_modulation", "move_device",
                                  "manage_rack", "control_looper",
@@ -719,6 +720,15 @@ class AbletonMCP(ControlSurface):
                                 params.get("clip_index", 0),
                                 params.get("notes", []),
                                 params.get("replace", False))
+                        elif command_type == "write_arrangement_automation":
+                            result = self._write_arrangement_automation(
+                                params.get("track_index", 0),
+                                params.get("parameter_name", ""),
+                                params.get("points", []),
+                                params.get("device_index", None),
+                                params.get("clear_first", True),
+                                params.get("from_time", None),
+                                params.get("to_time", None))
                         elif command_type == "write_clip_automation":
                             result = self._write_clip_automation(
                                 params.get("track_index", 0),
@@ -6666,6 +6676,68 @@ class AbletonMCP(ControlSurface):
                     "automated": found}
         except Exception as e:
             self.log_message("Error reading clip automation: " + str(e))
+            raise
+
+    def _write_arrangement_automation(self, track_index, parameter_name, points,
+                                      device_index=None, clear_first=True,
+                                      from_time=None, to_time=None):
+        """Write the same envelope into every arrangement clip on a track.
+
+        duplicate_clip_to_arrangement does NOT carry clip envelopes — a copy
+        placed in the arrangement arrives with its automation stripped. So
+        automation written to a session clip never reaches the arrangement,
+        and has to be applied to the arrangement clips themselves.
+
+        Point times are relative to each clip's own start, so one envelope
+        shape is stamped onto every clip in the range.
+        """
+        try:
+            track = self._track_at(track_index)
+            clips = list(track.arrangement_clips)
+            if not clips:
+                raise ValueError("'{0}' has no arrangement clips".format(track.name))
+
+            param, owner = self._resolve_parameter(
+                track, parameter_name, device_index)
+
+            written = 0
+            skipped = 0
+            pmin, pmax = param.min, param.max
+            for clip in clips:
+                if from_time is not None and clip.start_time < float(from_time):
+                    skipped += 1
+                    continue
+                if to_time is not None and clip.start_time >= float(to_time):
+                    skipped += 1
+                    continue
+                try:
+                    env = clip.automation_envelope(param)
+                except Exception:
+                    env = None
+                if env is None:
+                    env = clip.create_automation_envelope(param)
+                if env is None:
+                    skipped += 1
+                    continue
+                if clear_first:
+                    try:
+                        env.clear()
+                    except Exception:
+                        pass
+                for point in points:
+                    t = float(point.get("time", 0.0))
+                    length = float(point.get("length", 0.0))
+                    raw = float(point.get("value", 0.0))
+                    value = pmin + (pmax - pmin) * max(0.0, min(1.0, raw))
+                    env.insert_step(t, length, value)
+                written += 1
+
+            return {"track": track.name, "parameter": param.name,
+                    "device": owner, "clips_written": written,
+                    "clips_skipped": skipped,
+                    "points_per_clip": len(points)}
+        except Exception as e:
+            self.log_message("Error writing arrangement automation: " + str(e))
             raise
 
     def _write_clip_automation(self, track_index, clip_index, parameter_name,

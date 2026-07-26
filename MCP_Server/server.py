@@ -3050,6 +3050,62 @@ def get_clip_automation(ctx: Context, track_index: int, clip_index: int) -> str:
 
 
 @mcp.tool()
+def write_arrangement_automation(
+    ctx: Context,
+    track_index: int,
+    parameter_name: str,
+    points: list,
+    device_index: int | None = None,
+    clear_first: bool = True,
+    from_time: float | None = None,
+    to_time: float | None = None,
+) -> str:
+    """Write an automation envelope into every arrangement clip on a track.
+
+    Clip envelopes are NOT carried when a session clip is copied into the
+    arrangement — the copy arrives with its automation stripped. So
+    automation written to a session clip never reaches the arrangement, and
+    this is the tool that puts it there.
+
+    Point times are relative to each clip's own start, so one shape is
+    stamped onto every clip in the range — e.g. a filter opening across each
+    4-bar block.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    - parameter_name: "Volume", "Pan", a send name (e.g. "C-DELAY"), or a
+      device parameter such as "Filter Freq".
+    - points: list of {"time": beats, "value": 0.0-1.0, "length": beats},
+      relative to each clip's start.
+    - device_index: Restrict the parameter search to one device (1-based).
+    - clear_first: Wipe each clip's existing envelope first.
+    - from_time / to_time: Limit to clips starting within this beat range,
+      so automation can be applied to one section only.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        payload: dict = {
+            "track_index": ti, "parameter_name": parameter_name,
+            "points": points, "clear_first": clear_first,
+        }
+        if device_index is not None:
+            payload["device_index"] = _to_zero_based(device_index, "device_index")
+        for key, val in (("from_time", from_time), ("to_time", to_time)):
+            if val is not None:
+                payload[key] = val
+        r = ableton.send_command("write_arrangement_automation", payload)
+        return (
+            f"Wrote {r.get('points_per_clip')} points to '{r.get('parameter')}' "
+            f"on {r.get('clips_written')} arrangement clips of "
+            f"'{r.get('track')}' ({r.get('clips_skipped')} skipped)"
+        )
+    except Exception as e:
+        logger.error(f"Error writing arrangement automation: {str(e)}")
+        return f"Error writing arrangement automation: {str(e)}"
+
+
+@mcp.tool()
 def write_clip_automation(
     ctx: Context,
     track_index: int,

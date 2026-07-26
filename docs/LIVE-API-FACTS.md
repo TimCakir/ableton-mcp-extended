@@ -1,17 +1,47 @@
 # Live API — verified facts and hard limits
 
-Everything here was verified against a **running Live 12.3.8 Suite**, not recalled
+Everything here was verified against a **running Live 12.4.1 Suite**, not recalled
 or read from documentation. Published LOM docs are incomplete and
 version-dependent; the running instance is the only authority.
 
 **Two ways to check something rather than assume it:**
 1. `inspect_lom(target=…, filter=…)` — real properties and methods of a live object.
-2. Decode `/Applications/Ableton Live 12 Suite.app/Contents/App-Resources/MIDI Remote Scripts/_MxDCore/LomTypes.pyc`
-   — Max for Live's own type table, i.e. the authoritative member list for this build.
+   This is the authority.
+2. `strings` over `/Applications/Ableton Live 12 Suite.app/Contents/App-Resources/MIDI Remote Scripts/_MxDCore/LomTypes.pyc`
+   — Max for Live's own type table. Useful as a fast "does this name exist
+   anywhere" oracle, but **it is a subset, not the full API**: `Clip` really has
+   `automation_envelope`, `create_automation_envelope` and `automation_envelopes`,
+   and none of the three appear in that table. Never conclude something is absent
+   from its silence — confirm with `inspect_lom`.
 
 `call_lom` reaches anything not yet wrapped, and undocumented C++ signatures
 report their expected argument types in the error — that is how a signature gets
 discovered instead of guessed.
+
+---
+
+## Before believing any limitation: check you are asking a current build
+
+**This is the single largest source of false limitations in this repo.** Three
+copies of the integration run at once and drift apart within hours:
+
+| Copy | Reloads when |
+|---|---|
+| the repo working tree | immediately (it is just a file) |
+| the remote script Live loaded | **Ableton Live restarts** |
+| the MCP server process | **the MCP host (Claude Code) restarts** |
+
+Editing a file changes nothing for the two running processes. A command added an
+hour ago is genuinely absent from a Live started two hours ago — and the failure
+looks exactly like a Live API limitation.
+
+This has happened repeatedly. At the time of writing, arrangement-clip note
+editing was fully implemented and *uncommitted*, so `get_clip_notes` had no
+`arrangement` parameter in the running server while the working tree had it —
+producing "arranged material cannot be edited", which was never true.
+
+**Run `get_build_info` first, every time.** It reports all three builds and says
+which is stale. Deploy with `./deploy.sh`, then restart Live.
 
 ---
 
@@ -53,6 +83,20 @@ reproduced. A real finding needs the cause *observed*, not inferred — read the
 value, make the change, read it again. Anything less is a hypothesis and should be
 labelled as one.
 
+### Do not widen one failed call into a whole missing capability
+
+The costliest mistake in this file. `create_automation_envelope` fails on
+arrangement clips — true, and re-verified. From that came "arrangement automation
+is impossible", which is false: automation reached the arrangement fine through a
+different mechanism that was never tried. One API door being shut is evidence
+about that door, not about the room.
+
+Before writing *impossible*, name the mechanism that was tested and ask what else
+Live itself uses to do the same job — here, the answer was the record button.
+Prefer wording like "`create_automation_envelope` refuses arrangement clips" over
+"arrangement automation is impossible": the first stays true, the second was wrong
+within a version and blocked real work in the meantime.
+
 ### Repeated destructive calls can trip the permission classifier
 Deleting many tracks in a row gets blocked. Ask the user to do bulk deletion by
 hand — it is faster for them anyway.
@@ -63,19 +107,40 @@ hand — it is faster for them anyway.
 
 | Thing | Detail |
 |---|---|
-| **Arrangement clip automation** | `create_automation_envelope` on an arrangement clip → *"Not a session clip"*. Verified with a correctly-resolved parameter, so not a lookup artefact. |
-| **Envelopes surviving duplication** | `duplicate_clip_to_arrangement` **strips clip envelopes**. `has_envelopes` reads False on every copy. Re-placing does not help. Together with the row above: **clip automation cannot reach the arrangement at all.** Draw it in the UI. |
-| **Positioning arrangement playback** | `start_playback` always restarts from bar 1. `set_song_time` + play, `continue_playing`, `jump_to_cue` + continue all reset. `song.start_time` is read-only. So metering a *specific section* is impossible; fire a scene instead to measure all parts together. |
-| **Creating group tracks** | Existing groups can be folded (`fold_state`), never created. |
+| **Clip envelopes on arrangement clips** | `create_automation_envelope` on an arrangement clip → *"Not a session clip"*. Verified again on 12.4.1 with a correctly-resolved same-track parameter, so not a lookup artefact. **This is a limit on clip envelopes only — see below, arrangement automation itself is writable.** |
+| **Envelopes surviving duplication** | `duplicate_clip_to_arrangement` **strips clip envelopes**. `has_envelopes` reads False on every copy. Re-placing does not help. |
+| **Creating group tracks** | `song` exposes only `create_midi_track`, `create_audio_track`, `create_return_track`, `create_scene`. Existing groups can be folded (`fold_state`), never created. |
 | **Freeze / flatten** | `is_frozen` / `can_be_frozen` are readable; no method to trigger. |
 | **Rendering / exporting audio** | Not in the API. |
-| **Follow actions** | Not exposed on `Clip` or `ClipSlot` in 12.3 — neither object has any `follow_action` member. |
+| **Follow actions** | Not exposed on `Clip` or `ClipSlot` in 12.4.1 — `Clip` has `launch_mode` and `launch_quantization` but no `follow_action` member, and `ClipSlot` has none either. |
 | **VST/AU internals** | Opaque unless mapped via Live's Configure mode. Banks and presets are reachable. |
 
 ---
 
 ## Corrected assumptions (all of these were wrongly believed impossible)
 
+- **Arrangement automation is writable.** Previously recorded here as flatly
+  impossible. Two true facts — Live refuses clip envelopes on arrangement clips,
+  and duplication strips envelopes — were generalised into a third claim that
+  does not follow. Arrangement automation is not clip automation; it is **track
+  automation**, and Live writes it the way it does for a hardware fader: arm
+  arrangement record (`song.record_mode = True`), roll the transport, move the
+  parameter. Verified on 12.4.1: `automation_state` went `0 → 1` and the fader
+  then replayed the recorded shape unattended (0.2 → 0.2 → 0.5 while playing,
+  untouched). Wrapped as **`record_arrangement_automation`**, which runs off
+  Live's tick so the UI never blocks. It records in real time — a 16-bar sweep
+  takes 16 bars.
+- **`song.start_time` is writable, so playback CAN be positioned.** Previously
+  recorded as read-only, which led to "metering a specific section is
+  impossible". Setting `start_time = 64` then `start_playing()` began playback at
+  bar 17, confirmed by `current_song_time` and by meters showing exactly the
+  tracks that have clips there (CHORDS, PLUCK and FX silent — they do not enter
+  until bar 33+). Wrapped as **`play_section(from_bar, to_bar)`**. `song.loop`,
+  `loop_start` and `loop_length` give a second way to scope a section.
+- **Arrangement clips can be read and edited.** The note and region tools take
+  `arrangement=True` and resolve through `_resolve_clip`. When this appeared
+  impossible, the code existed but was uncommitted and undeployed — see the
+  staleness section above.
 - **Sidechain routing works.** `Compressor`, `Gate` and `Auto Filter` expose
   `input_routing_type` with a full `available_input_routing_types` list — that
   *is* the sidechain source. **Glue Compressor exposes no routing at all**, so it
@@ -130,7 +195,7 @@ Pad" case).
 `get_meters` reads per-track output levels. It is not hearing, but it makes level
 *relationships* measurable — what is loudest, what is clipping, what is inaudible.
 
-Because playback cannot be positioned, measure by **firing a scene** so all parts
-sound together, from a known unity-gain baseline. Reverb and delay tails bleed
-into a sample window for several seconds after a section ends — do not read that
-as a track still playing.
+Playback **can** be positioned, so measure the section you actually care about:
+`play_section(from_bar=33)` then `get_meters`. Firing a scene still works for
+judging session material. Reverb and delay tails bleed into a sample window for
+several seconds after a section ends — do not read that as a track still playing.

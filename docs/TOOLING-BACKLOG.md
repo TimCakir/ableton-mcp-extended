@@ -6,25 +6,34 @@ and what is genuinely impossible.
 
 ---
 
+## Done
+
+**Arrangement-clip note editing.** The note and region tools now take
+`arrangement=True` and resolve through `_resolve_clip`. Arranged material can be
+read and edited in place.
+
+**Arrangement automation.** `record_arrangement_automation` writes real track
+automation by recording off the transport. The old belief that this was
+impossible is corrected in `LIVE-API-FACTS.md`.
+
+**Section playback.** `play_section(from_bar, to_bar)` — `song.start_time` is
+writable, so a section can be auditioned and metered.
+
+**Build skew.** `get_build_info` compares the repo, the script Live loaded, and
+the running server, and names which is stale. `./deploy.sh` pushes to every path
+Live might read. This was the root cause of most "Live cannot do that" reports.
+
+---
+
 ## Blocking real work
 
-**1. Arrangement-clip note editing.**
-`get_clip_notes` / `modify_clip_notes` / `write_clip_automation` all resolve
-through `_clip_at`, which only looks at `clip_slots` — i.e. session clips.
-`_resolve_arrangement_clip` exists but is only used by the arrangement-clip
-property commands. Consequence: once material is in the arrangement it cannot be
-read or edited, only overwritten by re-placing a session clip. This is the single
-biggest gap for arranging.
-*Fix:* add an `arrangement=True` path (or an `arrangement_clip_index`) to the note
-and region tools, routed through `_resolve_arrangement_clip`.
+**1. Section variation without clip envelopes.**
+Clip envelopes still cannot reach the arrangement, so section-level change comes
+from MIDI content, per-section clip variants, or `record_arrangement_automation`.
+Worth a dedicated tool: generate a variant of a clip (drop the kick, thin the
+voicing, double the density) and place it over a bar range in one call.
 
-**2. Section variation without automation.**
-Since clip automation can never reach the arrangement, section-level change has to
-come from MIDI content or per-section clip variants. Worth a dedicated tool:
-generate a variant of a clip (drop the kick, thin the voicing, double the density)
-and place it over a bar range in one call.
-
-**3. `delete_arrangement_clip` addressing is fragile.**
+**2. `delete_arrangement_clip` addressing is fragile.**
 It takes a positional index into `arrangement_clips`, which shifts as clips are
 added or removed — the same class of bug as track-index drift.
 *Fix:* address by time range (`from_time` / `to_time`), which is how arrangement

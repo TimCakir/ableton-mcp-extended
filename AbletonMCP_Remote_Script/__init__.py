@@ -19,6 +19,16 @@ except ImportError:
 DEFAULT_PORT = 9877
 HOST = "localhost"
 
+# Bumped by hand whenever a command is added, removed or changes signature.
+# Three copies of this integration exist at once — the repo, the script Live
+# actually loaded at startup, and the MCP server process Claude is talking to —
+# and they drift apart constantly, because Live only reloads a remote script on
+# restart and the server only reloads when its host restarts. Every "Live can't
+# do that" that later turned out to be false was traced to one of those copies
+# being older than the others. `get_build_info` reports this back so the skew
+# is visible instead of being rediscovered as a phantom API limit.
+BUILD_ID = "2026-07-26.6"
+
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
     return AbletonMCP(c_instance)
@@ -69,7 +79,10 @@ class AbletonMCP(ControlSurface):
         
         # Cache the song reference for easier access
         self._song = self.song()
-        
+
+        # In-flight arrangement-automation record pass, if any
+        self._auto_rec = self._auto_rec_state_default()
+
         # Start the socket server
         self.start_server()
         
@@ -82,7 +95,15 @@ class AbletonMCP(ControlSurface):
         """Called when Ableton closes or the control surface is removed"""
         self.log_message("AbletonMCP disconnecting...")
         self.running = False
-        
+
+        # Never leave Live armed for arrangement record because a pass was
+        # still in flight when the script went away.
+        try:
+            if getattr(self, "_auto_rec", None) and self._auto_rec.get("active"):
+                self._finish_auto_rec("cancelled")
+        except Exception:
+            pass
+
         # Stop the server
         if self.server:
             try:
@@ -263,6 +284,10 @@ class AbletonMCP(ControlSurface):
                     params.get("track_index", 0))
             elif command_type == "get_grooves":
                 response["result"] = self._get_grooves()
+            elif command_type == "get_build_info":
+                response["result"] = self._get_build_info()
+            elif command_type == "get_automation_record_status":
+                response["result"] = self._get_automation_record_status()
             elif command_type == "inspect_lom":
                 response["result"] = self._inspect_lom(
                     params.get("target", "song"),
@@ -278,7 +303,9 @@ class AbletonMCP(ControlSurface):
                     params.get("from_time", 0.0),
                     params.get("time_span", None),
                     params.get("from_pitch", 0),
-                    params.get("pitch_span", 128))
+                    params.get("pitch_span", 128),
+                    params.get("arrangement", False),
+                    params.get("clip_name", None))
             elif command_type == "get_meters":
                 response["result"] = self._get_meters()
             elif command_type == "get_drift_modulation":
@@ -342,7 +369,8 @@ class AbletonMCP(ControlSurface):
                                  "write_clip_automation",
                                  "set_clip_launch", "set_clip_follow_action",
                                  "manage_warp_markers",
-                                 "modify_clip_notes", "manage_clip_region",
+                                 "modify_clip_notes", "remove_clip_notes",
+                                 "manage_clip_region",
                                  "set_wavetable_oscillator", "duplicate_device",
                                  "undo_step", "transport_action",
                                  "set_mixer_extras", "set_view_detail",
@@ -365,6 +393,9 @@ class AbletonMCP(ControlSurface):
                                  "control_live_view",
                                  "manage_tuning_system",
                                  "write_arrangement_automation",
+                                 "record_arrangement_automation",
+                                 "cancel_automation_record",
+                                 "play_section",
                                  "call_lom", "set_device_sidechain",
                                  "set_device_modulation", "move_device",
                                  "manage_rack", "control_looper",
@@ -445,7 +476,19 @@ class AbletonMCP(ControlSurface):
                                 params.get("from_time", 0.0),
                                 params.get("time_span", None),
                                 params.get("from_pitch", 0),
-                                params.get("pitch_span", 128))
+                                params.get("pitch_span", 128),
+                                params.get("arrangement", False),
+                                params.get("clip_name", None))
+                        elif command_type == "remove_clip_notes":
+                            result = self._remove_clip_notes(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("from_time", 0.0),
+                                params.get("time_span", None),
+                                params.get("from_pitch", 0),
+                                params.get("pitch_span", 128),
+                                params.get("arrangement", False),
+                                params.get("clip_name", None))
                         elif command_type == "manage_clip_region":
                             result = self._manage_clip_region(
                                 params.get("track_index", 0),
@@ -719,7 +762,9 @@ class AbletonMCP(ControlSurface):
                                 params.get("track_index", 0),
                                 params.get("clip_index", 0),
                                 params.get("notes", []),
-                                params.get("replace", False))
+                                params.get("replace", False),
+                                params.get("arrangement", False),
+                                params.get("clip_name", None))
                         elif command_type == "write_arrangement_automation":
                             result = self._write_arrangement_automation(
                                 params.get("track_index", 0),
@@ -729,6 +774,21 @@ class AbletonMCP(ControlSurface):
                                 params.get("clear_first", True),
                                 params.get("from_time", None),
                                 params.get("to_time", None))
+                        elif command_type == "record_arrangement_automation":
+                            result = self._record_arrangement_automation(
+                                params.get("track_index", 0),
+                                params.get("parameter_name", ""),
+                                params.get("points", []),
+                                params.get("device_index", None),
+                                params.get("return_to_start", True))
+                        elif command_type == "cancel_automation_record":
+                            result = self._cancel_automation_record()
+                        elif command_type == "play_section":
+                            result = self._play_section(
+                                params.get("from_beat", 0.0),
+                                params.get("to_beat", None),
+                                params.get("loop", False),
+                                params.get("play", True))
                         elif command_type == "write_clip_automation":
                             result = self._write_clip_automation(
                                 params.get("track_index", 0),
@@ -924,7 +984,8 @@ class AbletonMCP(ControlSurface):
                             ti = params.get("track_index", 0)
                             ci = params.get("clip_index", 0)
                             notes = params.get("notes", [])
-                            result = self._add_notes_to_arrangement_clip(ti, ci, notes)
+                            result = self._add_notes_to_arrangement_clip(
+                                ti, ci, notes, params.get("replace", False))
                         # Device modifying commands
                         elif command_type == "set_device_parameter":
                             ti = params.get("track_index", 0)
@@ -2015,25 +2076,24 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error duplicating to arrangement: " + str(e))
             raise
 
-    def _add_notes_to_arrangement_clip(self, track_index, clip_index, notes):
-        """Add MIDI notes to an arrangement clip."""
-        try:
-            track, clip = self._resolve_arrangement_clip(track_index, clip_index)
-            if not clip.is_midi_clip:
-                raise ValueError("Clip is not a MIDI clip")
-            live_notes = []
-            for note in notes:
-                pitch = note.get("pitch", 60)
-                start_time = note.get("start_time", 0.0)
-                duration = note.get("duration", 0.25)
-                velocity = note.get("velocity", 100)
-                mute = note.get("mute", False)
-                live_notes.append((pitch, start_time, duration, velocity, mute))
-            clip.set_notes(tuple(live_notes))
-            return {"note_count": len(notes)}
-        except Exception as e:
-            self.log_message("Error adding notes to arrangement clip: " + str(e))
-            raise
+    def _add_notes_to_arrangement_clip(self, track_index, clip_index, notes,
+                                       replace=False):
+        """Add MIDI notes to an arrangement clip.
+
+        Kept for wire compatibility; delegates to `_add_notes_extended` with
+        arrangement=True, which is the supported path and the one the MCP tool
+        layer exposes.
+
+        **Behaviour change (2026-07-26):** this used to call `clip.set_notes`,
+        which *replaces* every note in the clip rather than adding to it —
+        directly contradicting its own name, and destructive on any clip that
+        already had content. It now adds, and drops the existing notes only
+        when replace=True is asked for explicitly. It also no longer silently
+        discards probability and velocity_deviation. Nothing depended on the
+        old behaviour: the command had no MCP tool, so it was unreachable.
+        """
+        return self._add_notes_extended(
+            track_index, clip_index, notes, replace=replace, arrangement=True)
 
     def _delete_arrangement_clip(self, track_index, clip_index=None, clip_name=None):
         """Delete an arrangement clip."""
@@ -2742,6 +2802,24 @@ class AbletonMCP(ControlSurface):
                 clip_index, track.name))
         return track, slot.clip
 
+    def _resolve_clip(self, track_index, clip_index, arrangement=False,
+                      clip_name=None):
+        """Resolve a clip in either the session or the arrangement.
+
+        Session and arrangement clips live in different LOM collections —
+        `clip_slots` vs `arrangement_clips`. Every note tool used to resolve
+        only through `_clip_at`, i.e. session clips, which is why arranged
+        material could be overwritten but never read or edited. Routing
+        through here is what closes that gap.
+
+        Note times are clip-relative in BOTH cases: an arrangement clip
+        reports its notes from 0, not from its position on the timeline.
+        """
+        if arrangement:
+            return self._resolve_arrangement_clip(
+                track_index, clip_index, clip_name)
+        return self._clip_at(track_index, clip_index)
+
     def _serialise_notes(self, note_objects):
         out = []
         for n in note_objects:
@@ -2758,15 +2836,17 @@ class AbletonMCP(ControlSurface):
         return out
 
     def _get_clip_notes(self, track_index, clip_index, from_time=0.0,
-                        time_span=None, from_pitch=0, pitch_span=128):
-        """Read the notes in a MIDI clip.
+                        time_span=None, from_pitch=0, pitch_span=128,
+                        arrangement=False, clip_name=None):
+        """Read the notes in a MIDI clip, in the session or the arrangement.
 
         Without this, material can only be written, never inspected — so an
         existing part cannot be analysed, transposed or edited, only
         replaced. Returns pitch, timing, velocity and probability per note.
         """
         try:
-            track, clip = self._clip_at(track_index, clip_index)
+            track, clip = self._resolve_clip(
+                track_index, clip_index, arrangement, clip_name)
             if not clip.is_midi_clip:
                 raise ValueError("'{0}' is an audio clip".format(clip.name))
             span = float(time_span) if time_span is not None else float(clip.length)
@@ -2776,6 +2856,7 @@ class AbletonMCP(ControlSurface):
             pitches = [n["pitch"] for n in serialised if "pitch" in n]
             return {"clip_name": clip.name, "track_name": track.name,
                     "length": clip.length, "note_count": len(serialised),
+                    "arrangement": bool(arrangement),
                     "pitch_range": [min(pitches), max(pitches)] if pitches else None,
                     "notes": serialised}
         except Exception as e:
@@ -2786,16 +2867,20 @@ class AbletonMCP(ControlSurface):
                            velocity_scale=None, velocity_set=None,
                            humanize_ms=None, probability=None,
                            from_time=0.0, time_span=None,
-                           from_pitch=0, pitch_span=128):
+                           from_pitch=0, pitch_span=128,
+                           arrangement=False, clip_name=None):
         """Transform notes already in a clip, in place.
 
         Reads the selected notes, applies the requested changes, and writes
         them back by note id so nothing else in the clip is disturbed.
         Humanisation is deterministic (a fixed pattern of small offsets)
         rather than random, so repeated calls do not drift.
+
+        This cannot delete notes — use `remove_clip_notes` for that.
         """
         try:
-            track, clip = self._clip_at(track_index, clip_index)
+            track, clip = self._resolve_clip(
+                track_index, clip_index, arrangement, clip_name)
             if not clip.is_midi_clip:
                 raise ValueError("'{0}' is an audio clip".format(clip.name))
             span = float(time_span) if time_span is not None else float(clip.length)
@@ -2835,6 +2920,39 @@ class AbletonMCP(ControlSurface):
                                 "probability": probability}}
         except Exception as e:
             self.log_message("Error modifying clip notes: " + str(e))
+            raise
+
+    def _remove_clip_notes(self, track_index, clip_index, from_time=0.0,
+                           time_span=None, from_pitch=0, pitch_span=128,
+                           arrangement=False, clip_name=None):
+        """Delete notes from a MIDI clip within a pitch/time window.
+
+        `modify_clip_notes` can transpose and rescale but never remove, and
+        `add_notes_extended(replace=True)` clears the whole clip — so there
+        was no way to take a single note out of a part. Surgical removal is
+        what a voicing change actually needs: lifting one non-diatonic note
+        out of a chord without rewriting the chord.
+
+        Returns the notes that were removed so the edit is auditable and
+        reversible by hand.
+        """
+        try:
+            track, clip = self._resolve_clip(
+                track_index, clip_index, arrangement, clip_name)
+            if not clip.is_midi_clip:
+                raise ValueError("'{0}' is an audio clip".format(clip.name))
+            span = float(time_span) if time_span is not None else float(clip.length)
+            doomed = self._serialise_notes(clip.get_notes_extended(
+                int(from_pitch), int(pitch_span), float(from_time), span))
+            clip.remove_notes_extended(
+                int(from_pitch), int(pitch_span), float(from_time), span)
+            return {"clip_name": clip.name, "track_name": track.name,
+                    "arrangement": bool(arrangement),
+                    "removed": len(doomed), "removed_notes": doomed,
+                    "remaining": len(clip.get_notes_extended(
+                        0, 128, 0.0, float(clip.length)))}
+        except Exception as e:
+            self.log_message("Error removing clip notes: " + str(e))
             raise
 
     def _manage_clip_region(self, track_index, clip_index, action="info",
@@ -6469,20 +6587,21 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error setting song scale: " + str(e))
             raise
 
-    def _add_notes_extended(self, track_index, clip_index, notes, replace=False):
+    def _add_notes_extended(self, track_index, clip_index, notes, replace=False,
+                            arrangement=False, clip_name=None):
         """Add MIDI notes with per-note probability and velocity deviation.
 
         The older set_notes API cannot express probability, which is what
         makes programmed patterns breathe — hats that land 80% of the time
         rather than every single loop.
+
+        `add_new_notes` is additive: existing notes survive. Pass
+        replace=True to clear the clip first.
         """
         try:
             import Live
-            track = self._track_at(track_index)
-            slot = track.clip_slots[clip_index]
-            if not slot.has_clip:
-                raise ValueError("No clip at slot {0}".format(clip_index))
-            clip = slot.clip
+            track, clip = self._resolve_clip(
+                track_index, clip_index, arrangement, clip_name)
 
             if replace:
                 try:
@@ -6509,7 +6628,8 @@ class AbletonMCP(ControlSurface):
 
             clip.add_new_notes(tuple(specs))
             return {"clip_name": clip.name, "notes_added": len(specs),
-                    "replaced": bool(replace)}
+                    "replaced": bool(replace),
+                    "arrangement": bool(arrangement)}
         except Exception as e:
             self.log_message("Error adding extended notes: " + str(e))
             raise
@@ -6685,6 +6805,244 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error reading clip automation: " + str(e))
             raise
 
+    # --- Build identity --------------------------------------------------
+
+    def _get_build_info(self):
+        """Report which build of this script Live actually has loaded.
+
+        Live reads a remote script once, at startup, so an edited repo and a
+        running Live routinely disagree for hours. Every "the Live API cannot
+        do that" that later turned out to be false was traced to asking a
+        stale copy of this file, not to a real limit.
+        """
+        info = {"remote_script_build": BUILD_ID, "script_file": __file__}
+        try:
+            app = self.application()
+            parts = []
+            for getter in ("get_major_version", "get_minor_version",
+                           "get_bugfix_version"):
+                try:
+                    parts.append(str(getattr(app, getter)()))
+                except Exception:
+                    pass
+            if parts:
+                info["live_version"] = ".".join(parts)
+        except Exception:
+            pass
+        return info
+
+    # --- Arrangement automation, recorded off the transport ---------------
+    #
+    # Live refuses create_automation_envelope on an arrangement clip, and
+    # duplicating a session clip into the arrangement strips its envelopes.
+    # Both are true, and together they were read as "arrangement automation
+    # is impossible". They are not the same claim: those are limits on CLIP
+    # envelopes, and arrangement automation is TRACK automation.
+    #
+    # Live writes track automation the same way it does for a hardware fader
+    # — arm arrangement record, roll the transport, move the parameter. Doing
+    # exactly that from here produces automation Live owns and replays:
+    # verified by DeviceParameter.automation_state going 0 -> 1 and the
+    # parameter then reproducing the recorded shape untouched.
+
+    def _auto_rec_state_default(self):
+        return {"active": False, "status": "idle", "track": None,
+                "parameter": None, "device": None, "from_beat": None,
+                "to_beat": None, "position": None, "samples": 0}
+
+    @staticmethod
+    def _interpolate_points(pts, t):
+        """Linear value at beat t across sorted (time, value) pairs."""
+        if t <= pts[0][0]:
+            return pts[0][1]
+        if t >= pts[-1][0]:
+            return pts[-1][1]
+        for i in range(1, len(pts)):
+            t0, v0 = pts[i - 1]
+            t1, v1 = pts[i]
+            if t <= t1:
+                if t1 <= t0:
+                    return v1
+                return v0 + (v1 - v0) * ((t - t0) / (t1 - t0))
+        return pts[-1][1]
+
+    def _finish_auto_rec(self, status="done"):
+        """Stop the pass and put the transport back how it was found."""
+        state = getattr(self, "_auto_rec", None)
+        if not state:
+            self._auto_rec = self._auto_rec_state_default()
+            return self._auto_rec
+        song = self._song
+        restore = state.get("restore") or {}
+        try:
+            song.stop_playing()
+        except Exception:
+            pass
+        try:
+            song.record_mode = False
+        except Exception:
+            pass
+        try:
+            if "loop" in restore:
+                song.loop = restore["loop"]
+        except Exception:
+            pass
+        if restore.get("return_to_start", True):
+            try:
+                song.start_time = restore.get("start_time", 0.0)
+            except Exception:
+                pass
+        state["active"] = False
+        state["status"] = status
+        return state
+
+    def _get_automation_record_status(self):
+        state = getattr(self, "_auto_rec", None)
+        if not state:
+            return self._auto_rec_state_default()
+        out = dict((k, v) for k, v in state.items() if k != "restore")
+        if state.get("active"):
+            try:
+                out["position"] = self._song.current_song_time
+            except Exception:
+                pass
+        return out
+
+    def _cancel_automation_record(self):
+        state = getattr(self, "_auto_rec", None)
+        if not state or not state.get("active"):
+            return {"cancelled": False, "reason": "no recording in progress"}
+        result = self._finish_auto_rec("cancelled")
+        return {"cancelled": True,
+                "track": result.get("track"),
+                "parameter": result.get("parameter"),
+                "stopped_at_beat": result.get("position")}
+
+    def _record_arrangement_automation(self, track_index, parameter_name,
+                                       points, device_index=None,
+                                       return_to_start=True):
+        """Write real arrangement automation by recording it in real time.
+
+        points: [{"time": <absolute beat>, "value": 0.0-1.0}, ...] — at least
+        two, because recording captures movement and a single value has no
+        movement to capture. Values are interpolated against the TRUE
+        playhead on every tick, so ramps come out smooth and a slow tick
+        cannot make the shape drift out of time.
+
+        Returns immediately: the pass runs on Live's own tick via
+        schedule_message, so the UI thread is never blocked and the socket
+        does not sit past its timeout. Poll get_automation_record_status.
+
+        This overwrites existing automation for that parameter across the
+        recorded range, exactly as a real record pass would.
+        """
+        state = getattr(self, "_auto_rec", None)
+        if state and state.get("active"):
+            raise RuntimeError(
+                "Already recording automation for '{0}' on '{1}'. Wait for it "
+                "or call cancel_automation_record.".format(
+                    state.get("parameter"), state.get("track")))
+
+        track = self._track_at(track_index)
+        param, owner = self._resolve_parameter(
+            track, parameter_name, device_index)
+
+        pts = []
+        for point in points:
+            pts.append((float(point.get("time", 0.0)),
+                        max(0.0, min(1.0, float(point.get("value", 0.0))))))
+        if len(pts) < 2:
+            raise ValueError(
+                "Need at least 2 points — automation recording captures "
+                "movement over time, so one value has nothing to record. "
+                "For a static value just set the parameter.")
+        pts.sort(key=lambda pair: pair[0])
+
+        song = self._song
+        start_beat, end_beat = pts[0][0], pts[-1][0]
+        if end_beat <= start_beat:
+            raise ValueError("All points share the same time; nothing to record")
+
+        pmin, pmax = param.min, param.max
+        restore = {"start_time": song.start_time,
+                   "loop": song.loop,
+                   "return_to_start": bool(return_to_start)}
+
+        # A loop would send the playhead back and re-record over the pass.
+        song.loop = False
+        song.start_time = start_beat
+        song.record_mode = True
+        song.start_playing()
+
+        self._auto_rec = {
+            "active": True, "status": "recording",
+            "track": track.name, "parameter": param.name, "device": owner,
+            "from_beat": start_beat, "to_beat": end_beat,
+            "position": start_beat, "samples": 0, "restore": restore,
+        }
+
+        def step():
+            current = getattr(self, "_auto_rec", None)
+            if not current or not current.get("active"):
+                return
+            try:
+                now = song.current_song_time
+                current["position"] = now
+                if now >= end_beat or not song.is_playing:
+                    self._finish_auto_rec("done")
+                    return
+                param.value = pmin + (pmax - pmin) * self._interpolate_points(
+                    pts, now)
+                current["samples"] += 1
+            except Exception as exc:
+                self.log_message(
+                    "automation record step failed: " + str(exc))
+                self._finish_auto_rec("failed")
+                return
+            self.schedule_message(1, step)
+
+        self.schedule_message(1, step)
+
+        beats = end_beat - start_beat
+        try:
+            seconds = beats * 60.0 / song.tempo
+        except Exception:
+            seconds = None
+        return {"started": True, "track": track.name,
+                "parameter": param.name, "device": owner,
+                "from_beat": start_beat, "to_beat": end_beat,
+                "beats": beats, "estimated_seconds": seconds,
+                "note": "Recording in real time. Poll "
+                        "get_automation_record_status until status is 'done'."}
+
+    def _play_section(self, from_beat=0.0, to_beat=None, loop=False, play=True):
+        """Start arrangement playback at an arbitrary point.
+
+        `song.start_time` IS writable — an earlier note in this repo called it
+        read-only and concluded that metering a specific section was
+        impossible. It is not: start_playing() honours start_time, so any
+        section can be auditioned and metered rather than always hearing the
+        Set from bar 1.
+        """
+        song = self._song
+        from_beat = float(from_beat)
+        song.start_time = from_beat
+        result = {"from_beat": from_beat}
+        if to_beat is not None:
+            to_beat = float(to_beat)
+            if to_beat <= from_beat:
+                raise ValueError("to_beat must be greater than from_beat")
+            song.loop_start = from_beat
+            song.loop_length = to_beat - from_beat
+            result["to_beat"] = to_beat
+        song.loop = bool(loop)
+        result["loop"] = song.loop
+        if play:
+            song.start_playing()
+        result["playing"] = song.is_playing
+        result["position"] = song.current_song_time
+        return result
+
     def _write_arrangement_automation(self, track_index, parameter_name, points,
                                       device_index=None, clear_first=True,
                                       from_time=None, to_time=None):
@@ -6726,13 +7084,15 @@ class AbletonMCP(ControlSurface):
                         env = clip.create_automation_envelope(param)
                     except Exception as exc:
                         raise RuntimeError(
-                            "Live refuses automation envelopes on ARRANGEMENT "
-                            "clips ({0}). Verified on 12.3: only session clips "
-                            "accept them, and duplicating a session clip into "
-                            "the arrangement strips its envelopes. Arrangement "
-                            "automation has to be drawn in Live's UI; from here "
-                            "use write_clip_automation on session clips, or vary "
-                            "sections through MIDI content instead.".format(exc))
+                            "Live refuses CLIP envelopes on arrangement clips "
+                            "({0}) — only session clips accept them, and "
+                            "duplicating a session clip into the arrangement "
+                            "strips its envelopes. That is a limit on clip "
+                            "envelopes, NOT on arrangement automation: "
+                            "arrangement automation is track automation, and "
+                            "record_arrangement_automation writes it for real "
+                            "by recording off the transport. Use that "
+                            "instead.".format(exc))
                 if env is None:
                     skipped += 1
                     continue
@@ -7207,7 +7567,14 @@ class AbletonMCP(ControlSurface):
     def _set_transport_state(self, metronome=None, loop=None,
                              session_record=None, record_mode=None,
                              punch_in=None, punch_out=None):
-        """Set transport toggles. Omitted values are left alone."""
+        """Set transport toggles. Omitted values are left alone.
+
+        The read-back can lag the write. `record_mode` in particular reports
+        its OLD value if read in the same tick it was set, which reads as a
+        failed write when the write actually succeeded — so report what was
+        requested alongside what was observed rather than only the stale
+        read.
+        """
         try:
             changed = {}
             for attr, val in (("metronome", metronome), ("loop", loop),
@@ -7215,8 +7582,15 @@ class AbletonMCP(ControlSurface):
                               ("record_mode", record_mode),
                               ("punch_in", punch_in), ("punch_out", punch_out)):
                 if val is not None:
-                    setattr(self._song, attr, bool(val))
-                    changed[attr] = getattr(self._song, attr)
+                    wanted = bool(val)
+                    setattr(self._song, attr, wanted)
+                    observed = getattr(self._song, attr)
+                    entry = {"requested": wanted, "observed": observed}
+                    if observed != wanted:
+                        entry["note"] = ("Live applies this on its next tick; "
+                                         "this read-back is one tick early, "
+                                         "not a failed write.")
+                    changed[attr] = entry
             return {"changed": changed}
         except Exception as e:
             self.log_message("Error setting transport state: " + str(e))

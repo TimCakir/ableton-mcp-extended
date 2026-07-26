@@ -27,6 +27,18 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("AbletonMCPServer")
 
+# Must match BUILD_ID in AbletonMCP_Remote_Script/__init__.py. Bump both
+# together whenever a command is added, removed or changes signature.
+#
+# Three copies of this integration run at once and drift apart constantly:
+# the repo, the script Live loaded at ITS startup, and this server process as
+# the MCP host launched it. Live only re-reads a remote script on restart, and
+# the host only re-reads this file when it restarts. Every "the Live API can't
+# do that" that later proved false was traced to one of those copies being
+# older than the others — the capability existed, the process answering the
+# question just didn't have it. `get_build_info` makes that visible.
+SERVER_BUILD_ID = "2026-07-26.6"
+
 @dataclass
 class AbletonConnection:
     host: str
@@ -129,6 +141,7 @@ class AbletonConnection:
             "set_view", "control_arrangement_view",
             "manage_clip_automation",
             "add_notes_to_arrangement_clip",
+            "modify_clip_notes", "remove_clip_notes", "add_notes_extended",
             "set_device_parameter", "set_device_enabled",
             "delete_device", "navigate_preset",
             "set_track_volume", "set_track_panning",
@@ -626,6 +639,8 @@ def get_clip_notes(
     time_span: float | None = None,
     from_pitch: int = 0,
     pitch_span: int = 128,
+    arrangement: bool = False,
+    clip_name: str | None = None,
 ) -> str:
     """Read the notes in a MIDI clip — pitch, timing, velocity, probability.
 
@@ -636,6 +651,12 @@ def get_clip_notes(
     - track_index / clip_index: 1-based.
     - from_time / time_span: Beat window. Defaults to the whole clip.
     - from_pitch / pitch_span: MIDI note window. Defaults to all notes.
+    - arrangement: Read an ARRANGEMENT clip instead of a session clip.
+      `clip_index` then indexes the track's arrangement clips in timeline
+      order (1-based) — call `get_arrangement_info` to see that order.
+      Note times stay clip-relative, NOT absolute timeline position.
+    - clip_name: With arrangement=True, address the clip by name instead of
+      index. Errors if the name is ambiguous on that track.
     """
     try:
         ableton = get_ableton_connection()
@@ -644,13 +665,17 @@ def get_clip_notes(
         payload: dict = {
             "track_index": ti, "clip_index": ci, "from_time": from_time,
             "from_pitch": from_pitch, "pitch_span": pitch_span,
+            "arrangement": arrangement,
         }
         if time_span is not None:
             payload["time_span"] = time_span
+        if clip_name is not None:
+            payload["clip_name"] = clip_name
         r = ableton.send_command("get_clip_notes", payload)
         notes = r.get("notes") or []
+        where = "arrangement" if r.get("arrangement") else "session"
         header = (
-            f"'{r.get('clip_name')}' on '{r.get('track_name')}' — "
+            f"'{r.get('clip_name')}' on '{r.get('track_name')}' ({where}) — "
             f"{r.get('note_count')} notes, {r.get('length')} beats, "
             f"pitch range {r.get('pitch_range')}"
         )
@@ -684,12 +709,16 @@ def modify_clip_notes(
     time_span: float | None = None,
     from_pitch: int = 0,
     pitch_span: int = 128,
+    arrangement: bool = False,
+    clip_name: str | None = None,
 ) -> str:
     """Transform notes already in a clip, in place, without rewriting it.
 
     Notes are read, changed and written back by id, so nothing outside the
     selected window is disturbed. Humanisation is deterministic, so calling
     it twice does not compound into sloppiness.
+
+    This CANNOT delete notes — use `remove_clip_notes` for that.
 
     Parameters:
     - track_index / clip_index: 1-based.
@@ -700,6 +729,9 @@ def modify_clip_notes(
     - probability: Set per-note probability, 0.0-1.0.
     - from_time / time_span / from_pitch / pitch_span: Restrict the window,
       e.g. pitch 42 only to affect just the hats in a drum clip.
+    - arrangement / clip_name: Target an ARRANGEMENT clip. Each placed copy
+      holds its own notes, so a change must be repeated per copy — editing
+      the session clip does not propagate to clips already in the timeline.
     """
     try:
         ableton = get_ableton_connection()
@@ -708,12 +740,12 @@ def modify_clip_notes(
         payload: dict = {
             "track_index": ti, "clip_index": ci, "transpose": transpose,
             "from_time": from_time, "from_pitch": from_pitch,
-            "pitch_span": pitch_span,
+            "pitch_span": pitch_span, "arrangement": arrangement,
         }
         for key, val in (
             ("velocity_scale", velocity_scale), ("velocity_set", velocity_set),
             ("humanize_ms", humanize_ms), ("probability", probability),
-            ("time_span", time_span),
+            ("time_span", time_span), ("clip_name", clip_name),
         ):
             if val is not None:
                 payload[key] = val
@@ -722,6 +754,72 @@ def modify_clip_notes(
     except Exception as e:
         logger.error(f"Error modifying clip notes: {str(e)}")
         return f"Error modifying clip notes: {str(e)}"
+
+
+@mcp.tool()
+def remove_clip_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    from_time: float = 0.0,
+    time_span: float | None = None,
+    from_pitch: int = 0,
+    pitch_span: int = 128,
+    arrangement: bool = False,
+    clip_name: str | None = None,
+) -> str:
+    """Delete notes from a MIDI clip within a pitch and time window.
+
+    The only way to take notes OUT of a part. `modify_clip_notes` transposes
+    and rescales but never removes, and `add_notes_extended(replace=True)`
+    clears the entire clip. This is the surgical option: lift one note out of
+    a chord without rewriting the chord.
+
+    Defaults to the WHOLE clip and ALL pitches — always narrow the window.
+    To remove a single pitch, pass from_pitch=<n>, pitch_span=1.
+
+    Returns what was removed, so the edit can be checked and reversed by hand.
+
+    Parameters:
+    - track_index / clip_index: 1-based.
+    - from_time / time_span: Beat window. Defaults to the whole clip.
+    - from_pitch / pitch_span: MIDI note window. Defaults to ALL notes.
+    - arrangement / clip_name: Target an ARRANGEMENT clip instead of a session
+      clip. Each placed copy is independent, so removing a note from a part
+      that appears N times in the timeline takes N calls.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        ci = _to_zero_based(clip_index, "clip_index")
+        payload: dict = {
+            "track_index": ti, "clip_index": ci, "from_time": from_time,
+            "from_pitch": from_pitch, "pitch_span": pitch_span,
+            "arrangement": arrangement,
+        }
+        if time_span is not None:
+            payload["time_span"] = time_span
+        if clip_name is not None:
+            payload["clip_name"] = clip_name
+        r = ableton.send_command("remove_clip_notes", payload)
+        where = "arrangement" if r.get("arrangement") else "session"
+        removed = r.get("removed_notes") or []
+        lines = [
+            f"Removed {r.get('removed')} note(s) from '{r.get('clip_name')}' "
+            f"on '{r.get('track_name')}' ({where}) — "
+            f"{r.get('remaining')} remaining"
+        ]
+        for n in removed[:20]:
+            lines.append(
+                f"  {n.get('start_time')}: pitch {n.get('pitch')} "
+                f"dur {n.get('duration')} vel {n.get('velocity')}"
+            )
+        if len(removed) > 20:
+            lines.append(f"  … {len(removed) - 20} more")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error removing clip notes: {str(e)}")
+        return f"Error removing clip notes: {str(e)}"
 
 
 @mcp.tool()
@@ -2941,6 +3039,8 @@ def add_notes_extended(
     clip_index: int,
     notes: list,
     replace: bool = False,
+    arrangement: bool = False,
+    clip_name: str | None = None,
 ) -> str:
     """Add MIDI notes with per-note probability and velocity deviation.
 
@@ -2948,23 +3048,35 @@ def add_notes_extended(
     programmed parts breathe — a hat that lands 80% of the time instead of
     identically every loop.
 
+    Additive by default: existing notes survive unless replace=True.
+
     Parameters:
     - track_index / clip_index: 1-based.
     - notes: list of {"pitch", "start_time", "duration", "velocity",
       "mute", "probability" (0.0-1.0), "velocity_deviation",
       "release_velocity"}.
     - replace: Clear existing notes first.
+    - arrangement / clip_name: Write into an ARRANGEMENT clip instead of a
+      session clip. `start_time` stays clip-relative, not absolute timeline
+      position. This is how a single section is varied in place, rather than
+      re-placing a session clip over it.
     """
     try:
         ableton = get_ableton_connection()
         ti = _to_zero_based(track_index, "track_index")
         ci = _to_zero_based(clip_index, "clip_index")
-        r = ableton.send_command("add_notes_extended", {
+        payload: dict = {
             "track_index": ti, "clip_index": ci,
             "notes": notes, "replace": replace,
-        })
+            "arrangement": arrangement,
+        }
+        if clip_name is not None:
+            payload["clip_name"] = clip_name
+        r = ableton.send_command("add_notes_extended", payload)
+        where = "arrangement" if r.get("arrangement") else "session"
         return (
-            f"Added {r.get('notes_added')} notes to '{r.get('clip_name')}'"
+            f"Added {r.get('notes_added')} notes to '{r.get('clip_name')}' "
+            f"({where})"
             + (" (replaced existing)" if r.get("replaced") else "")
         )
     except Exception as e:
@@ -3103,6 +3215,111 @@ def write_arrangement_automation(
     except Exception as e:
         logger.error(f"Error writing arrangement automation: {str(e)}")
         return f"Error writing arrangement automation: {str(e)}"
+
+
+@mcp.tool()
+def record_arrangement_automation(
+    ctx: Context,
+    track_index: int,
+    parameter_name: str,
+    points: list,
+    device_index: int | None = None,
+    return_to_start: bool = True,
+) -> str:
+    """Write REAL arrangement automation, by recording it off the transport.
+
+    This is how automation actually reaches the arrangement. Clip envelopes
+    cannot: Live refuses them on arrangement clips, and copying a session
+    clip into the arrangement strips them. But that is a limit on CLIP
+    envelopes — arrangement automation is TRACK automation, and Live writes
+    it the same way it does for a hardware fader: arm arrangement record,
+    roll the transport, move the parameter. That is exactly what this does,
+    and Live treats the result as its own automation.
+
+    Runs in real time, so a 16-bar sweep takes 16 bars of wall clock. The
+    call returns immediately — poll `get_automation_record_status` until
+    status is "done". Sampling is one point per Live tick (~100 ms), and
+    values are interpolated against the true playhead, so ramps come out
+    smooth and cannot drift out of time.
+
+    Overwrites existing automation for that parameter across the recorded
+    range, exactly as a real record pass would.
+
+    Parameters:
+    - track_index: Track number (1-based).
+    - parameter_name: "Volume", "Pan", a send name, or a device parameter
+      such as "Filter Freq".
+    - points: list of {"time": <absolute beat>, "value": 0.0-1.0}. At least
+      two — recording captures movement, so one value has nothing to record.
+      Times are ABSOLUTE arrangement beats, not clip-relative.
+    - device_index: Restrict the parameter search to one device (1-based).
+    - return_to_start: Put the arrangement start marker back afterwards.
+    """
+    try:
+        ableton = get_ableton_connection()
+        ti = _to_zero_based(track_index, "track_index")
+        payload: dict = {
+            "track_index": ti, "parameter_name": parameter_name,
+            "points": points, "return_to_start": return_to_start,
+        }
+        if device_index is not None:
+            payload["device_index"] = _to_zero_based(device_index, "device_index")
+        r = ableton.send_command("record_arrangement_automation", payload)
+        secs = r.get("estimated_seconds")
+        secs_txt = f" (~{secs:.1f}s)" if isinstance(secs, (int, float)) else ""
+        return (
+            f"Recording '{r.get('parameter')}' on '{r.get('track')}' from beat "
+            f"{r.get('from_beat')} to {r.get('to_beat')}{secs_txt}. "
+            f"Poll get_automation_record_status until status is 'done'."
+        )
+    except Exception as e:
+        logger.error(f"Error recording arrangement automation: {str(e)}")
+        return f"Error recording arrangement automation: {str(e)}"
+
+
+@mcp.tool()
+def get_automation_record_status(ctx: Context) -> str:
+    """Progress of an in-flight `record_arrangement_automation` pass.
+
+    Status is one of: idle, recording, done, cancelled, failed.
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command("get_automation_record_status", {})
+        status = r.get("status", "idle")
+        if status == "idle":
+            return "No automation recording has run this session."
+        head = (
+            f"{status.upper()} — '{r.get('parameter')}' on '{r.get('track')}' "
+            f"(beats {r.get('from_beat')}-{r.get('to_beat')})"
+        )
+        pos = r.get("position")
+        if isinstance(pos, (int, float)):
+            head += f"\nPlayhead at beat {pos:.2f}, {r.get('samples')} points written"
+        return head
+    except Exception as e:
+        logger.error(f"Error reading automation record status: {str(e)}")
+        return f"Error reading automation record status: {str(e)}"
+
+
+@mcp.tool()
+def cancel_automation_record(ctx: Context) -> str:
+    """Abort an in-flight automation record pass and disarm the transport.
+
+    Whatever was already recorded stays — undo it in Live if unwanted.
+    """
+    try:
+        ableton = get_ableton_connection()
+        r = ableton.send_command("cancel_automation_record", {})
+        if not r.get("cancelled"):
+            return f"Nothing to cancel: {r.get('reason')}"
+        return (
+            f"Cancelled recording '{r.get('parameter')}' on "
+            f"'{r.get('track')}' at beat {r.get('stopped_at_beat')}"
+        )
+    except Exception as e:
+        logger.error(f"Error cancelling automation record: {str(e)}")
+        return f"Error cancelling automation record: {str(e)}"
 
 
 @mcp.tool()
@@ -4788,6 +5005,116 @@ def set_song_time(ctx: Context, bar: int = 0, beat: float = 0.0) -> str:
     except Exception as e:
         logger.error(f"Error setting song time: {str(e)}")
         return f"Error setting song time: {str(e)}"
+
+
+@mcp.tool()
+def get_build_info(ctx: Context) -> str:
+    """Check that Live, this server, and the repo are running the same build.
+
+    RUN THIS FIRST when a command seems to be missing, a parameter the docs
+    describe is rejected, or Live "cannot" do something you believe it can.
+    Three copies of this integration run at once — the repo on disk, the
+    remote script Live loaded at its own startup, and this server process —
+    and they drift apart constantly, because Live only re-reads a remote
+    script when Live restarts and this server only re-reads its source when
+    the MCP host restarts.
+
+    Every limitation found so far that turned out not to be real was one of
+    those copies being stale, not a limit in the Live API.
+    """
+    try:
+        server_build = SERVER_BUILD_ID
+        repo_build = None
+        repo_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "AbletonMCP_Remote_Script", "__init__.py")
+        try:
+            with open(repo_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    m = re.match(r'^BUILD_ID\s*=\s*["\'](.+?)["\']', line)
+                    if m:
+                        repo_build = m.group(1)
+                        break
+        except OSError:
+            pass
+
+        ableton = get_ableton_connection()
+        r = ableton.send_command("get_build_info", {})
+        live_build = r.get("remote_script_build")
+
+        lines = [
+            f"Live {r.get('live_version', '?')}",
+            f"  remote script loaded by Live : {live_build}",
+            f"  this MCP server process      : {server_build}",
+            f"  repo on disk                 : {repo_build or '?'}",
+            f"  script file: {r.get('script_file', '?')}",
+        ]
+        builds = {b for b in (live_build, server_build, repo_build) if b}
+        if len(builds) > 1:
+            lines.append("")
+            lines.append("MISMATCH — these are not the same build.")
+            if repo_build and live_build != repo_build:
+                lines.append(
+                    "  Live is stale: redeploy the remote script, then "
+                    "restart Ableton Live (it only reads the script at "
+                    "startup).")
+            if repo_build and server_build != repo_build:
+                lines.append(
+                    "  This server is stale: restart the MCP host (Claude "
+                    "Code) so it re-imports server.py.")
+            lines.append(
+                "  Until they match, a missing command means a stale build, "
+                "NOT a Live API limitation.")
+        else:
+            lines.append("")
+            lines.append("All three match — a missing command is a real gap.")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error getting build info: {str(e)}")
+        return f"Error getting build info: {str(e)}"
+
+
+@mcp.tool()
+def play_section(
+    ctx: Context,
+    from_bar: int = 1,
+    to_bar: int | None = None,
+    loop: bool = False,
+    play: bool = True,
+) -> str:
+    """Play the arrangement from a specific bar — not always from bar 1.
+
+    `song.start_time` is writable and `start_playing()` honours it, so a
+    single section can be auditioned and metered. (An earlier note in this
+    repo called start_time read-only and concluded section metering was
+    impossible; it is not.)
+
+    Pair with `get_meters` to measure one section's balance instead of
+    guessing, e.g. play_section(from_bar=33) then get_meters.
+
+    Parameters:
+    - from_bar: Bar to start at (1-based).
+    - to_bar: Optional end bar; sets the arrangement loop brace to this span.
+    - loop: Loop that span rather than playing through.
+    - play: Set False to move the start marker without starting playback.
+    """
+    try:
+        ableton = get_ableton_connection()
+        num, denom = _get_time_signature()
+        payload: dict = {
+            "from_beat": bar_to_beat(from_bar, num, denom),
+            "loop": loop, "play": play,
+        }
+        if to_bar is not None:
+            payload["to_beat"] = bar_to_beat(to_bar, num, denom)
+        r = ableton.send_command("play_section", payload)
+        span = f"bar {from_bar}" + (f" to {to_bar}" if to_bar else "")
+        verb = "Playing from" if r.get("playing") else "Start marker set to"
+        tail = " (looping)" if r.get("loop") else ""
+        return f"{verb} {span}{tail}"
+    except Exception as e:
+        logger.error(f"Error playing section: {str(e)}")
+        return f"Error playing section: {str(e)}"
 
 
 @mcp.tool()

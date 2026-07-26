@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.9"
+BUILD_ID = "2026-07-26.10"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -6981,7 +6981,7 @@ class AbletonMCP(ControlSurface):
         return {"active": False, "status": "idle", "track": None,
                 "parameter": None, "device": None, "from_beat": None,
                 "to_beat": None, "position": None, "samples": 0,
-                "ticks": 0, "stopped_ticks": 0}
+                "ticks": 0, "rolling": False, "waiting": 0, "stalled": 0}
 
     @staticmethod
     def _interpolate_points(pts, t):
@@ -7147,7 +7147,8 @@ class AbletonMCP(ControlSurface):
             "track": track.name, "parameter": param.name, "device": owner,
             "from_beat": start_beat, "to_beat": end_beat,
             "position": start_beat, "samples": 0, "ticks": 0,
-            "stopped_ticks": 0, "restore": restore,
+            "rolling": False, "waiting": 0, "stalled": 0,
+            "restore": restore,
         }
 
         # Ticks are ~100 ms. If the playhead somehow never reaches end_beat —
@@ -7166,21 +7167,36 @@ class AbletonMCP(ControlSurface):
                 return
             try:
                 now = song.current_song_time
+                previous = current["position"]
                 current["position"] = now
-                # `not is_playing` means the user stopped the transport — but
-                # on the first tick it can also just mean start_playing() has
-                # not been applied yet, and a count-in delays it further.
-                # Treating that as "finished" would abort the pass before it
-                # recorded anything, so only honour it once rolling.
-                # One not-playing reading is not proof the user stopped: the
-                # transport was observed reading stopped for a moment while a
-                # queued command settled. Ending the pass on that would leave
-                # a silently partial envelope, so require two in a row.
-                if current["samples"] > 0 and not song.is_playing:
-                    current["stopped_ticks"] += 1
+
+                # Liveness is judged on the PLAYHEAD, never on is_playing.
+                # is_playing keeps reading False for several ticks after
+                # start_playing() while the change settles — not one tick, as
+                # an earlier version assumed. That version read "not playing",
+                # concluded the user had stopped, and ended the pass after two
+                # ticks having written nothing, while reporting "done" with an
+                # empty envelope. A silent no-op that looks like success is
+                # the worst possible failure here, so the transport's own
+                # position is the only signal trusted.
+                if now > start_beat + 1e-6:
+                    current["rolling"] = True
+                if not current["rolling"]:
+                    current["waiting"] += 1
+                    if current["waiting"] > 40:          # ~4 s of ticks
+                        self.log_message(
+                            "automation record: transport never rolled")
+                        self._finish_auto_rec("never_started")
+                        return
+                    self.schedule_message(1, step)
+                    return
+
+                # Once rolling, a playhead that stops advancing IS the stop.
+                if now <= previous:
+                    current["stalled"] += 1
                 else:
-                    current["stopped_ticks"] = 0
-                stopped = current["stopped_ticks"] >= 2
+                    current["stalled"] = 0
+                stopped = current["stalled"] >= 3
                 if now >= end_beat or stopped:
                     # Land exactly on the target. Without this the envelope
                     # ends at whatever the last tick interpolated, up to one
@@ -7288,7 +7304,8 @@ class AbletonMCP(ControlSurface):
             "track": track.name, "parameter": "input (take)", "device": None,
             "from_beat": from_beat, "to_beat": to_beat,
             "position": from_beat, "samples": 0, "ticks": 0,
-            "stopped_ticks": 0, "restore": restore,
+            "rolling": False, "waiting": 0, "stalled": 0,
+            "restore": restore,
         }
 
         try:
@@ -7303,15 +7320,31 @@ class AbletonMCP(ControlSurface):
                 return
             try:
                 now = song.current_song_time
+                previous = current["position"]
                 current["position"] = now
-                # Two consecutive not-playing readings, for the same reason as
-                # the automation recorder: one is not proof, and stopping
-                # early would silently truncate the take.
-                if current["samples"] > 0 and not song.is_playing:
-                    current["stopped_ticks"] += 1
+
+                # Playhead-based liveness, same reasoning as the automation
+                # recorder: is_playing lags start_playing() by several ticks,
+                # and trusting it ended the pass instantly with nothing
+                # recorded. A take that silently captures nothing is worse
+                # than one that errors.
+                if now > from_beat + 1e-6:
+                    current["rolling"] = True
+                if not current["rolling"]:
+                    current["waiting"] += 1
+                    if current["waiting"] > 40:          # ~4 s of ticks
+                        self.log_message(
+                            "take recording: transport never rolled")
+                        self._finish_auto_rec("never_started")
+                        return
+                    self.schedule_message(1, step)
+                    return
+
+                if now <= previous:
+                    current["stalled"] += 1
                 else:
-                    current["stopped_ticks"] = 0
-                if now >= to_beat or current["stopped_ticks"] >= 2:
+                    current["stalled"] = 0
+                if now >= to_beat or current["stalled"] >= 3:
                     self._finish_auto_rec("done")
                     return
                 current["ticks"] += 1

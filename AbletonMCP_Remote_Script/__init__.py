@@ -6629,10 +6629,17 @@ class AbletonMCP(ControlSurface):
         partial = []
         for device in devices:
             for p in tuple(device.parameters):
-                pname = p.name.strip().lower()
-                if pname == target:
+                # Live abbreviates p.name ("Flt 1 Freq") while original_name
+                # keeps the UI spelling ("Filter 1 Freq"). Match either.
+                candidates = [p.name.strip().lower()]
+                try:
+                    if p.original_name:
+                        candidates.append(p.original_name.strip().lower())
+                except Exception:
+                    pass
+                if target in candidates:
                     exact.append((p, device.name))
-                elif target in pname:
+                elif any(target in c for c in candidates):
                     partial.append((p, device.name))
         if len(exact) == 1:
             return exact[0]
@@ -6715,7 +6722,17 @@ class AbletonMCP(ControlSurface):
                 except Exception:
                     env = None
                 if env is None:
-                    env = clip.create_automation_envelope(param)
+                    try:
+                        env = clip.create_automation_envelope(param)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Live refuses automation envelopes on ARRANGEMENT "
+                            "clips ({0}). Verified on 12.3: only session clips "
+                            "accept them, and duplicating a session clip into "
+                            "the arrangement strips its envelopes. Arrangement "
+                            "automation has to be drawn in Live's UI; from here "
+                            "use write_clip_automation on session clips, or vary "
+                            "sections through MIDI content instead.".format(exc))
                 if env is None:
                     skipped += 1
                     continue

@@ -156,6 +156,61 @@ class TestServerWiring:
             "them — remove them from the allowlist: {0}".format(stale))
 
 
+class TestRecorderLiveness:
+    """Every real-time pass must judge liveness on the PLAYHEAD.
+
+    `song.is_playing` keeps reading False for several ticks after
+    start_playing(). A recorder that treated that as "the user stopped" ended
+    its pass after ~2 ticks having written nothing, and reported success. The
+    fix was to watch `current_song_time` instead — and the risk now is that a
+    fourth tick loop gets added later using the obvious-but-wrong signal.
+    """
+
+    def test_every_tick_loop_uses_playhead_stall_detection(self):
+        src = _remote_source()
+        loops = len(re.findall(r'^\s+def step\(\):', src, re.MULTILINE))
+        stalled = len(re.findall(r'current\["stalled"\]', src))
+        assert loops >= 3, "expected the recorder tick loops to be present"
+        assert stalled >= loops, (
+            "{0} tick loop(s) but only {1} reference(s) to the playhead-stall "
+            "counter — a loop is judging liveness some other way, most likely "
+            "on song.is_playing, which lags and silently truncates the "
+            "pass".format(loops, stalled))
+
+    def test_every_tick_loop_tolerates_a_count_in(self):
+        """count_in_duration delays the roll by up to 4 bars."""
+        src = _remote_source()
+        loops = len(re.findall(r'^\s+def step\(\):', src, re.MULTILINE))
+        assert len(re.findall(r'is_counting_in', src)) >= loops, (
+            "a tick loop does not check is_counting_in, so a count-in will "
+            "burn its patience budget and abort as 'never_started'")
+
+
+class TestStemExportArmHandling:
+    """Stem export arms many tracks at once, which needs exclusive_arm off."""
+
+    def test_export_stems_disables_and_restores_exclusive_arm(self):
+        src = _remote_source()
+        body = re.search(r'def _export_stems\(.*?\n(.*?)(?=\n    def )',
+                         src, re.DOTALL)
+        assert body, "_export_stems not found"
+        text = body.group(1)
+        assert 'exclusive_arm = False' in text, (
+            "export_stems must switch exclusive_arm off, or arming each stem "
+            "track disarms the previous one and only the last records")
+        assert 'pre_exclusive' in text, (
+            "export_stems must capture and restore the user's exclusive_arm")
+
+    def test_finish_restores_exclusive_arm_before_arm_map(self):
+        """Restoring arm state while exclusive_arm is on would undo itself."""
+        src = _remote_source()
+        body = re.search(r'def _finish_auto_rec\(.*?\n(.*?)(?=\n    def )',
+                         src, re.DOTALL).group(1)
+        assert body.index('exclusive_arm') < body.index('arm_map'), (
+            "exclusive_arm must be restored BEFORE the arm map, or exclusive "
+            "arm disarms each track as the next one is restored")
+
+
 class TestBuildStamp:
     """The two halves must advertise the same build, or the handshake lies."""
 

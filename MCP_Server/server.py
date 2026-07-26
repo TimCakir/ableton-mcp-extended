@@ -37,7 +37,7 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-07-26.16"
+SERVER_BUILD_ID = "2026-07-26.17"
 
 @dataclass
 class AbletonConnection:
@@ -3520,6 +3520,156 @@ def delete_return_track(ctx: Context, return_index: int) -> str:
     except Exception as e:
         logger.error(f"Error deleting return track: {str(e)}")
         return f"Error deleting return track: {str(e)}"
+
+
+@mcp.tool()
+def export_stems(
+    ctx: Context,
+    from_bar: int,
+    to_bar: int,
+    track_names: list | None = None,
+) -> str:
+    """Bounce every track to its own audio file in ONE transport pass.
+
+    The obvious way costs N real-time passes. But an audio track can take any
+    other track as its input, so N resampling tracks can be armed together
+    and captured in a single playthrough — 11 stems for the price of one.
+
+    Requires `exclusive_arm` OFF, which this handles and restores: with it
+    on, arming each stem track disarms the previous one and only the last
+    would record.
+
+    Real time: 32 bars costs 32 bars, once, regardless of how many stems.
+    Returns immediately; poll `get_automation_record_status`.
+
+    Leaves one new audio track per stem, named "STEM <source>", each holding
+    the recorded clip. Delete them once the files are collected — the files
+    live in the project's Samples/Recorded folder.
+
+    Parameters:
+    - from_bar / to_bar: Bar range (1-based, to_bar exclusive).
+    - track_names: Only bounce these tracks. Omit for every track.
+    """
+    try:
+        ableton = get_ableton_connection()
+        num, denom = _get_time_signature()
+        payload: dict = {
+            "from_beat": bar_to_beat(from_bar, num, denom),
+            "to_beat": bar_to_beat(to_bar, num, denom),
+        }
+        if track_names:
+            payload["track_names"] = track_names
+        r = ableton.send_command("export_stems", payload)
+        secs = r.get("estimated_seconds")
+        secs_txt = f" (~{secs:.1f}s)" if isinstance(secs, (int, float)) else ""
+        names = ", ".join(s.get("source", "?") for s in (r.get("stems") or []))
+        return (
+            f"Recording {r.get('stem_count')} stems over bars "
+            f"{from_bar}-{to_bar - 1}{secs_txt} in ONE pass: {names}\n"
+            f"Poll get_automation_record_status until status is 'done'."
+        )
+    except Exception as e:
+        logger.error(f"Error exporting stems: {str(e)}")
+        return f"Error exporting stems: {str(e)}"
+
+
+@mcp.tool()
+def freeze_track(
+    ctx: Context,
+    track_index: int,
+    from_bar: int = 1,
+    to_bar: int = 0,
+    deactivate: bool = True,
+) -> str:
+    """Bounce a track to audio and switch the original off — a real freeze.
+
+    Live's own freeze is not in the API (`is_frozen` has no setter). This
+    reaches the same end differently: resample the track, then drop its
+    `track_activator` so its devices stop costing CPU. Fully reversible —
+    turn the original back on and delete the bounce track.
+
+    Use `get_performance_report` (while rolling) to find what is worth
+    freezing.
+
+    Real time: freezing 64 bars takes 64 bars. Returns immediately; poll
+    `get_automation_record_status`.
+
+    Parameters:
+    - track_index: Track to freeze (1-based).
+    - from_bar / to_bar: Range to bounce. to_bar defaults to the end of the
+      arrangement, which is what you normally want.
+    - deactivate: Switch the original off afterwards. False bounces without
+      touching it.
+    """
+    try:
+        ableton = get_ableton_connection()
+        num, denom = _get_time_signature()
+        if not to_bar:
+            info = ableton.send_command("get_session_info", {})
+            last = float(info.get("song_length") or 0.0)
+            to_bar = max(beat_to_bar(last, num, denom) + 1, from_bar + 1)
+        r = ableton.send_command("freeze_track", {
+            "track_index": _to_zero_based(track_index, "track_index"),
+            "from_beat": bar_to_beat(from_bar, num, denom),
+            "to_beat": bar_to_beat(to_bar, num, denom),
+            "deactivate": deactivate,
+        })
+        secs = r.get("estimated_seconds")
+        secs_txt = f" (~{secs:.0f}s)" if isinstance(secs, (int, float)) else ""
+        tail = (" The original will be switched off when it finishes."
+                if deactivate else "")
+        return (
+            f"Freezing '{r.get('frozen_source')}' over bars "
+            f"{from_bar}-{to_bar - 1}{secs_txt}.{tail}\n"
+            f"Poll get_automation_record_status until status is 'done'."
+        )
+    except Exception as e:
+        logger.error(f"Error freezing track: {str(e)}")
+        return f"Error freezing track: {str(e)}"
+
+
+@mcp.tool()
+def capture_session_to_arrangement(
+    ctx: Context,
+    scene_index: int,
+    from_bar: int,
+    to_bar: int,
+) -> str:
+    """Record a firing scene into the arrangement.
+
+    Live's oldest songwriting move: play session clips, hit arrangement
+    record, and what played lands on the timeline. Fires the scene, arms
+    arrangement record, rolls the range, stops.
+
+    WARNING: this OVERWRITES the arrangement across the range on every track
+    that has a clip in the scene, and that is not undoable through this API.
+    Check what is already at those bars with `get_arrangement_info` first.
+
+    Real time: capturing 16 bars takes 16 bars. Returns immediately; poll
+    `get_automation_record_status`.
+
+    Parameters:
+    - scene_index: Scene to fire (1-based).
+    - from_bar / to_bar: Arrangement range to record into (to_bar exclusive).
+    """
+    try:
+        ableton = get_ableton_connection()
+        num, denom = _get_time_signature()
+        r = ableton.send_command("capture_session_to_arrangement", {
+            "scene_index": _to_zero_based(scene_index, "scene_index"),
+            "from_beat": bar_to_beat(from_bar, num, denom),
+            "to_beat": bar_to_beat(to_bar, num, denom),
+        })
+        secs = r.get("estimated_seconds")
+        secs_txt = f" (~{secs:.1f}s)" if isinstance(secs, (int, float)) else ""
+        return (
+            f"Capturing scene '{r.get('scene')}' into bars "
+            f"{from_bar}-{to_bar - 1}{secs_txt}.\n"
+            f"Poll get_automation_record_status until status is 'done'."
+        )
+    except Exception as e:
+        logger.error(f"Error capturing session to arrangement: {str(e)}")
+        return f"Error capturing session to arrangement: {str(e)}"
 
 
 @mcp.tool()

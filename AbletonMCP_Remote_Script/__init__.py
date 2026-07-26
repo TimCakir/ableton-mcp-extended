@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.16"
+BUILD_ID = "2026-07-26.17"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -417,6 +417,9 @@ class AbletonMCP(ControlSurface):
                                  "record_arrangement_automation",
                                  "record_over_range",
                                  "bounce_to_audio",
+                                 "export_stems",
+                                 "freeze_track",
+                                 "capture_session_to_arrangement",
                                  "delete_return_track",
                                  "import_audio_file",
                                  "insert_device",
@@ -839,6 +842,22 @@ class AbletonMCP(ControlSurface):
                         elif command_type == "delete_return_track":
                             result = self._delete_return_track(
                                 params.get("return_index", 0))
+                        elif command_type == "export_stems":
+                            result = self._export_stems(
+                                params.get("from_beat", 0.0),
+                                params.get("to_beat", 0.0),
+                                params.get("track_names", None))
+                        elif command_type == "freeze_track":
+                            result = self._freeze_track(
+                                params.get("track_index", 0),
+                                params.get("from_beat", 0.0),
+                                params.get("to_beat", 0.0),
+                                params.get("deactivate", True))
+                        elif command_type == "capture_session_to_arrangement":
+                            result = self._capture_session_to_arrangement(
+                                params.get("scene_index", 0),
+                                params.get("from_beat", 0.0),
+                                params.get("to_beat", 0.0))
                         elif command_type == "bounce_to_audio":
                             result = self._bounce_to_audio(
                                 params.get("from_beat", 0.0),
@@ -7163,6 +7182,22 @@ class AbletonMCP(ControlSurface):
         # Arming a track makes Live's exclusive arm disarm the others, and
         # nothing reports it — so the whole arm map is captured and put back,
         # disarming everything first so exclusive arm cannot fight the restore.
+        # Stem export switches exclusive_arm off so many tracks can be armed
+        # at once; put the user's setting back before touching arm state, or
+        # the restore itself would disarm what it is trying to restore.
+        if "exclusive_arm" in restore:
+            try:
+                song.exclusive_arm = restore["exclusive_arm"]
+            except Exception:
+                pass
+        # freeze_track: deactivate the source only once its bounce is on disk.
+        deactivate = restore.get("deactivate_track_index")
+        if deactivate is not None:
+            try:
+                song.tracks[deactivate].mixer_device.track_activator.value = 0
+                state["deactivated"] = song.tracks[deactivate].name
+            except Exception as exc:
+                state["deactivate_error"] = str(exc)
         arm_map = restore.get("arm_map")
         if arm_map:
             tracks = tuple(song.tracks)
@@ -7540,20 +7575,33 @@ class AbletonMCP(ControlSurface):
                 "A transport pass is already running ({0} on {1}).".format(
                     state.get("parameter") or "recording", state.get("track")))
 
+        index, track, resolved = self._new_resampling_track(source, name)
+        track_index = index
+        result = self._record_over_range(track_index, from_beat, to_beat)
+        self._auto_rec["bounce_track_index"] = track_index
+        result["bounce_track"] = track.name
+        result["bounce_track_index"] = track_index
+        result["source"] = resolved
+        return result
+
+    def _new_resampling_track(self, source_name, label=None):
+        """Add an audio track fed from `source_name`, ready to record.
+
+        Shared by bounce_to_audio, export_stems and freeze_track. Monitoring
+        is forced Off — a resampling track that monitors itself feeds the
+        main bus back into itself.
+        """
         song = self._song
         song.create_audio_track(-1)
-        track = song.tracks[len(song.tracks) - 1]
-        track_index = len(song.tracks) - 1
-        if name:
+        index = len(song.tracks) - 1
+        track = song.tracks[index]
+        if label:
             try:
-                track.name = name
+                track.name = label
             except Exception:
                 pass
 
-        # Resolve the input by display name against what Live actually
-        # offers; the list depends on the audio interface and on which other
-        # tracks exist, so it can never be assumed.
-        wanted = str(source).strip().lower()
+        wanted = str(source_name).strip().lower()
         chosen = None
         for routing in tuple(track.available_input_routing_types):
             if routing.display_name.strip().lower() == wanted:
@@ -7567,27 +7615,228 @@ class AbletonMCP(ControlSurface):
         if chosen is None:
             available = [r.display_name
                          for r in tuple(track.available_input_routing_types)]
-            song.delete_track(track_index)
+            song.delete_track(index)
             raise ValueError(
                 "No input routing matching '{0}'. Available: {1}".format(
-                    source, ", ".join(available)))
+                    source_name, ", ".join(available)))
         track.input_routing_type = chosen
-
-        # Monitoring must be Off or a resampling track re-feeds the main bus.
         try:
-            track.current_monitoring_state = 2      # 2 == Off
+            track.current_monitoring_state = 2      # Off
         except Exception:
             pass
+        return index, track, chosen.display_name
 
-        result = self._record_over_range(track_index, from_beat, to_beat)
-        self._auto_rec["bounce_track_index"] = track_index
-        result["bounce_track"] = track.name
-        result["bounce_track_index"] = track_index
-        result["source"] = chosen.display_name
+    def _export_stems(self, from_beat, to_beat, track_names=None):
+        """Bounce every track to its own audio file in ONE transport pass.
+
+        The obvious implementation bounces each track separately, costing N
+        real-time passes. But an audio track can take ANY track as its input,
+        so N resampling tracks can be armed together and captured in a single
+        playthrough — 11 stems for the price of one.
+
+        This requires `exclusive_arm` OFF. With it on, arming each stem track
+        disarms the previous one and only the last would record — which would
+        look like the feature simply not working.
+        """
+        state = getattr(self, "_auto_rec", None)
+        if state and state.get("active"):
+            raise RuntimeError("A transport pass is already running")
+
+        song = self._song
+        wanted = None
+        if track_names:
+            wanted = set(n.strip().lower() for n in track_names)
+
+        sources = []
+        for track in tuple(song.tracks):
+            name = track.name
+            if wanted is not None and name.strip().lower() not in wanted:
+                continue
+            sources.append(name)
+        if not sources:
+            raise ValueError("No matching source tracks")
+
+        pre_arm = []
+        for i, track in enumerate(tuple(song.tracks)):
+            try:
+                pre_arm.append((i, bool(track.arm)))
+            except Exception:
+                pass
+        pre_exclusive = bool(song.exclusive_arm)
+        song.exclusive_arm = False
+
+        made = []
+        try:
+            for name in sources:
+                index, track, resolved = self._new_resampling_track(
+                    name, "STEM " + name)
+                track.arm = True
+                made.append({"index": index, "name": track.name,
+                             "source": resolved})
+        except Exception:
+            for entry in reversed(made):
+                try:
+                    song.delete_track(entry["index"])
+                except Exception:
+                    pass
+            song.exclusive_arm = pre_exclusive
+            raise
+
+        result = self._record_over_range(
+            made[0]["index"], from_beat, to_beat,
+            arm_track=False, solo_arm=False)
+
+        # The pass captured arm state AFTER the stem tracks were armed, which
+        # would restore them as armed. Replace it with the map taken before,
+        # and put exclusive_arm back too.
+        self._auto_rec["restore"]["arm_map"] = pre_arm
+        self._auto_rec["restore"]["exclusive_arm"] = pre_exclusive
+        self._auto_rec["stem_track_indices"] = [m["index"] for m in made]
+
+        result["stems"] = made
+        result["stem_count"] = len(made)
         return result
 
+    def _freeze_track(self, track_index, from_beat, to_beat,
+                      deactivate=True):
+        """Bounce a track to audio, then switch the original off.
+
+        Live's own freeze is not in the API — `is_frozen` has no setter. This
+        is the same end reached differently: resample the track, then drop its
+        `track_activator` so its devices stop costing CPU. Reversible by
+        turning the original back on and deleting the bounce.
+        """
+        track = self._track_at(track_index)
+        source_name = track.name
+        index, _, resolved = self._new_resampling_track(
+            source_name, "FROZEN " + source_name)
+        result = self._record_over_range(index, from_beat, to_beat)
+        if deactivate:
+            self._auto_rec["restore"]["deactivate_track_index"] = track_index
+        result["frozen_source"] = source_name
+        result["bounce_track_index"] = index
+        self._auto_rec["bounce_track_index"] = index
+        result["source"] = resolved
+        return result
+
+    def _capture_session_to_arrangement(self, scene_index, from_beat, to_beat):
+        """Record a firing scene into the arrangement.
+
+        Live's oldest songwriting move: play session clips, hit arrangement
+        record, and what you played lands on the timeline. Every part of it
+        is reachable — fire the scene, arm record_mode, roll the transport.
+
+        This WRITES OVER the arrangement across the range on every track that
+        has a clip in the scene, which is the intended behaviour and is not
+        undoable through this API. Check the range first.
+        """
+        state = getattr(self, "_auto_rec", None)
+        if state and state.get("active"):
+            raise RuntimeError("A transport pass is already running")
+
+        song = self._song
+        scenes = tuple(song.scenes)
+        if scene_index < 0 or scene_index >= len(scenes):
+            raise IndexError(
+                "Scene {0} out of range (0-{1})".format(
+                    scene_index, len(scenes) - 1))
+        scene = scenes[scene_index]
+        if getattr(scene, "is_empty", False):
+            raise ValueError(
+                "Scene '{0}' is empty — nothing would be captured".format(
+                    scene.name))
+
+        from_beat = float(from_beat)
+        to_beat = float(to_beat)
+        if to_beat <= from_beat:
+            raise ValueError("to_beat must be greater than from_beat")
+
+        restore = {"start_time": song.start_time, "loop": song.loop,
+                   "return_to_start": True}
+        song.loop = False
+        song.start_time = from_beat
+        song.record_mode = True
+        scene.fire()
+        song.start_playing()
+
+        self._auto_rec = {
+            "active": True, "status": "recording",
+            "track": "scene '{0}'".format(scene.name),
+            "parameter": "session capture", "device": None,
+            "from_beat": from_beat, "to_beat": to_beat,
+            "position": from_beat, "samples": 0, "ticks": 0,
+            "rolling": False, "waiting": 0, "stalled": 0,
+            "restore": restore,
+        }
+        self._schedule_pass(song, from_beat, to_beat, "session capture")
+
+        beats = to_beat - from_beat
+        try:
+            seconds = beats * 60.0 / song.tempo
+        except Exception:
+            seconds = None
+        return {"started": True, "scene": scene.name,
+                "from_beat": from_beat, "to_beat": to_beat,
+                "beats": beats, "estimated_seconds": seconds,
+                "note": "Capturing the scene into the arrangement. Poll "
+                        "get_automation_record_status until status is 'done'."}
+
+    def _schedule_pass(self, song, from_beat, to_beat, label):
+        """Generic playhead-driven tick loop for a plain transport pass."""
+        try:
+            expected = (to_beat - from_beat) * 60.0 / song.tempo * 10.0
+        except Exception:
+            expected = 600.0
+        max_ticks = int(expected * 3) + 100
+
+        def step():
+            current = getattr(self, "_auto_rec", None)
+            if not current or not current.get("active"):
+                return
+            try:
+                now = song.current_song_time
+                previous = current["position"]
+                current["position"] = now
+                if now > from_beat + 1e-6:
+                    current["rolling"] = True
+                if not current["rolling"]:
+                    counting_in = False
+                    try:
+                        counting_in = bool(song.is_counting_in)
+                    except Exception:
+                        pass
+                    if not counting_in:
+                        current["waiting"] += 1
+                    if current["waiting"] > 40:
+                        self.log_message(label + ": transport never rolled")
+                        self._finish_auto_rec("never_started")
+                        return
+                    self.schedule_message(1, step)
+                    return
+                if now <= previous:
+                    current["stalled"] += 1
+                else:
+                    current["stalled"] = 0
+                if now >= to_beat or current["stalled"] >= 3:
+                    self._finish_auto_rec("done")
+                    return
+                current["ticks"] += 1
+                if current["ticks"] > max_ticks:
+                    self.log_message(label + ": tick budget exceeded")
+                    self._finish_auto_rec("timeout")
+                    return
+                current["samples"] += 1
+            except Exception as exc:
+                self.log_message(label + " step failed: " + str(exc))
+                self._finish_auto_rec("failed")
+                return
+            self.schedule_message(1, step)
+
+        self.schedule_message(1, step)
+
     def _record_over_range(self, track_index, from_beat, to_beat,
-                           arm_track=True, return_to_start=True):
+                           arm_track=True, return_to_start=True,
+                           solo_arm=True):
         """Record a track's live input into the arrangement over a bar range.
 
         Same transport pass as record_arrangement_automation, capturing audio
@@ -7634,12 +7883,15 @@ class AbletonMCP(ControlSurface):
         # punching a vocal take over bars 33-49 would quietly destroy bars
         # 33-49 of an unrelated armed track. Exclusive arm usually does this,
         # but it is a preference and cannot be relied on.
-        for other in tuple(song.tracks):
-            try:
-                if other.arm and other != track:
-                    other.arm = False
-            except Exception:
-                pass
+        # solo_arm=False is for stem export, which deliberately arms many
+        # tracks at once and must not have them disarmed here.
+        if solo_arm:
+            for other in tuple(song.tracks):
+                try:
+                    if other.arm and other != track:
+                        other.arm = False
+                except Exception:
+                    pass
         if arm_track:
             track.arm = True
         song.loop = False

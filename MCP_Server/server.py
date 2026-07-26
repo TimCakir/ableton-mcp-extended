@@ -37,7 +37,7 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-07-26.10"
+SERVER_BUILD_ID = "2026-07-26.11"
 
 @dataclass
 class AbletonConnection:
@@ -3331,6 +3331,63 @@ def record_over_range(
 
 
 @mcp.tool()
+def bounce_to_audio(
+    ctx: Context,
+    from_bar: int,
+    to_bar: int,
+    source: str = "Resampling",
+    name: str | None = None,
+) -> str:
+    """Render a bar range to an audio file, by resampling it in real time.
+
+    Live exposes no render/export call — but an audio track accepts
+    "Resampling" (the main bus) or any individual track as its INPUT, so
+    arming one and rolling the transport writes a real audio file into the
+    project's Samples/Recorded folder. Verified: bars 33-35 produced a 48 kHz
+    stereo AIFF peaking at -8.5 dBFS.
+
+    This covers three things the API supposedly cannot do:
+    - `source="Resampling"` — bounce the full mix (export/mixdown)
+    - `source="<track name>"` — bounce one track (stem export)
+    - the same, then disable the original — a freeze/flatten stand-in
+
+    Real time: bouncing 32 bars takes 32 bars. Returns immediately; poll
+    `get_automation_record_status`, which reports `file_path` once done.
+
+    Creates a new audio track to record onto and leaves it in place, so the
+    result is audible and editable. Delete it when finished with it.
+
+    Parameters:
+    - from_bar / to_bar: Bar range (1-based, to_bar exclusive).
+    - source: "Resampling" for the full mix, or a track name for a stem.
+      Matched against Live's actual routing list — call get_routing_options
+      on any audio track to see what this system offers.
+    - name: Optional name for the new audio track.
+    """
+    try:
+        ableton = get_ableton_connection()
+        num, denom = _get_time_signature()
+        payload: dict = {
+            "from_beat": bar_to_beat(from_bar, num, denom),
+            "to_beat": bar_to_beat(to_bar, num, denom),
+            "source": source,
+        }
+        if name:
+            payload["name"] = name
+        r = ableton.send_command("bounce_to_audio", payload)
+        secs = r.get("estimated_seconds")
+        secs_txt = f" (~{secs:.1f}s)" if isinstance(secs, (int, float)) else ""
+        return (
+            f"Bouncing '{r.get('source')}' over bars {from_bar}-{to_bar - 1}"
+            f"{secs_txt} onto new track '{r.get('bounce_track')}'. "
+            f"Poll get_automation_record_status for status and file_path."
+        )
+    except Exception as e:
+        logger.error(f"Error bouncing to audio: {str(e)}")
+        return f"Error bouncing to audio: {str(e)}"
+
+
+@mcp.tool()
 def get_automation_record_status(ctx: Context) -> str:
     """Progress of an in-flight `record_arrangement_automation` pass.
 
@@ -3349,6 +3406,8 @@ def get_automation_record_status(ctx: Context) -> str:
         pos = r.get("position")
         if isinstance(pos, (int, float)):
             head += f"\nPlayhead at beat {pos:.2f}, {r.get('samples')} points written"
+        if r.get("file_path"):
+            head += f"\nRecorded file: {r.get('file_path')}"
         return head
     except Exception as e:
         logger.error(f"Error reading automation record status: {str(e)}")

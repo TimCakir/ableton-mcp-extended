@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.10"
+BUILD_ID = "2026-07-26.11"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -414,6 +414,7 @@ class AbletonMCP(ControlSurface):
                                  "write_arrangement_automation",
                                  "record_arrangement_automation",
                                  "record_over_range",
+                                 "bounce_to_audio",
                                  "cancel_automation_record",
                                  "play_section",
                                  "call_lom", "set_device_sidechain",
@@ -808,6 +809,12 @@ class AbletonMCP(ControlSurface):
                                 params.get("to_beat", 0.0),
                                 params.get("arm_track", True),
                                 params.get("return_to_start", True))
+                        elif command_type == "bounce_to_audio":
+                            result = self._bounce_to_audio(
+                                params.get("from_beat", 0.0),
+                                params.get("to_beat", 0.0),
+                                params.get("source", "Resampling"),
+                                params.get("name", None))
                         elif command_type == "cancel_automation_record":
                             result = self._cancel_automation_record()
                         elif command_type == "play_section":
@@ -7057,6 +7064,18 @@ class AbletonMCP(ControlSurface):
                 out["position"] = self._song.current_song_time
             except Exception:
                 pass
+        # A finished bounce is only useful if the caller can find the file.
+        # Resolved lazily rather than at stop time: Live finalises the
+        # recording a moment after the transport stops, so reading it in
+        # _finish_auto_rec would race and often come back empty.
+        index = state.get("bounce_track_index")
+        if index is not None and not state.get("active"):
+            try:
+                clips = tuple(self._song.tracks[index].arrangement_clips)
+                if clips:
+                    out["file_path"] = clips[-1].file_path
+            except Exception:
+                pass
         return out
 
     def _cancel_automation_record(self):
@@ -7237,6 +7256,78 @@ class AbletonMCP(ControlSurface):
                 "beats": beats, "estimated_seconds": seconds,
                 "note": "Recording in real time. Poll "
                         "get_automation_record_status until status is 'done'."}
+
+    def _bounce_to_audio(self, from_beat, to_beat, source="Resampling",
+                         name=None):
+        """Render a range to an audio file, by resampling it in real time.
+
+        Live exposes no render/export call, which was written up here as
+        "rendering audio: not in the API". True of *export*, false of the
+        goal: an audio track accepts `Resampling` (the main bus) or any
+        individual track as its INPUT, so arming it and rolling the transport
+        captures a real audio file on disk. Verified: bars 33-35 produced a
+        843 KB 48 kHz stereo AIFF peaking at -8.5 dBFS.
+
+        source="Resampling" bounces the full mix; source="<track name>"
+        bounces that track alone, which is stem export, and doubles as a
+        stand-in for freeze/flatten (resample the track, then disable the
+        original).
+
+        Real time: bouncing 32 bars takes 32 bars. Monitoring is forced Off,
+        because monitoring a resampling track feeds the main bus back into
+        itself.
+        """
+        state = getattr(self, "_auto_rec", None)
+        if state and state.get("active"):
+            raise RuntimeError(
+                "A transport pass is already running ({0} on {1}).".format(
+                    state.get("parameter") or "recording", state.get("track")))
+
+        song = self._song
+        song.create_audio_track(-1)
+        track = song.tracks[len(song.tracks) - 1]
+        track_index = len(song.tracks) - 1
+        if name:
+            try:
+                track.name = name
+            except Exception:
+                pass
+
+        # Resolve the input by display name against what Live actually
+        # offers; the list depends on the audio interface and on which other
+        # tracks exist, so it can never be assumed.
+        wanted = str(source).strip().lower()
+        chosen = None
+        for routing in tuple(track.available_input_routing_types):
+            if routing.display_name.strip().lower() == wanted:
+                chosen = routing
+                break
+        if chosen is None:
+            for routing in tuple(track.available_input_routing_types):
+                if wanted in routing.display_name.strip().lower():
+                    chosen = routing
+                    break
+        if chosen is None:
+            available = [r.display_name
+                         for r in tuple(track.available_input_routing_types)]
+            song.delete_track(track_index)
+            raise ValueError(
+                "No input routing matching '{0}'. Available: {1}".format(
+                    source, ", ".join(available)))
+        track.input_routing_type = chosen
+
+        # Monitoring must be Off or a resampling track re-feeds the main bus.
+        try:
+            track.current_monitoring_state = 2      # 2 == Off
+        except Exception:
+            pass
+
+        result = self._record_over_range(track_index, from_beat, to_beat)
+        self._auto_rec["bounce_track_index"] = track_index
+        result["bounce_track"] = track.name
+        result["bounce_track_index"] = track_index
+        result["source"] = chosen.display_name
+        return result
 
     def _record_over_range(self, track_index, from_beat, to_beat,
                            arm_track=True, return_to_start=True):

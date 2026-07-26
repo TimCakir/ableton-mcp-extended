@@ -27,7 +27,7 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.19"
+BUILD_ID = "2026-07-26.20"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -7740,6 +7740,22 @@ class AbletonMCP(ControlSurface):
             # Tick 2: the tracks now exist properly, so route and arm them.
             made = []
             try:
+                stem_indices = set(i for i, _ in created)
+                # Disarm everything that is NOT a stem track. The pass runs
+                # with solo_arm=False so the stem tracks can be armed
+                # together — which also means it will not disarm anything
+                # else, and any track the user left armed would record too,
+                # punching an empty clip over its arrangement. Observed: FX /
+                # RISER was armed during a stems test and came back with a
+                # stray clip across the exact export range.
+                for i, other in enumerate(tuple(song.tracks)):
+                    if i in stem_indices:
+                        continue
+                    try:
+                        if other.arm:
+                            other.arm = False
+                    except Exception:
+                        pass
                 for index, name in created:
                     track = song.tracks[index]
                     try:

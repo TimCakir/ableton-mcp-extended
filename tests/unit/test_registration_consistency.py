@@ -205,6 +205,17 @@ class TestStemExportArmHandling:
             "exclusive_arm has no setter — writing it raises and aborts the "
             "export before any stem is recorded")
 
+    def test_export_stems_disarms_non_stem_tracks(self):
+        """solo_arm=False keeps the stem tracks armed — and would also leave
+        the user's armed track armed, so it records too. Observed once: a
+        stray empty clip punched across the export range on FX / RISER."""
+        src = _remote_source()
+        body = re.search(r'def _export_stems\(.*?\n(.*?)(?=\n    def )',
+                         src, re.DOTALL).group(1)
+        assert 'stem_indices' in body and 'other.arm = False' in body, (
+            "export_stems runs the pass with solo_arm=False, so it must "
+            "disarm every non-stem track itself or they record too")
+
     def test_export_stems_restores_the_arm_map(self):
         src = _remote_source()
         body = re.search(r'def _export_stems\(.*?\n(.*?)(?=\n    def )',

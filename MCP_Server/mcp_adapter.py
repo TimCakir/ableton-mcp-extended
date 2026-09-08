@@ -22,6 +22,7 @@ READ_ONLY_TOOLS = frozenset({
     "get_chain_info", "get_drum_pad_info", "get_track_deletion_status", "get_edit_targets",
     "get_session_snapshot", "get_command_status", "analyze_audio_file",
     "compare_session_snapshots", "verify_export_outputs",
+    "get_latency_report", "analyze_recording_timing",
 })
 
 

@@ -1,12 +1,47 @@
 # Live API — verified facts and hard limits
 
-> The observations below record earlier Live builds. The September 2026
-> reliability implementation is documented in [release 1.1.0](RELEASE-1.1.0.md)
-> and has offline tests; it has not established new live API facts. Installation
-> instructions are now corrected in [INSTALLATION.md](../INSTALLATION.md).
-> Always check the loaded build before applying older observations to a new run.
+## September 8, 2026: latency in Live 12.4.5
 
-Everything here was verified against a **running Live 12.4.3 Suite**, not recalled
+The disposable acceptance Set exposed `Device.latency_in_samples` and
+`Device.latency_in_ms` through the Python Live objects. Its Main Limiter reported
+128 samples / 2.902494331 ms. The vocal Multiband Dynamics reported zero in this
+specific stopped Set; do not treat this as a universal device/preset constant.
+Both `BECKY VOX` and `BECKY GTR` exposed `current_monitoring_state=2` (Off).
+
+`inspect_lom` searches for latency/delay on the inspected Song and Track objects
+did not expose buffer, track-delay or global compensation controls. This is an
+observation of those objects and this build, not proof that every possible control
+interface lacks them. `get_latency_report` reports those settings as unobserved;
+`configure_monitoring` only writes track monitoring, and the local timing analyzer
+measures recorded threshold edges. See [1.6.0 tool behavior](RELEASE-1.6.0.md).
+
+The final `.8` workflow verified `current_monitoring_state` writes from Off (2)
+to Auto (1) and back to Off on both Becky tracks, with next-tick and independent
+readback. The restored Off values passed after save/unload/reopen; see the
+[1.6.0 acceptance report](LIVE-ACCEPTANCE-1.6.0-2026-09-08.md). No buffer, driver,
+track-delay or clock preference was written.
+
+The Audio Settings UI, read without changes on the same date, showed CoreAudio,
+No Device for input, MacBook Pro Speakers for output, 44.1 kHz, a 256-sample buffer,
+9.00 ms displayed output/overall latency and 0.00 ms Driver Error Compensation.
+These UI observations are not values read by the latency-report MCP tool and do
+not establish a connected TR/Apollo path or physical monitoring latency.
+
+Published semantics matter: Live retains latency when a device activator is off;
+Reduced Latency When Monitoring does not remove latency along the monitored
+track's own downstream path; Keep Monitoring Latency in Recording changes
+recorded placement. Refer to the primary sources in the
+[TR/vocal/guitar latency guide](LATENCY-GUIDE.md), not inferred meanings from
+property names alone.
+
+## Historical Live 12.4.3 observations
+
+> The following sections retain earlier observations. Current installation
+> instructions are in [INSTALLATION.md](../INSTALLATION.md); September workflow
+> acceptance is recorded in the versioned release reports. Always check the loaded
+> build before applying older observations to a new run.
+
+The historical observations here were verified against a **running Live 12.4.3 Suite**, not recalled
 or read from documentation. Published LOM docs are incomplete and
 version-dependent; the running instance is the only authority.
 

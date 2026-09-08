@@ -5,7 +5,29 @@ Control Ableton Live through an MCP-compatible assistant. The Python MCP server 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-## Version 1.5.0
+## Version 1.6.0
+
+Build `2026-09-08.8` adds three tools for latency diagnosis and recording setup:
+
+- `get_latency_report`: device-reported delays across tracks, nested racks, returns
+  and Main, with monitoring state, routing, explicit unknowns and scan limits.
+- `configure_monitoring`: preview, apply and restore Monitor Auto for Live monitoring
+  or Off for an external monitoring path. Stable identities, recording guards,
+  context checks and deferred readback protect the change.
+- `analyze_recording_timing`: measure isolated PCM WAV test hits against supplied
+  reference times, reporting offset, jitter and missing or ambiguous detections.
+
+There are now 155 top-level tools. These features distinguish recorded alignment
+from heard monitoring delay. They do not control Live's buffer preferences or
+Apollo/TR hardware settings, and device-chain sums are not total round-trip measurements.
+See [1.6.0 examples](docs/RELEASE-1.6.0.md) and the practical
+[TR-1000, vocal and guitar latency guide](docs/LATENCY-GUIDE.md).
+
+All **1,196 automated tests** passed. Real Live 12.4.5 tests verified monitoring
+apply/restore, unchanged routing and Set metadata, and the restored state after
+save/unload/reopen. See [1.6.0 acceptance](docs/LIVE-ACCEPTANCE-1.6.0-2026-09-08.md).
+
+## Version 1.5.0 baseline
 
 Build `2026-09-08.7` adds direct PCM WAV placement to `build_arrangement`.
 Supply an absolute file path, an audio-track handle and a destination beat.
@@ -95,6 +117,7 @@ Verified for the 1.1.0 baseline in Live 12.4.5: short bounce and stem captures, 
 | Automation | Clip envelopes and real-time arrangement automation recording, subject to Live API constraints |
 | Recording | Input recording, scene capture, real-time mix bounce and stem capture |
 | Diagnostics | Session overview, meters, performance information, build agreement and command status |
+| Latency and tracking | Device latency report, reversible monitoring setup, recorded test-hit timing analysis |
 
 The existing `freeze_track` tool performs a real-time bounce and can switch off the original track after output verification. It does not invoke Live's native Freeze/Flatten or promise CPU savings. Features depend on the Live version, edition, device and available API; consult [Live API facts](docs/LIVE-API-FACTS.md) and [Live 11 notes](LIVE_11_NOTES.md).
 
@@ -131,6 +154,10 @@ Restart the MCP server in the assistant. Ask it to run `get_build_info`, then `g
 See [INSTALLATION.md](INSTALLATION.md) for platform paths, upgrade steps and troubleshooting.
 
 ## Try the new workflows
+
+- “Check Becky’s vocal and guitar tracks for device latency and monitoring routing.”
+- “Preview a direct-monitoring setup for these inputs, apply it, then restore the previous settings.”
+- “Measure this finished TR test recording against the supplied beat times; exclude startup hits.”
 
 - “List stable edit targets. Preview changing the Bass track's volume to 0.7.”
 - “Take a session snapshot before this edit, then compare it with a new snapshot.”
@@ -179,6 +206,9 @@ Or use pip in the existing virtual environment:
 
 The default test command excludes tests marked `integration`. Automated tests simulate Live objects and scheduled ticks; they cannot establish that a recording is audible or that an edit survives saving a real Set.
 
+- [Release 1.6.0](docs/RELEASE-1.6.0.md)
+- [1.6.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.6.0-2026-09-08.md)
+- [Latency guide](docs/LATENCY-GUIDE.md)
 - [Release 1.5.0](docs/RELEASE-1.5.0.md)
 - [1.5.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.5.0-2026-09-08.md)
 - [Release 1.4.0](docs/RELEASE-1.4.0.md)

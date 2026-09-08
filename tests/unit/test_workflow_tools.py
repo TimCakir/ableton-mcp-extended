@@ -107,3 +107,29 @@ def test_export_verification_preserves_missing_and_failed_file_results(monkeypat
     result = registry.tools["verify_export_outputs"]()
     assert [r["analysis_status"] for r in result["outputs"]] == ["missing_file", "error"]
     assert not result["all_files_measured"]
+
+
+def test_latency_workflows_forward_stable_identities_and_poll_same_plan():
+    registry, connection = Registry(), Mock()
+    register_workflow_tools(registry, lambda: connection)
+    registry.tools["get_latency_report"]("set1", ["voice"])
+    connection.send_command.assert_called_with("get_latency_report", {
+        "session_id": "set1", "track_handles": ["voice"]})
+    registry.tools["configure_monitoring"]("preview", "set1", ["voice"], "direct")
+    connection.send_command.assert_called_with("configure_monitoring", {
+        "action": "preview", "session_id": "set1", "track_handles": ["voice"],
+        "monitoring_path": "direct", "plan_id": ""})
+    for action in ("apply", "restore"):
+        registry.tools["configure_monitoring"](action, "set1", plan_id="retained")
+        connection.send_command.assert_called_with("configure_monitoring", {
+            "action": action, "session_id": "set1", "track_handles": None,
+            "monitoring_path": None, "plan_id": "retained"})
+
+
+def test_timing_analysis_has_no_live_connection(monkeypatch):
+    registry = Registry()
+    register_workflow_tools(registry, lambda: pytest.fail("offline analysis connected to Live"))
+    analyzer = Mock(return_value={"status": "measured"})
+    monkeypatch.setattr("MCP_Server.workflow_tools.analyze_timing", analyzer)
+    assert registry.tools["analyze_recording_timing"]("/hits.wav", [.5, 1, 1.5], skip_initial=0) == {"status": "measured"}
+    analyzer.assert_called_once_with("/hits.wav", [.5, 1, 1.5], 100., -40., 50., 1, 0)

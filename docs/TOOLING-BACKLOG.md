@@ -2,6 +2,20 @@
 
 ## Current implementation handoff — 2026-09-08
 
+Build `2026-09-08.8` / package `1.6.0` adds device latency reporting, guarded
+monitoring preview/apply/restore, and offline recorded-hit timing analysis.
+The full suite passed 1,196 tests. See [1.6.0 tools and limits](RELEASE-1.6.0.md)
+and the [TR/vocal/guitar guide](LATENCY-GUIDE.md). Physical calibration and listening
+acceptance depend on the actual connected input/output and monitoring paths.
+
+Real Live 12.4.5 workflow and restored-state save/reopen acceptance passed with
+155 discovered tools and matching final `.8` source hashes. See
+[1.6.0 acceptance](LIVE-ACCEPTANCE-1.6.0-2026-09-08.md). Live has loaded `.8`;
+Codex's existing MCP process still needs refreshing from `.4`. The Audio Settings
+UI had no input device selected, so new physical calibration remains open.
+
+## Verified 1.5.0 baseline
+
 Build `2026-09-08.7` / package `1.5.0` adds direct PCM WAV file placement to
 `build_arrangement`. Preview reserves a full-file arrangement span and an empty
 Session slot per placement. Apply stages and normalizes unwarped audio, verifies
@@ -13,9 +27,9 @@ The full automated suite passed 1,031 tests. Actual Live 12.4.5 acceptance passe
 for one excerpt and one full WAV, including replay, cleanup, unchanged originals
 and save/unload/reopen persistence. See the
 [1.5.0 acceptance report](LIVE-ACCEPTANCE-1.5.0-2026-09-08.md).
-Live runs `.7`; fresh acceptance servers matched the loaded build and source
-hashes. Codex's existing connection still holds `.4` and needs a host refresh.
-Remote CI and publication remain outstanding.
+Live ran `.7` at that checkpoint; fresh acceptance servers matched the loaded
+build and source hashes. Codex's existing connection held `.4` and needed a host
+refresh. Remote CI and publication were not claimed.
 
 ## Verified 1.4.0 baseline
 
@@ -97,15 +111,28 @@ acceptance does not establish either. Codex's subsequent restart verified all
 
 ## Next work, in order
 
-1. **Remote CI and publication.** Run the configured remote checks and publish
-   only when authorized. The local baseline, 1.5.0 implementation and real Live
-   acceptance are complete; no remote CI result or published release is claimed.
-2. **Extend arrangement coverage where needed.** File formats beyond integer
+1. **Recording preflight.** Build a preview that combines input availability,
+   arm states, monitoring routes and a short level measurement before Becky or
+   a guitar take. Report clipping and possible duplicate monitoring paths;
+   hardware Console feeds need confirmation outside the Live API.
+2. **Retained calibration records.** Store repeated capture evidence separately
+   for TR clock-driven patterns, MIDI-triggered notes, USB and analog returns.
+   Record interface, buffer, rate, kit and monitoring context, and flag changed
+   context before reusing values. Values must come from measurement; do not
+   turn an earlier clock adjustment into a universal latency preset.
+3. **Cue and tracking workflows.** Preview explicit headphone/cue routes and
+   repeatable performer inputs with a verified restore. Low-latency device-chain
+   alternatives need actual device parameter capability checks; simply switching
+   off an effect does not remove its compensation latency.
+4. **Complete distribution.** Include the Remote Script and installation helper
+   in a self-contained release artifact; current wheel/sdist packaging is focused
+   on the Python server. Run remote CI and publish only when authorized.
+5. **Extend arrangement coverage where needed.** File formats beyond integer
    PCM WAV, grouping staggered notes and note-density generation remain outside
    the current planner. Same-track and cross-track copies, pitch removal,
    individual-note/whole-onset thinning and transposition are implemented;
    direct PCM WAV placement passed 1.5.0 workflow and saved-Set acceptance.
-3. **Broader recording acceptance.** Exercise longer captures and the actual
+6. **Broader recording acceptance.** Exercise longer captures and the actual
    hardware routing. Test freeze-style source deactivation and scene capture
    independently; passing bounce tests does not establish these workflows.
 

@@ -12,6 +12,40 @@ class CommandStatus(OpenResult):
     message: str | None = None
 
 
+class LatencyReport(OpenResult):
+    status: str
+    complete: bool
+    session_id: str
+    tracks: list[dict[str, Any]]
+    master: dict[str, Any] | None
+    findings: list[dict[str, Any]]
+    read_errors: list[dict[str, Any]]
+
+
+class MonitoringSetup(OpenResult):
+    status: str
+    plan_id: str
+    session_id: str
+    monitoring_path: str
+    track_count: int
+    tracks: list[dict[str, Any]]
+    replayed: bool = False
+    saved: bool = False
+
+
+class RecordingTiming(OpenResult):
+    status: str
+    complete: bool
+    file_path: str
+    sample_rate: int
+    channels: int
+    measured_hit_count: int
+    median_offset_ms: float | None
+    jitter_stddev_ms: float | None
+    jitter_peak_to_peak_ms: float | None
+    hits: list[dict[str, Any]]
+
+
 class EditTargets(OpenResult):
     session_id: str
     revision: str

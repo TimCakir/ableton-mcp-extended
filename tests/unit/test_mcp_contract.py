@@ -100,6 +100,11 @@ def test_discovery_exposes_structured_results_and_conservative_annotations():
             assert "operation_id" in tools["get_automation_record_status"].outputSchema["properties"]
             assert "outputs" in tools["get_automation_record_status"].outputSchema["properties"]
             assert "remote_script_build" in tools["get_build_info"].outputSchema["properties"]
+            for name in ("get_latency_report", "analyze_recording_timing"):
+                assert tools[name].annotations.readOnlyHint is True
+                assert tools[name].outputSchema["properties"]["complete"]["type"] == "boolean"
+            assert tools["configure_monitoring"].annotations.readOnlyHint is False
+            assert tools["configure_monitoring"].inputSchema["properties"]["action"]["enum"] == ["preview", "apply", "restore"]
         asyncio.run(main())
     ''')
 
@@ -116,6 +121,39 @@ def test_missing_build_identity_is_unknown_not_matching():
         assert data["status"] == "unknown", data
         assert data["remote_script_build"] is None
         assert data["protocol_version"] is None
+    ''')
+
+
+def test_incomplete_latency_evidence_and_partial_monitoring_survive_sdk_validation():
+    _run('''
+        import asyncio
+        import mcp.types as types
+        from MCP_Server import server
+        class FakeConnection:
+            def connect(self): return True
+            def send_command(self, command, *args):
+                if command == "get_latency_report":
+                    return {"status":"incomplete","complete":False,"session_id":"set1",
+                        "tracks":[],"master":None,"findings":[],
+                        "read_errors":[{"field":"master_track","message":"unavailable","unavailable":True}]}
+                return {"status":"partial","plan_id":"plan1","session_id":"set1",
+                    "monitoring_path":"direct","track_count":1,"tracks":[{"track_handle":"voice"}],
+                    "rollback_verified":False,"rollback_errors":["recording started"]}
+        server._ableton_connection = FakeConnection()
+        async def main():
+            for name, args in (("get_latency_report", {"session_id":"set1"}),
+                               ("configure_monitoring", {"action":"apply","session_id":"set1","plan_id":"plan1"})):
+                request = types.CallToolRequest(params=types.CallToolRequestParams(name=name, arguments=args))
+                response = (await server.mcp._mcp_server.request_handlers[types.CallToolRequest](request)).root
+                assert response.isError == (name == "configure_monitoring"), response
+                data = response.structuredContent
+                if name == "get_latency_report":
+                    assert data["master"] is None and not data["complete"]
+                    assert data["read_errors"][0]["field"] == "master_track"
+                else:
+                    assert data["rollback_verified"] is False
+                    assert data["rollback_errors"] == ["recording started"]
+        asyncio.run(main())
     ''')
 
 

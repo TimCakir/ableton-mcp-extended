@@ -4,9 +4,10 @@ import math
 from typing import Any, Literal
 
 from MCP_Server.audio_analysis import analyze_audio_file as analyze_file
+from MCP_Server.timing_analysis import analyze_recording_timing as analyze_timing
 from MCP_Server.workflow_models import (
     ArrangementBuild, AudioAnalysis, CommandStatus, EditTargets, ExportVerification, SessionSnapshot,
-    SnapshotComparison, TrackEdit,
+    SnapshotComparison, TrackEdit, LatencyReport, MonitoringSetup, RecordingTiming,
 )
 
 
@@ -61,6 +62,71 @@ def prepare_track_edit(property_name: str, value: Any, send_index: int = 0) -> t
 
 
 def register_workflow_tools(mcp, get_connection):
+    @mcp.tool()
+    def get_latency_report(session_id: str, track_handles: list[str] | None = None) -> LatencyReport:
+        """Inspect device-reported latency, monitoring and routes in the current Set.
+
+        First get_edit_targets for current session_id and stable handles. Omit handles
+        for all tracks, or choose regular tracks; their parent groups, all returns and
+        Main are included. Nested racks are inventoried with explicit errors/limits.
+        Top-level device-chain totals include inactive devices, whose latency Live
+        retains. Child latencies are not added again. These are device reports, not
+        measured total monitoring or hardware round-trip latency. Buffer, driver,
+        compensation preferences and hardware clock settings remain manual/unknown.
+        Reads on Live's execution thread. Does not change or play the Set.
+        """
+        return get_connection().send_command("get_latency_report", {
+            "session_id": session_id, "track_handles": track_handles})
+
+    @mcp.tool()
+    def configure_monitoring(action: Literal["preview", "apply", "restore"], session_id: str,
+                             track_handles: list[str] | None = None,
+                             monitoring_path: Literal["live", "direct"] | None = None,
+                             plan_id: str = "") -> MonitoringSetup:
+        """Preview, apply and restore monitoring for 1..32 regular audio tracks.
+
+        Preview requires current get_edit_targets session_id/track_handles and a path:
+        live sets Monitor Auto (armed tracks monitor through Live); direct sets Off
+        for an already-configured interface/Console monitoring path. This controls
+        Live only; verify the external feed separately. It does not arm, route, save,
+        adjust gain, bypass devices or change buffer/clock/latency preferences.
+        Apply within five minutes using only the returned session_id and plan_id.
+        Poll apply with that same plan while status=applying; repeated terminal calls
+        replay without writes. Restore uses the same plan and polls while restoring.
+        Restore is retained until script restart or eviction from a 32-plan cache.
+        Writes reject recording, stale Set/track identities, frozen targets and changed
+        monitor/arm/routing context; all tracks are preflighted before any write.
+        Next-tick readback is required for applied/restored. Pending deadline is 30s;
+        callbacks and polling attempt guarded rollback on failure. partial means
+        rollback could not be verified. Changes made since apply are not overwritten.
+        """
+        return get_connection().send_command("configure_monitoring", {
+            "action": action, "session_id": session_id, "track_handles": track_handles,
+            "monitoring_path": monitoring_path, "plan_id": plan_id})
+
+    @mcp.tool()
+    def analyze_recording_timing(path: str, expected_onsets_seconds: list[float],
+                                 search_window_ms: float = 100.0, threshold_dbfs: float = -40.0,
+                                 min_separation_ms: float = 50.0, channel: int = 1,
+                                 skip_initial: int = 2) -> RecordingTiming:
+        """Measure isolated recorded test hits against supplied file-relative times.
+
+        Local finished uncompressed PCM WAV, 8/16/24/32-bit, 8..192 kHz, 1..64 channels;
+        selects one 1-based channel without resampling. Supply 3..400 increasing times
+        whose symmetric search windows do not overlap. Final window must fit the file
+        and first 120s; at most 12 million frames are scanned. No optional dependencies.
+        Detects absolute-amplitude threshold edges after continuous below-threshold
+        min_separation_ms. Use isolated hits with silence, not a musical full mix.
+        Missing/ambiguous/boundary hits are reported and excluded, as are skip_initial
+        startup hits (default 2). At least 3 accepted hits are required for statistics.
+        Positive median offset means a late recorded edge; jitter reports sample SD
+        and peak-to-peak spread. Attack/noise/threshold affect results. This measures
+        recorded alignment, not heard monitoring or total hardware round-trip latency,
+        and does not suggest a universal clock/track-delay correction or change Live.
+        """
+        return analyze_timing(path, expected_onsets_seconds, search_window_ms, threshold_dbfs,
+                              min_separation_ms, channel, skip_initial)
+
     @mcp.tool()
     def build_arrangement(action: Literal["preview", "apply"], session_id: str,
                           placements: list[dict[str, Any]] | None = None,

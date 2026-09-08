@@ -13,6 +13,8 @@ import uuid
 import math
 from collections import Counter, OrderedDict
 from .arrangement_builder import build_arrangement as _build_arrangement_plan
+from .latency_report import get_report as _get_latency_report
+from .monitoring_setup import configure as _configure_monitoring
 
 # Change queue import for Python 2
 try:
@@ -35,7 +37,7 @@ _REQUEST_INIT_LOCK = threading.RLock()
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-09-08.7"
+BUILD_ID = "2026-09-08.8"
 try:
     with open(__file__, "rb") as _source_file:
         LOADED_SOURCE_SHA256 = hashlib.sha256(_source_file.read()).hexdigest()
@@ -620,7 +622,7 @@ class AbletonMCP(ControlSurface):
                                  "create_cue_point", "delete_cue_point",
                                  "create_arrangement_clip", "create_arrangement_audio_clip",
                                  "duplicate_to_arrangement", "delete_arrangement_clip",
-                                 "build_arrangement",
+                                 "build_arrangement", "get_latency_report", "configure_monitoring",
                                  "set_arrangement_clip_property",
                                  "set_view", "control_arrangement_view",
                                  "manage_clip_automation",
@@ -1235,6 +1237,14 @@ class AbletonMCP(ControlSurface):
                             result = _build_arrangement_plan(
                                 self, params.get("action"), params.get("session_id"),
                                 params.get("placements"), params.get("plan_id", ""))
+                        elif command_type == "get_latency_report":
+                            result = _get_latency_report(
+                                self, params.get("session_id"), params.get("track_handles"))
+                        elif command_type == "configure_monitoring":
+                            result = _configure_monitoring(
+                                self, params.get("action"), params.get("session_id"),
+                                params.get("track_handles"), params.get("monitoring_path"),
+                                params.get("plan_id", ""))
                         elif command_type == "delete_arrangement_clip":
                             ti = params.get("track_index", 0)
                             ci = params.get("clip_index", None)

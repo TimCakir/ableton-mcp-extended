@@ -45,7 +45,7 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-09-08.1"
+SERVER_BUILD_ID = "2026-09-08.4"
 
 
 def _source_sha256(path):
@@ -5908,8 +5908,8 @@ def create_arrangement_audio_clip(
     Parameters:
     - track_index: Track number (1-based).
     - file_path: Path to the audio file.
-    - start_bar: Start bar (1-based).
-    - start_beat: Start position in beats.
+    - start_bar: Start bar (1-based). A positive value takes precedence.
+    - start_beat: Absolute zero-based beat position when start_bar=0; fractions work.
     """
     try:
         ableton = get_ableton_connection()
@@ -5940,8 +5940,8 @@ def duplicate_clip_to_arrangement(
     Parameters:
     - track_index: Track number (1-based).
     - clip_index: Session clip slot (1-based).
-    - destination_bar: Destination bar (1-based).
-    - destination_beat: Destination beat.
+    - destination_bar: Destination bar (1-based). A positive value takes precedence.
+    - destination_beat: Absolute zero-based beats when destination_bar=0; fractions work.
     """
     try:
         ableton = get_ableton_connection()

@@ -1,4 +1,4 @@
-"""Preview and place bounded MIDI clip plans on Live's execution thread.
+"""Preview and place bounded MIDI and audio plans on Live's execution thread.
 
 Plans retain Live object references. They are process-local, expire quickly and
 never use track/clip positions as identity after preview. No Live imports are
@@ -13,6 +13,8 @@ import time
 import uuid
 from collections import OrderedDict
 
+from . import audio_arrangement, midi_variations
+
 
 MAX_PLACEMENTS = 64
 MAX_PLAN_NOTES = 10000
@@ -24,7 +26,12 @@ _CLIP_FIELDS = ("name", "length", "looping", "loop_start", "loop_end",
 
 
 def _same(left, right):
-    return left is right or left == right
+    if left is right:
+        return True
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
 
 
 def _contains(objects, target):
@@ -55,8 +62,12 @@ def _notes(remote, clip):
 
 
 def _source(remote, clip):
+    if getattr(clip, "is_audio_clip", False):
+        return audio_arrangement.capture_source(clip, remote._song)
     if not getattr(clip, "is_midi_clip", False):
-        raise ValueError("Only session MIDI clips are supported")
+        raise ValueError("Only session MIDI or audio clips are supported")
+    if getattr(clip, "is_recording", False):
+        raise ValueError("Recording sources cannot be copied")
     try:
         envelopes = clip.has_envelopes
     except Exception as exc:
@@ -69,7 +80,7 @@ def _source(remote, clip):
     fingerprint = hashlib.sha256(json.dumps(
         {"clip": metadata, "notes": notes}, sort_keys=True,
         allow_nan=False).encode("utf-8")).hexdigest()
-    return {"metadata": metadata, "notes": notes, "fingerprint": fingerprint}
+    return {"kind": "midi", "metadata": metadata, "notes": notes, "fingerprint": fingerprint}
 
 
 def _arrangement(track):
@@ -79,9 +90,20 @@ def _arrangement(track):
     return clips
 
 
+def _bounds(clips):
+    return [(clip, _number(clip.start_time, "existing clip start"),
+             _number(clip.end_time, "existing clip end", positive=True)) for clip in clips]
+
+
+def _unchanged_bounds(current, originals):
+    for clip, start, end in originals:
+        if (not _contains(current, clip) or clip.start_time != start or clip.end_time != end):
+            raise RuntimeError("Existing arrangement material was removed or its bounds changed")
+
+
 def _check_ranges(entries):
     for index, entry in enumerate(entries):
-        start, end = entry["start"], entry["end"]
+        start, end = entry["start"], entry["reserved_end"]
         existing = _arrangement(entry["track"])
         additions = sum(1 for other in entries if _same(other["track"], entry["track"]))
         if len(existing) + additions > MAX_EXISTING_CLIPS:
@@ -95,7 +117,8 @@ def _check_ranges(entries):
                 raise ValueError("Placement {0} overlaps existing arrangement clip '{1}'".format(
                     index + 1, clip.name))
         for other in entries[:index]:
-            if _same(entry["track"], other["track"]) and other["start"] < end and other["end"] > start:
+            if (_same(entry["track"], other["track"]) and other["start"] < end
+                    and other["reserved_end"] > start):
                 raise ValueError("Placement {0} overlaps another proposed placement".format(index + 1))
 
 
@@ -113,27 +136,53 @@ def _targets(remote, session_id):
     return targets
 
 
+def _check_recording(remote, song):
+    if (getattr(remote, "_auto_rec", None) or {}).get("active"):
+        raise ValueError("Finish or cancel the active recording job before placing arrangement clips")
+    try:
+        recording = song.record_mode or song.session_record
+    except Exception as exc:
+        raise ValueError("Live recording state cannot be verified: " + str(exc))
+    if recording:
+        raise ValueError("Disable Live arrangement/session recording before placing arrangement clips")
+
+
 def _public(entry, index):
-    return {"index": index + 1, "track_handle": entry["handle"],
+    row = {"index": index + 1, "track_handle": entry["handle"],
             "track_name": entry["track"].name, "source_slot": entry["slot"] + 1,
             "source_name": entry["source"]["metadata"]["name"],
+            "kind": entry["source"]["kind"], "name": entry["name"],
             "destination_beat": entry["start"], "end_beat": entry["end"],
+            "reserved_end_beat": entry["reserved_end"],
             "length_beats": entry["end"] - entry["start"],
             "note_count": len(entry["source"]["notes"]),
             "source_fingerprint": entry["source"]["fingerprint"]}
+    if entry.get("variation") is not None:
+        variation = entry["variation"]
+        row.update(variation=variation["variation"], notes=copy.deepcopy(variation["notes"]),
+                   source_note_count=len(entry["source"]["notes"]),
+                   note_count=len(variation["notes"]))
+    if entry.get("audio") is not None:
+        row["source_range"] = copy.deepcopy(entry["audio"]["source_range"])
+    return row
 
 
 def _preview(remote, session_id, placements, plans):
+    _check_pending(plans)
     if not isinstance(placements, list) or not 1 <= len(placements) <= MAX_PLACEMENTS:
         raise ValueError("placements must contain 1 to 64 entries")
     targets = _targets(remote, session_id)
     song = remote._song
+    _check_recording(remote, song)
     rows = {row["track_handle"]: row for row in targets["tracks"]}
     entries, note_count = [], 0
     for placement in placements:
-        if not isinstance(placement, dict) or set(placement) != {
-                "track_handle", "source_slot", "destination_beat"}:
-            raise ValueError("Each placement requires only track_handle, source_slot and destination_beat")
+        required = {"track_handle", "source_slot", "destination_beat"}
+        optional = {"variation", "source_range", "name"}
+        if (not isinstance(placement, dict) or not required.issubset(placement)
+                or set(placement) - required - optional):
+            raise ValueError("Each placement requires track_handle, source_slot and destination_beat; "
+                             "optional fields are variation, source_range and name")
         handle = placement["track_handle"]
         if not isinstance(handle, str) or handle not in rows or rows[handle]["kind"] != "track":
             raise ValueError("Placement requires a current regular track handle")
@@ -147,14 +196,32 @@ def _preview(remote, session_id, placements, plans):
             raise ValueError("Source slot is empty or out of range")
         clip = slots[slot_index - 1].clip
         source = _source(remote, clip)
+        name = placement.get("name", source["metadata"]["name"])
+        if "name" in placement and (not isinstance(name, str) or not name.strip() or len(name) > 1024):
+            raise ValueError("name must be nonempty text of at most 1024 characters")
+        variation, audio = None, None
+        if source["kind"] == "midi":
+            if "source_range" in placement:
+                raise ValueError("source_range applies only to audio clips")
+            if "variation" in placement:
+                variation = midi_variations.prepare_variation(
+                    [json.loads(row) for row in source["notes"]], placement["variation"])
+            length = reserved_length = source["metadata"]["length"]
+        else:
+            if "variation" in placement:
+                raise ValueError("variation applies only to MIDI clips")
+            audio = audio_arrangement.prepare_audio(source, placement.get("source_range"))
+            length, reserved_length = audio["length_beats"], audio["reserved_length_beats"]
         note_count += len(source["notes"])
         if note_count > MAX_PLAN_NOTES:
             raise ValueError("Plan exceeds the 10000-note verification limit")
         start = _number(placement["destination_beat"], "destination_beat")
-        end = _number(start + source["metadata"]["length"], "placement end", positive=True)
+        end = _number(start + length, "placement end", positive=True)
+        reserved_end = _number(start + reserved_length, "reserved end", positive=True)
         entries.append({"handle": handle, "track": track, "clip": clip,
                         "slot": slot_index - 1, "source": source,
-                        "start": start, "end": end})
+                        "start": start, "end": end, "reserved_end": reserved_end,
+                        "name": name, "variation": variation, "audio": audio})
     _check_ranges(entries)
     if not _same(remote._song, song):
         raise ValueError("Set changed during preview; refresh the plan")
@@ -163,9 +230,13 @@ def _preview(remote, session_id, placements, plans):
     result = {"status": "preview", "plan_id": plan_id, "session_id": session_id,
               "expires_in_seconds": PLAN_TTL_SECONDS,
               "placements": [_public(entry, i) for i, entry in enumerate(entries)],
-              "placement_count": len(entries), "note_count": note_count,
-              "warnings": ["Copies session MIDI clips on their own tracks. No source changes, playback or file save.",
-                           "Source guards cover clip metadata and exposed MIDI note values; per-note expression is not inspected."]}
+              "placement_count": len(entries), "source_note_count": note_count,
+              "note_count": sum(len(entry["variation"]["notes"]) if entry["variation"] is not None
+                                else len(entry["source"]["notes"]) for entry in entries),
+              "warnings": ["Copies session clips on their own tracks. No source changes, playback or file save.",
+                           "MIDI guards cover exposed note values; per-note expression is not inspected.",
+                           "Audio requires empty space through reserved_end_beat, including temporary copy and trim bounds. "
+                           "Audio files are guarded by file identity metadata, not a content hash."]}
     while len(plans) >= MAX_PLANS:
         plans.popitem(last=False)
     plans[plan_id] = {"song": song, "session_id": session_id, "created": now,
@@ -177,8 +248,7 @@ def _validate_plan(remote, plan, session_id):
     targets = _targets(remote, session_id)
     if plan["session_id"] != session_id or not _same(remote._song, plan["song"]):
         raise ValueError("Plan belongs to a different Set instance")
-    if (getattr(remote, "_auto_rec", None) or {}).get("active"):
-        raise ValueError("Finish or cancel the active recording job before placing arrangement clips")
+    _check_recording(remote, plan["song"])
     for entry in plan["entries"]:
         handle, track = entry["handle"], entry["track"]
         if handle not in remote._target_refs or not _same(remote._target_refs[handle], track):
@@ -196,6 +266,107 @@ def _validate_plan(remote, plan, session_id):
     return targets
 
 
+def _check_pending(plans, current=None):
+    if any(plan is not current and plan["status"] == "applying" for plan in plans.values()):
+        raise ValueError("Another arrangement plan is applying; poll its apply result before starting a new plan")
+
+
+def _rollback(remote, plan, exc, owned, placed, initial, undo_song=None):
+    rollback_errors = []
+    if undo_song is None and _same(remote._song, plan["song"]):
+        try:
+            undo_song = remote._begin_note_undo()
+        except Exception as undo_exc:
+            rollback_errors.append("Could not open rollback undo group: " + str(undo_exc))
+    for track, clip in reversed(owned):
+        try:
+            if not _same(remote._song, plan["song"]) or not _contains(tuple(plan["song"].tracks), track):
+                raise RuntimeError("Owning Set or track is no longer available")
+            if _contains(_arrangement(track), clip):
+                track.delete_clip(clip)
+            if _contains(_arrangement(track), clip):
+                raise RuntimeError("Created clip remains after rollback")
+        except Exception as rollback_exc:
+            rollback_errors.append(str(rollback_exc))
+    for track, originals in initial:
+        try:
+            current = _arrangement(track)
+            _unchanged_bounds(current, originals)
+            original_clips = [clip for clip, _start, _end in originals]
+            if any(not _contains(original_clips, clip) for clip in current):
+                rollback_errors.append("New arrangement material remains after failed copy")
+        except Exception as rollback_exc:
+            rollback_errors.append("Cannot verify original arrangement: " + str(rollback_exc))
+    if undo_song is not None:
+        try:
+            undo_song.end_undo_step()
+        except Exception as undo_exc:
+            rollback_errors.append("Could not close undo group: " + str(undo_exc))
+    result = {"status": "partial" if rollback_errors else "error", "plan_id": plan["result"]["plan_id"],
+              "session_id": plan["session_id"], "message": str(exc),
+              "placements": [dict(row, status="rollback_unverified" if rollback_errors else "rolled_back")
+                             for row in placed],
+              "placement_count": len(plan["entries"]), "completed_before_failure": len(placed),
+              "rollback_verified": not rollback_errors, "rollback_errors": rollback_errors,
+              "replayed": False, "saved": False}
+    plan["status"], plan["result"] = result["status"], result
+    return copy.deepcopy(result)
+
+
+def _finish(remote, plan, owned, placed, initial):
+    """Read back settled clips; unwarped audio invokes this on the next tick."""
+    try:
+        _targets(remote, plan["session_id"])
+        if not _same(remote._song, plan["song"]):
+            raise RuntimeError("Set changed before arrangement verification")
+        _check_recording(remote, plan["song"])
+        verified = []
+        for index, (entry, (track, clip)) in enumerate(zip(plan["entries"], owned)):
+            if (not _contains(tuple(plan["song"].tracks), track)
+                    or not _same(remote._target_refs.get(entry["handle"]), track)
+                    or not _contains(_arrangement(track), clip)):
+                raise RuntimeError("Placed clip or owning track disappeared before verification")
+            _eligible(track)
+            slots = tuple(track.clip_slots)
+            if (entry["slot"] >= len(slots) or not slots[entry["slot"]].has_clip
+                    or not _same(slots[entry["slot"]].clip, entry["clip"])
+                    or _source(remote, entry["clip"])["fingerprint"] != entry["source"]["fingerprint"]):
+                raise RuntimeError("Source changed before arrangement verification")
+            start = _number(clip.start_time, "placed clip start")
+            end = _number(clip.end_time, "placed clip end", positive=True)
+            if abs(start - entry["start"]) > 0.00001 or abs(end - entry["end"]) > 0.00001:
+                raise RuntimeError(
+                    "Placement {0} bounds differ from preview: expected {1}..{2}, got {3}..{4}".format(
+                        index + 1, entry["start"], entry["end"], start, end))
+            if clip.name != entry["name"]:
+                raise RuntimeError("Placed clip name differs from the preview")
+            verification = {}
+            if entry["audio"] is not None:
+                verification = audio_arrangement.verify_audio(
+                    clip, entry["source"], entry["audio"], expected_name=entry["name"])
+            else:
+                expected = (sorted(json.dumps(row, sort_keys=True, allow_nan=False)
+                                   for row in entry["variation"]["notes"])
+                            if entry["variation"] is not None else entry["source"]["notes"])
+                if _notes(remote, clip) != expected:
+                    raise RuntimeError("Placed MIDI note values changed before verification")
+            row = _public(entry, index)
+            row.update(verification)
+            row.update(status="verified", actual_start_beat=start, actual_end_beat=end, actual_name=clip.name)
+            verified.append(row)
+        if len(verified) != len(plan["entries"]):
+            raise RuntimeError("Not every placement could be identified for verification")
+        for track, originals in initial:
+            _unchanged_bounds(_arrangement(track), originals)
+        result = {"status": "applied", "plan_id": plan["result"]["plan_id"],
+                  "session_id": plan["session_id"], "placements": verified,
+                  "placement_count": len(verified), "replayed": False, "saved": False}
+        plan["status"], plan["result"] = "applied", result
+        return copy.deepcopy(result)
+    except Exception as exc:
+        return _rollback(remote, plan, exc, owned, placed, initial)
+
+
 def _apply(remote, session_id, plan_id, plans):
     plan = plans.get(plan_id)
     if plan is None:
@@ -203,7 +374,7 @@ def _apply(remote, session_id, plan_id, plans):
     _targets(remote, session_id)
     if plan["session_id"] != session_id or not _same(remote._song, plan["song"]):
         raise ValueError("Plan belongs to a different Set instance")
-    if plan["status"] in ("applied", "error", "partial"):
+    if plan["status"] in ("applying", "applied", "error", "partial"):
         result = copy.deepcopy(plan["result"])
         result["replayed"] = True
         return result
@@ -211,12 +382,15 @@ def _apply(remote, session_id, plan_id, plans):
         raise ValueError("Plan expired; create a new preview")
     if plan["status"] != "preview":
         raise ValueError("Plan is already applying; reconcile the original request before continuing")
+    _check_pending(plans, current=plan)
     _validate_plan(remote, plan, session_id)
-    owned, placed, rollback_errors = [], [], []
+    owned, placed = [], []
+    deferred = any(entry["audio"] is not None and not entry["source"]["metadata"]["warping"]
+                   for entry in plan["entries"])
     initial = []
     for entry in plan["entries"]:
         if not any(_same(track, entry["track"]) for track, _clips in initial):
-            initial.append((entry["track"], _arrangement(entry["track"])))
+            initial.append((entry["track"], _bounds(_arrangement(entry["track"]))))
     plan["status"] = "applying"
     undo_song = None
     try:
@@ -224,6 +398,8 @@ def _apply(remote, session_id, plan_id, plans):
         for index, entry in enumerate(plan["entries"]):
             track = entry["track"]
             before = _arrangement(track)
+            before_bounds = _bounds(before)
+            verification = {}
             try:
                 track.duplicate_clip_to_arrangement(entry["clip"], entry["start"])
             finally:
@@ -235,56 +411,54 @@ def _apply(remote, session_id, plan_id, plans):
             clip = created[0]
             if not all(_contains(after, old) for old in before):
                 raise RuntimeError("Copy unexpectedly replaced existing arrangement material")
+            _unchanged_bounds(after, before_bounds)
             actual_start = _number(clip.start_time, "placed clip start")
             actual_end = _number(clip.end_time, "placed clip end", positive=True)
-            if abs(actual_start - entry["start"]) > 0.00001 or abs(actual_end - entry["end"]) > 0.00001:
-                raise RuntimeError("Placed clip bounds differ from the preview")
-            if _notes(remote, clip) != entry["source"]["notes"]:
-                raise RuntimeError("Placed MIDI note values differ from the preview")
+            if entry["audio"] is not None:
+                if (abs(actual_start - entry["start"]) > 0.00001 or actual_end <= actual_start
+                        or actual_end > entry["reserved_end"] + 0.00001):
+                    raise RuntimeError("Initial audio copy bounds exceed the reserved range")
+                verification = audio_arrangement.apply_audio(clip, entry["source"], entry["audio"])
+                actual_start = _number(clip.start_time, "trimmed clip start")
+                actual_end = _number(clip.end_time, "trimmed clip end", positive=True)
+            unwarped = entry["audio"] is not None and not entry["source"]["metadata"]["warping"]
+            if (abs(actual_start - entry["start"]) > 0.00001
+                    or (not unwarped and abs(actual_end - entry["end"]) > 0.00001)
+                    or actual_end <= actual_start or actual_end > entry["reserved_end"] + 0.00001):
+                raise RuntimeError(
+                    "Placement {0} bounds differ from preview: expected {1}..{2}, got {3}..{4}".format(
+                        index + 1, entry["start"], entry["end"], actual_start, actual_end))
+            if entry["source"]["kind"] == "midi":
+                if _notes(remote, clip) != entry["source"]["notes"]:
+                    raise RuntimeError("Placed MIDI note values differ from the source")
+                if entry["variation"] is not None:
+                    midi_variations.apply_variation(remote, clip, entry["variation"]["variation"],
+                                                    entry["variation"]["notes"])
+            if clip.name != entry["name"]:
+                clip.name = entry["name"]
+            if clip.name != entry["name"]:
+                raise RuntimeError("Placed clip name differs from the preview")
+            if _source(remote, entry["clip"])["fingerprint"] != entry["source"]["fingerprint"]:
+                raise RuntimeError("Source changed while placing the copy")
+            _unchanged_bounds(_arrangement(track), before_bounds)
             record = _public(entry, index)
-            record.update(status="verified", actual_start_beat=clip.start_time,
+            record.update(verification)
+            record.update(status="awaiting_verification" if deferred else "verified", actual_start_beat=clip.start_time,
                           actual_end_beat=clip.end_time, actual_name=clip.name)
             placed.append(record)
         if undo_song is not None:
             undo_song.end_undo_step()
             undo_song = None
-        result = {"status": "applied", "plan_id": plan_id, "session_id": session_id,
-                  "placements": placed, "placement_count": len(placed),
-                  "replayed": False, "saved": False}
+        if deferred:
+            plan["result"] = {"status": "applying", "plan_id": plan_id, "session_id": session_id,
+                              "placements": placed, "placement_count": len(placed),
+                              "message": "Waiting for Live to settle audio bounds. Poll apply with this same plan_id; do not submit another plan.",
+                              "replayed": False, "saved": False}
+            remote.schedule_message(1, lambda: _finish(remote, plan, owned, placed, initial))
+            return copy.deepcopy(plan["result"])
+        return _finish(remote, plan, owned, placed, initial)
     except Exception as exc:
-        for track, clip in reversed(owned):
-            try:
-                if not _same(remote._song, plan["song"]) or not _contains(tuple(plan["song"].tracks), track):
-                    raise RuntimeError("Owning Set or track is no longer available")
-                if _contains(_arrangement(track), clip):
-                    track.delete_clip(clip)
-                if _contains(_arrangement(track), clip):
-                    raise RuntimeError("Created clip remains after rollback")
-            except Exception as rollback_exc:
-                rollback_errors.append(str(rollback_exc))
-        for track, originals in initial:
-            try:
-                current = _arrangement(track)
-                if not all(_contains(current, clip) for clip in originals):
-                    rollback_errors.append("Original arrangement material is missing after failed copy")
-                if any(not _contains(originals, clip) for clip in current):
-                    rollback_errors.append("New arrangement material remains after failed copy")
-            except Exception as rollback_exc:
-                rollback_errors.append("Cannot verify original arrangement: " + str(rollback_exc))
-        if undo_song is not None:
-            try:
-                undo_song.end_undo_step()
-            except Exception as undo_exc:
-                rollback_errors.append("Could not close undo group: " + str(undo_exc))
-        result = {"status": "partial" if rollback_errors else "error", "plan_id": plan_id,
-                  "session_id": session_id, "message": str(exc),
-                  "placements": [dict(row, status="rollback_unverified" if rollback_errors else "rolled_back")
-                                 for row in placed],
-                  "placement_count": len(plan["entries"]),
-                  "completed_before_failure": len(placed), "rollback_verified": not rollback_errors,
-                  "rollback_errors": rollback_errors, "replayed": False, "saved": False}
-    plan["status"], plan["result"] = result["status"], result
-    return copy.deepcopy(result)
+        return _rollback(remote, plan, exc, owned, placed, initial, undo_song)
 
 
 def build_arrangement(remote, action, session_id, placements=None, plan_id=""):

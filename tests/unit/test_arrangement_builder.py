@@ -19,6 +19,10 @@ from AbletonMCP_Remote_Script import AbletonMCP
 from AbletonMCP_Remote_Script import arrangement_builder as builder
 
 
+class NativeVector(list):
+    """Represent the Live-owned vector required for note modification."""
+
+
 class Clip:
     def __init__(self, name="Pattern", start=0.0, length=4.0):
         self.name, self.length = name, length
@@ -31,9 +35,36 @@ class Clip:
         self.notes = [types.SimpleNamespace(pitch=60, start_time=0.0, duration=0.25,
             velocity=90.0, mute=False, note_id=1, probability=1.0,
             velocity_deviation=0.0, release_velocity=64.0)]
+        self.note_remove_failure = self.note_modify_failure = None
+        self.note_remove_calls = self.note_modify_calls = 0
 
     def get_all_notes_extended(self):
-        return copy.deepcopy(self.notes)
+        vector = NativeVector(copy.deepcopy(self.notes))
+        vector.owner = self
+        return vector
+
+    def remove_notes_by_id(self, ids):
+        self.note_remove_calls += 1
+        if self.note_remove_failure == "before":
+            raise RuntimeError("note removal failed before mutation")
+        if self.note_remove_failure != "silent":
+            selected = ids[:1] if self.note_remove_failure == "partial" else ids
+            self.notes = [note for note in self.notes if note.note_id not in selected]
+        if self.note_remove_failure == "partial":
+            raise RuntimeError("note removal failed after partial mutation")
+
+    def apply_note_modifications(self, vector):
+        assert isinstance(vector, NativeVector) and vector.owner is self
+        assert {note.note_id for note in vector} == {note.note_id for note in self.notes}
+        self.note_modify_calls += 1
+        if self.note_modify_failure == "before":
+            raise RuntimeError("note modification failed before mutation")
+        if self.note_modify_failure != "silent":
+            selected = vector[:1] if self.note_modify_failure == "partial" else vector
+            updates = {note.note_id: note for note in selected}
+            self.notes = [copy.deepcopy(updates.get(note.note_id, note)) for note in self.notes]
+        if self.note_modify_failure == "partial":
+            raise RuntimeError("note modification failed after partial mutation")
 
 
 class Track:
@@ -53,7 +84,8 @@ class Track:
             return
         duplicate = copy.deepcopy(clip)
         duplicate.start_time, duplicate.end_time = start, start + clip.length
-        duplicate.notes[0].note_id += 100
+        for note in duplicate.notes:
+            note.note_id += 100
         self.arrangement_clips.append(duplicate)
         if self.copy_failure == (self.copy_calls, "after"):
             raise RuntimeError("copy failed after insertion")
@@ -61,6 +93,10 @@ class Track:
             duplicate.end_time += 1
         if self.copy_failure == (self.copy_calls, "wrong_notes"):
             duplicate.notes[0].pitch += 1
+        for phase in ("remove", "modify"):
+            for failure in ("before", "partial", "silent"):
+                if self.copy_failure == (self.copy_calls, "note_" + phase + "_" + failure):
+                    setattr(duplicate, "note_" + phase + "_failure", failure)
 
     def delete_clip(self, clip):
         self.delete_calls.append(clip)
@@ -74,6 +110,7 @@ class Song:
         self.tracks, self.return_tracks = [Track()], []
         self.name, self.file_path = "Test Lab", "/tmp/Test Lab.als"
         self.undo_started, self.undo_finished = 0, 0
+        self.record_mode = self.session_record = False
 
     def begin_undo_step(self):
         self.undo_started += 1
@@ -89,6 +126,8 @@ def remote():
     instance.log_message = lambda message: None
     instance._auto_rec = {"active": False}
     instance.running, instance._closing = True, False
+    instance._scheduled_callbacks = []
+    instance.schedule_message = lambda delay, callback: instance._scheduled_callbacks.append((delay, callback))
     return instance, song
 
 
@@ -107,6 +146,23 @@ def preview(instance, starts=(0.0,)):
 
 def apply(instance, plan):
     return builder.build_arrangement(instance, "apply", plan["session_id"], plan_id=plan["plan_id"])
+
+
+def settle_audio_bounds(instance):
+    """Model Live making arrangement edge updates observable on its next tick."""
+    for track in instance._song.tracks:
+        for clip in track.arrangement_clips:
+            if hasattr(clip, "_pending_end_time"):
+                clip.end_time = clip._pending_end_time
+                del clip._pending_end_time
+
+
+def drain_callbacks(instance):
+    settle_audio_bounds(instance)
+    while instance._scheduled_callbacks:
+        delay, callback = instance._scheduled_callbacks.pop(0)
+        assert delay == 1
+        callback()
 
 
 def test_preview_has_no_mutations_and_retains_resolved_ranges():
@@ -303,6 +359,45 @@ def test_new_destination_conflict_and_recording_rejected_before_any_copy():
     assert song.tracks[0].copy_calls == 0
 
 
+@pytest.mark.parametrize("action", ["preview", "apply"])
+@pytest.mark.parametrize("flag", ["record_mode", "session_record", "auto_recording_job"])
+def test_recording_guard_rejects_preview_and_apply_without_stopping_transport(action, flag):
+    instance, song = remote()
+    plan = preview(instance) if action == "apply" else None
+    stop_calls = []
+    song.is_playing = True
+    song.stop_playing = lambda: stop_calls.append("stopped")
+    if flag == "auto_recording_job":
+        instance._auto_rec["active"] = True
+    else:
+        setattr(song, flag, True)
+    with pytest.raises(ValueError, match="recording"):
+        apply(instance, plan) if plan else preview(instance)
+    assert song.tracks[0].copy_calls == song.undo_started == 0
+    assert song.is_playing is True and stop_calls == []
+    assert instance._auto_rec["active"] if flag == "auto_recording_job" else getattr(song, flag)
+
+
+@pytest.mark.parametrize("action", ["preview", "apply"])
+@pytest.mark.parametrize("flag", ["record_mode", "session_record"])
+def test_unreadable_recording_flag_fails_closed_without_copy_or_transport_changes(monkeypatch, action, flag):
+    instance, song = remote()
+    plan = preview(instance) if action == "apply" else None
+    stop_calls = []
+    song.is_playing = True
+    song.stop_playing = lambda: stop_calls.append("stopped")
+
+    def unavailable(_song):
+        raise RuntimeError("recording flag unavailable")
+
+    monkeypatch.setattr(Song, flag, property(unavailable), raising=False)
+    with pytest.raises(ValueError, match="recording"):
+        apply(instance, plan) if plan else preview(instance)
+    assert song.tracks[0].copy_calls == song.undo_started == 0
+    assert song.is_playing is True and stop_calls == []
+    assert song.__dict__[flag] is False
+
+
 def test_success_preserves_source_and_completed_plan_replays_without_copying():
     instance, song = remote()
     source = song.tracks[0].clip_slots[0].clip
@@ -453,3 +548,551 @@ def test_actual_mcp_discovery_and_partial_error_schema():
     result = subprocess.run([sys.executable, "-c", textwrap.dedent(source)], cwd=root,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def variation_source(song):
+    source = song.tracks[0].clip_slots[0].clip
+    source.notes = [types.SimpleNamespace(pitch=pitch, start_time=start, duration=0.25,
+        velocity=velocity, mute=False, note_id=index + 1, probability=0.8125,
+        velocity_deviation=-3.125, release_velocity=61.875)
+        for index, (pitch, start, velocity) in enumerate([
+            (64, 2.0, 88.125), (36, 0.0, 95.0), (60, 0.0, 80.75),
+            (36, 1.0, 96.0), (62, 1.0, 84.25), (67, 3.0, 91.5)])]
+    return source
+
+
+def test_variation_preview_reports_exact_result_and_apply_names_only_the_copy():
+    instance, song = remote()
+    source = variation_source(song)
+    original = copy.deepcopy(vars(source))
+    session, placements = request(instance, (0, 4))
+    placements[0].update(name="Breakdown", variation={"remove_pitches": [36],
+                          "keep_every": 2, "keep_offset": 1, "transpose": 7})
+    placements[1].update(name="Original phrase")
+    plan = builder.build_arrangement(instance, "preview", session, placements)
+    variation = plan["placements"][0]
+    expected = [dict(vars(source.notes[index]), pitch=source.notes[index].pitch + 7)
+                for index in (4, 5)]
+    for note in expected:
+        note.pop("note_id")
+    assert variation["notes"] == expected
+    assert variation["source_note_count"] == 6 and variation["note_count"] == 2
+    assert plan["source_note_count"] == 12 and plan["note_count"] == 8
+    assert variation["name"] == "Breakdown" and variation["kind"] == "midi"
+    assert vars(source) == original
+    assert song.tracks[0].copy_calls == song.undo_started == 0
+
+    # Mutating the returned preview cannot alter the retained plan.
+    variation["notes"][0]["pitch"] = 1
+    result = apply(instance, plan)
+    assert result["status"] == "applied"
+    copied, unchanged = song.tracks[0].arrangement_clips
+    assert copied.name == "Breakdown" and unchanged.name == "Original phrase"
+    actual = instance._serialise_notes(copied.get_all_notes_extended(), rounded=False)
+    for note in actual:
+        note.pop("note_id")
+    assert sorted(actual, key=lambda note: note["start_time"]) == expected
+    assert builder._notes(instance, unchanged) == builder._notes(instance, source)
+    assert vars(source) == original
+    assert copied.note_remove_calls == copied.note_modify_calls == 1
+    assert unchanged.note_remove_calls == unchanged.note_modify_calls == 0
+    assert apply(instance, plan)["replayed"] is True
+    assert song.tracks[0].copy_calls == 2
+    assert song.undo_started == song.undo_finished == 1
+
+
+@pytest.mark.parametrize("variation", [
+    {"keep_every": 0}, {"keep_every": 2, "keep_offset": 2},
+    {"transpose": True}, {"transpose": 100}, {"remove_pitches": [128]},
+    {"randomize": True}, "remove kick",
+])
+def test_invalid_later_variation_rejects_whole_plan_without_edits(variation):
+    instance, song = remote()
+    source = variation_source(song)
+    original = copy.deepcopy(vars(source))
+    session, placements = request(instance, (0, 4))
+    placements[0]["variation"] = {"transpose": 7}
+    placements[1]["variation"] = variation
+    with pytest.raises(ValueError):
+        builder.build_arrangement(instance, "preview", session, placements)
+    assert vars(source) == original
+    assert song.tracks[0].copy_calls == song.undo_started == 0
+
+
+@pytest.mark.parametrize("name", [None, 42, True, "", "   ", "x" * 1025])
+def test_invalid_later_clip_name_is_preflighted(name):
+    instance, song = remote()
+    session, placements = request(instance, (0, 4))
+    placements[1]["name"] = name
+    with pytest.raises(ValueError, match="name must"):
+        builder.build_arrangement(instance, "preview", session, placements)
+    assert song.tracks[0].copy_calls == 0
+
+
+@pytest.mark.parametrize("phase", ["remove", "modify"])
+@pytest.mark.parametrize("failure", ["before", "partial", "silent"])
+def test_later_native_variation_failure_removes_all_owned_copies_only(phase, failure):
+    instance, song = remote()
+    source = variation_source(song)
+    original = copy.deepcopy(vars(source))
+    track = song.tracks[0]
+    keep = Clip("Unrelated arrangement", start=20)
+    track.arrangement_clips.append(keep)
+    session, placements = request(instance, (0, 4))
+    for placement in placements:
+        placement["variation"] = {"remove_pitches": [36], "transpose": 12}
+    plan = builder.build_arrangement(instance, "preview", session, placements)
+    track.copy_failure = (2, "note_" + phase + "_" + failure)
+    result = apply(instance, plan)
+    assert result["status"] == "error" and result["rollback_verified"]
+    assert result["completed_before_failure"] == 1
+    assert track.arrangement_clips == [keep]
+    assert keep not in track.delete_calls
+    assert len(track.delete_calls) == 2
+    assert vars(source) == original
+    assert song.undo_started == song.undo_finished == 1
+    assert apply(instance, plan)["replayed"] is True
+    assert track.copy_calls == 2
+
+
+def test_midi_variation_can_intentionally_place_an_empty_breakdown():
+    instance, song = remote()
+    session, placements = request(instance)
+    placements[0].update(name="Silent breakdown", variation={"remove_pitches": [60]})
+    result = apply(instance, builder.build_arrangement(instance, "preview", session, placements))
+    assert result["status"] == "applied"
+    assert song.tracks[0].arrangement_clips[0].notes == []
+    assert len(song.tracks[0].clip_slots[0].clip.notes) == 1
+
+
+class AudioClip:
+    """Simulate arrangement edge updates from marker edits without toggling warp."""
+
+    def __init__(self, file_path, warped=True):
+        self.name, self.file_path = "Recorded stem", str(file_path)
+        self.is_midi_clip, self.is_audio_clip = False, True
+        self.is_session_clip, self.is_arrangement_clip = True, False
+        self.has_envelopes = self.has_groove = self.is_recording = False
+        self.color, self.muted, self.gain = 32, False, 0.85
+        self.warping, self.warp_mode, self.looping = warped, 0, warped
+        self.pitch_coarse = self.pitch_fine = 0
+        self.sample_rate, self.sample_length = 44100, 441000
+        self.warp_markers = [types.SimpleNamespace(beat_time=0.0, sample_time=0.0),
+                             types.SimpleNamespace(beat_time=20.0, sample_time=10.0)]
+        self.length = 8.0
+        self.start_marker, self.end_marker = 2.0, 10.0
+        self._loop_start, self._loop_end = 2.0, 10.0
+        self.start_time, self.end_time = 0.0, 8.0
+        self.marker_failure = None
+
+    def _edge(self):
+        factor = 1 if self.warping else 2  # Fake Song's fixed 120 BPM.
+        end = self.start_time + (self._loop_end - self._loop_start) * factor
+        if getattr(self, "defer_bounds", False):
+            self._pending_end_time = end
+        else:
+            self.end_time = end
+
+    @property
+    def loop_start(self):
+        return self._loop_start
+
+    @loop_start.setter
+    def loop_start(self, value):
+        self._loop_start = self.start_marker = value
+        self._edge()
+        if self.marker_failure == "after_loop_start":
+            raise RuntimeError("audio trim failed after marker mutation")
+
+    @property
+    def loop_end(self):
+        return self._loop_end
+
+    @loop_end.setter
+    def loop_end(self, value):
+        self._loop_end = value
+        self._edge()
+
+
+class AudioTrack(Track):
+    def __init__(self, file_path, warped=True):
+        super().__init__("Recorded audio")
+        self.clip_slots[0].clip = AudioClip(file_path, warped)
+        self.defer_bounds = False
+
+    def duplicate_clip_to_arrangement(self, clip, start):
+        self.copy_calls += 1
+        duplicate = copy.deepcopy(clip)
+        duplicate.is_session_clip, duplicate.is_arrangement_clip = False, True
+        duplicate.defer_bounds = self.defer_bounds
+        duplicate.start_time, duplicate.end_time = start, start + clip.length
+        self.arrangement_clips.append(duplicate)
+        if self.copy_failure == (self.copy_calls, "trim"):
+            duplicate.marker_failure = "after_loop_start"
+        elif self.copy_failure == (self.copy_calls, "oversized"):
+            duplicate.end_time = start + 100
+
+
+def audio_remote(tmp_path, warped=True):
+    instance, song = remote()
+    audio_file = tmp_path / "stem.wav"
+    audio_file.write_bytes(b"nonempty audio file identity fixture")
+    song.tracks = [AudioTrack(audio_file, warped)]
+    song.tempo = 120.0
+    song.tempo_follower_enabled = song.is_ableton_link_enabled = False
+    song.master_track = types.SimpleNamespace(mixer_device=types.SimpleNamespace(
+        song_tempo=types.SimpleNamespace(automation_state=0)))
+    return instance, song
+
+
+def audio_plan(instance, starts=(0,), units="beats"):
+    session, placements = request(instance, starts)
+    for index, placement in enumerate(placements):
+        placement.update(name="Stem section " + str(index + 1),
+                         source_range={"start": 4.0, "end": 6.0, "units": units})
+    return builder.build_arrangement(instance, "preview", session, placements)
+
+
+@pytest.mark.parametrize("warped,units,length,reserved", [
+    (True, "beats", 2.0, 10.0), (False, "seconds", 4.0, 20.0),
+])
+def test_audio_plan_places_fractional_start_trims_names_and_preserves_source(
+        tmp_path, warped, units, length, reserved):
+    instance, song = audio_remote(tmp_path, warped)
+    source = song.tracks[0].clip_slots[0].clip
+    original = copy.deepcopy(vars(source))
+    plan = audio_plan(instance, (1.5,), units)
+    row = plan["placements"][0]
+    assert (row["destination_beat"], row["end_beat"], row["reserved_end_beat"]) == (
+        1.5, 1.5 + length, 1.5 + reserved)
+    assert row["kind"] == "audio" and row["note_count"] == 0
+    assert song.tracks[0].copy_calls == 0
+    result = apply(instance, plan)
+    if not warped:
+        assert result["status"] == "applying"
+        drain_callbacks(instance)
+        result = apply(instance, plan)
+    assert result["status"] == "applied"
+    placed = song.tracks[0].arrangement_clips[0]
+    assert (placed.start_time, placed.end_time) == (1.5, 1.5 + length)
+    assert (placed.loop_start, placed.loop_end, placed.start_marker, placed.end_marker) == (4, 6, 4, 6)
+    assert placed.name == "Stem section 1" and placed.looping is False
+    assert placed.warping is warped
+    assert vars(source) == original
+    assert apply(instance, plan)["replayed"] is True
+    assert song.tracks[0].copy_calls == 1
+
+
+@pytest.mark.parametrize("starts", [(0, 4), (4, 0)])
+def test_audio_reserved_span_blocks_proposed_overlap_outside_final_trim(tmp_path, starts):
+    instance, song = audio_remote(tmp_path)
+    with pytest.raises(ValueError, match="proposed placement"):
+        audio_plan(instance, starts)
+    assert song.tracks[0].copy_calls == 0
+
+
+def test_audio_reserved_span_blocks_current_clip_then_accepts_adjacent_footprint(tmp_path):
+    instance, song = audio_remote(tmp_path)
+    track = song.tracks[0]
+    keep = Clip("Keep beyond trimmed section", start=4)
+    track.arrangement_clips.append(keep)
+    with pytest.raises(ValueError, match="existing arrangement clip"):
+        audio_plan(instance)
+    assert track.copy_calls == 0
+    keep.start_time, keep.end_time = 20, 24
+    result = apply(instance, audio_plan(instance, (0, 10)))
+    assert result["status"] == "applied"
+    assert track.arrangement_clips[0] is keep
+    assert [(clip.start_time, clip.end_time) for clip in track.arrangement_clips[1:]] == [(0, 2), (10, 12)]
+
+
+def test_audio_destination_conflict_inserted_after_preview_rejects_before_copy(tmp_path):
+    instance, song = audio_remote(tmp_path)
+    plan = audio_plan(instance)
+    song.tracks[0].arrangement_clips.append(Clip("New material in reserved space", start=4))
+    with pytest.raises(ValueError, match="existing arrangement clip"):
+        apply(instance, plan)
+    assert song.tracks[0].copy_calls == 0
+
+
+@pytest.mark.parametrize("failure", ["trim", "oversized"])
+def test_later_audio_trim_failure_rolls_back_all_owned_copies_only(tmp_path, failure):
+    instance, song = audio_remote(tmp_path)
+    track = song.tracks[0]
+    source = track.clip_slots[0].clip
+    original = copy.deepcopy(vars(source))
+    keep = Clip("Unrelated audio", start=40)
+    track.arrangement_clips.append(keep)
+    plan = audio_plan(instance, (0, 10))
+    track.copy_failure = (2, failure)
+    result = apply(instance, plan)
+    assert result["status"] == "error" and result["rollback_verified"]
+    assert result["completed_before_failure"] == 1
+    assert track.arrangement_clips == [keep]
+    assert keep not in track.delete_calls and len(track.delete_calls) == 2
+    assert vars(source) == original
+    assert song.undo_started == song.undo_finished == 1
+
+
+@pytest.mark.parametrize("change", ["file", "tempo", "source_markers"])
+def test_unwarped_source_changes_invalidate_audio_preview_before_copy(tmp_path, change):
+    instance, song = audio_remote(tmp_path, warped=False)
+    plan = audio_plan(instance, units="seconds")
+    source = song.tracks[0].clip_slots[0].clip
+    if change == "file":
+        with open(source.file_path, "ab") as handle:
+            handle.write(b"changed")
+    elif change == "tempo":
+        song.tempo = 121.0
+    else:
+        source.loop_start = 3.0
+    with pytest.raises(ValueError, match="Source clip changed"):
+        apply(instance, plan)
+    assert song.tracks[0].copy_calls == 0
+
+
+@pytest.mark.parametrize("kind,field,value,error", [
+    ("midi", "source_range", {"start": 0, "end": 1, "units": "beats"}, "only to audio"),
+    ("audio", "variation", {"transpose": 12}, "only to MIDI"),
+    ("audio", "source_range", {"start": 4, "end": 6, "units": "seconds"}, "units must"),
+])
+def test_later_incompatible_options_reject_before_any_copy(tmp_path, kind, field, value, error):
+    instance, song = audio_remote(tmp_path) if kind == "audio" else remote()
+    session, placements = request(instance, (0, 20))
+    placements[1][field] = value
+    with pytest.raises(ValueError, match=error):
+        builder.build_arrangement(instance, "preview", session, placements)
+    assert song.tracks[0].copy_calls == song.undo_started == 0
+
+
+def test_copy_that_secretly_trims_existing_clip_cannot_claim_verified_rollback():
+    instance, song = remote()
+    track = song.tracks[0]
+    keep = Clip("Keep entire original", start=20)
+    track.arrangement_clips.append(keep)
+    plan = preview(instance)
+    original_copy = track.duplicate_clip_to_arrangement
+
+    def copy_with_unexpected_side_effect(source, start):
+        original_copy(source, start)
+        keep.end_time = 23.0  # The object survives, but one beat of its region is lost.
+
+    track.duplicate_clip_to_arrangement = copy_with_unexpected_side_effect
+    result = apply(instance, plan)
+    assert result["status"] == "partial"
+    assert result["rollback_verified"] is False
+    assert "bounds changed" in result["message"]
+    assert any("bounds changed" in message for message in result["rollback_errors"])
+    assert track.arrangement_clips == [keep]
+    assert keep.end_time == 23.0
+    assert keep not in track.delete_calls and len(track.delete_calls) == 1
+
+
+def pending_audio(instance, starts=(0,)):
+    track = instance._song.tracks[0]
+    track.defer_bounds = True
+    plan = audio_plan(instance, starts, units="seconds")
+    result = apply(instance, plan)
+    assert result["status"] == "applying"
+    assert len(instance._scheduled_callbacks) == 1
+    return plan
+
+
+def test_unwarped_deferred_edges_verify_after_undo_closes_and_replay_never_copies(tmp_path):
+    instance, song = audio_remote(tmp_path, warped=False)
+    source = song.tracks[0].clip_slots[0].clip
+    original = copy.deepcopy(vars(source))
+    plan = pending_audio(instance)
+    track = song.tracks[0]
+    copied = track.arrangement_clips[0]
+    assert copied.end_time == 8  # Stale while Live has not settled the trim.
+    assert song.undo_started == song.undo_finished == 1
+    assert track.delete_calls == []
+    for _ in range(3):
+        status = apply(instance, plan)
+        assert status["status"] == "applying" and status["replayed"] is True
+    assert track.copy_calls == 1 and len(instance._scheduled_callbacks) == 1
+    drain_callbacks(instance)
+    result = apply(instance, plan)
+    assert result["status"] == "applied" and result["replayed"] is True
+    assert (copied.start_time, copied.end_time) == (0, 4)
+    assert vars(source) == original
+    assert apply(instance, plan)["status"] == "applied"
+    assert track.copy_calls == 1
+
+
+def test_unwarped_final_bounds_failure_rolls_back_all_owned_copies(tmp_path):
+    instance, song = audio_remote(tmp_path, warped=False)
+    track = song.tracks[0]
+    keep = Clip("Unrelated region", start=80)
+    track.arrangement_clips.append(keep)
+    plan = pending_audio(instance, (0, 20))
+    settle_audio_bounds(instance)
+    track.arrangement_clips[-1].end_time += 1
+    drain_callbacks(instance)
+    result = apply(instance, plan)
+    assert result["status"] == "error" and result["rollback_verified"] is True
+    assert "bounds" in result["message"]
+    assert track.arrangement_clips == [keep]
+    assert keep not in track.delete_calls and len(track.delete_calls) == 2
+    assert song.undo_started == song.undo_finished == 2
+
+
+@pytest.mark.parametrize("changed", ["source", "tempo", "copy_gain", "copy_name"])
+def test_unwarped_finalizer_rechecks_source_and_copied_audio_values(tmp_path, changed):
+    instance, song = audio_remote(tmp_path, warped=False)
+    source = song.tracks[0].clip_slots[0].clip
+    plan = pending_audio(instance)
+    track = song.tracks[0]
+    if changed == "source":
+        source.gain = 0.75
+    elif changed == "tempo":
+        song.tempo = 121
+    elif changed == "copy_gain":
+        track.arrangement_clips[0].gain = 0.25
+    else:
+        track.arrangement_clips[0].name = "Changed during pending finalization"
+    drain_callbacks(instance)
+    result = apply(instance, plan)
+    assert result["status"] == "error" and result["rollback_verified"] is True
+    assert track.arrangement_clips == []
+    assert source.gain == (0.75 if changed == "source" else 0.85)
+    assert song.tempo == (121 if changed == "tempo" else 120)
+
+
+def test_unwarped_finalizer_preserves_new_set_and_reports_unverifiable_old_copy(tmp_path):
+    instance, old_song = audio_remote(tmp_path, warped=False)
+    plan = pending_audio(instance)
+    old_copy = old_song.tracks[0].arrangement_clips[0]
+    new_song = Song()
+    new_keep = Clip("New Set original region", start=0)
+    new_song.tracks[0].arrangement_clips.append(new_keep)
+    instance.song = lambda: new_song
+    drain_callbacks(instance)
+    terminal = instance._arrangement_plans[plan["plan_id"]]["result"]
+    assert terminal["status"] == "partial" and terminal["rollback_verified"] is False
+    assert old_song.tracks[0].arrangement_clips == [old_copy]
+    assert new_song.tracks[0].arrangement_clips == [new_keep]
+    assert new_song.tracks[0].delete_calls == old_song.tracks[0].delete_calls == []
+    with pytest.raises(ValueError, match="Set"):
+        apply(instance, plan)
+
+
+def test_unwarped_finalizer_detects_deleted_owned_copy_and_removes_remaining_owned_only(tmp_path):
+    instance, song = audio_remote(tmp_path, warped=False)
+    track = song.tracks[0]
+    plan = pending_audio(instance, (0, 20))
+    track.arrangement_clips.pop(0)
+    drain_callbacks(instance)
+    result = apply(instance, plan)
+    assert result["status"] == "error" and result["rollback_verified"] is True
+    assert track.arrangement_clips == []
+    assert len(track.delete_calls) == 1
+
+
+@pytest.mark.parametrize("flag", ["record_mode", "session_record"])
+def test_unwarped_finalizer_rejects_recording_that_starts_while_pending_without_stopping_it(tmp_path, flag):
+    instance, song = audio_remote(tmp_path, warped=False)
+    plan = pending_audio(instance)
+    stop_calls = []
+    song.stop_playing = lambda: stop_calls.append("stopped")
+    song.is_playing = True
+    setattr(song, flag, True)
+    drain_callbacks(instance)
+    result = apply(instance, plan)
+    assert result["status"] == "error" and result["rollback_verified"] is True
+    assert "recording" in result["message"]
+    assert song.tracks[0].arrangement_clips == []
+    assert song.is_playing is True and getattr(song, flag) is True and stop_calls == []
+
+
+@pytest.mark.parametrize("action", ["preview", "apply"])
+def test_pending_audio_blocks_other_plans_until_finalized(tmp_path, action):
+    instance, song = audio_remote(tmp_path, warped=False)
+    other = audio_plan(instance, (40,), units="seconds")
+    pending = pending_audio(instance)
+    with pytest.raises(ValueError, match="pending|applying|progress|settling|Finish"):
+        apply(instance, other) if action == "apply" else audio_plan(instance, (40,), units="seconds")
+    assert song.tracks[0].copy_calls == 1
+    drain_callbacks(instance)
+    assert apply(instance, pending)["status"] == "applied"
+    assert apply(instance, other)["status"] == "applying"
+    drain_callbacks(instance)
+    assert apply(instance, other)["status"] == "applied"
+
+
+def test_terminal_plan_replay_remains_available_while_another_audio_plan_is_pending(tmp_path):
+    instance, song = audio_remote(tmp_path, warped=False)
+    complete = pending_audio(instance)
+    drain_callbacks(instance)
+    assert apply(instance, complete)["status"] == "applied"
+    pending = pending_audio(instance, (20,))
+    replay = apply(instance, complete)
+    assert replay["status"] == "applied" and replay["replayed"] is True
+    assert song.tracks[0].copy_calls == 2 and len(instance._scheduled_callbacks) == 1
+    drain_callbacks(instance)
+    assert apply(instance, pending)["status"] == "applied"
+
+
+def test_unwarped_schedule_failure_rolls_back_and_releases_pending_guard(tmp_path):
+    instance, song = audio_remote(tmp_path, warped=False)
+    plan = audio_plan(instance, units="seconds")
+    original_schedule = instance.schedule_message
+
+    def failed_schedule(_delay, _callback):
+        raise RuntimeError("cannot schedule Live finalizer")
+
+    instance.schedule_message = failed_schedule
+    result = apply(instance, plan)
+    assert result["status"] == "error" and result["rollback_verified"] is True
+    assert "schedule" in result["message"]
+    assert song.tracks[0].arrangement_clips == []
+    assert apply(instance, plan)["replayed"] is True
+    instance.schedule_message = original_schedule
+    next_plan = pending_audio(instance)
+    drain_callbacks(instance)
+    assert apply(instance, next_plan)["status"] == "applied"
+
+
+def test_pending_plan_is_not_expired_or_evicted_while_waiting_for_live_tick(tmp_path, monkeypatch):
+    instance, song = audio_remote(tmp_path, warped=False)
+    oldest = audio_plan(instance, units="seconds")
+    for _ in range(builder.MAX_PLANS - 1):
+        audio_plan(instance, (40,), units="seconds")
+    song.tracks[0].defer_bounds = True
+    assert apply(instance, oldest)["status"] == "applying"
+    original_clock = builder.time.monotonic
+    monkeypatch.setattr(builder.time, "monotonic", lambda: original_clock() + 301)
+    with pytest.raises(ValueError, match="pending|applying|progress|settling|Finish"):
+        audio_plan(instance, (60,), units="seconds")
+    assert oldest["plan_id"] in instance._arrangement_plans
+    assert apply(instance, oldest)["status"] == "applying"
+    assert song.tracks[0].copy_calls == 1
+    drain_callbacks(instance)
+    assert apply(instance, oldest)["status"] == "applied"
+
+
+def test_deferred_mixed_plan_rechecks_midi_copy_before_claiming_success(tmp_path):
+    instance, song = audio_remote(tmp_path, warped=False)
+    audio_track = song.tracks[0]
+    midi_track = Track("MIDI alongside audio")
+    song.tracks.append(midi_track)
+    audio_track.defer_bounds = True
+    targets = instance._get_edit_targets()
+    handles = {row["name"]: row["track_handle"] for row in targets["tracks"]}
+    placements = [
+        {"track_handle": handles[midi_track.name], "source_slot": 1, "destination_beat": 0,
+         "variation": {"transpose": 7}},
+        {"track_handle": handles[audio_track.name], "source_slot": 1, "destination_beat": 0,
+         "source_range": {"start": 4.0, "end": 6.0, "units": "seconds"}},
+    ]
+    plan = builder.build_arrangement(instance, "preview", targets["session_id"], placements)
+    assert apply(instance, plan)["status"] == "applying"
+    midi_track.arrangement_clips[0].notes[0].velocity += 1
+    drain_callbacks(instance)
+    result = apply(instance, plan)
+    assert result["status"] == "error" and result["rollback_verified"] is True
+    assert "MIDI" in result["message"]
+    assert midi_track.arrangement_clips == audio_track.arrangement_clips == []
+    assert midi_track.clip_slots[0].clip.notes[0].pitch == 60
+    assert midi_track.clip_slots[0].clip.notes[0].velocity == 90

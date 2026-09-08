@@ -65,15 +65,32 @@ def register_workflow_tools(mcp, get_connection):
     def build_arrangement(action: Literal["preview", "apply"], session_id: str,
                           placements: list[dict[str, Any]] | None = None,
                           plan_id: str = "") -> ArrangementBuild:
-        """Preview then place session MIDI clips in arrangement on their own tracks.
+        """Preview then place session MIDI or audio clips on their own tracks.
 
         First call get_edit_targets. Preview requires its session_id and 1..64
         placements, each containing track_handle, source_slot (1-based) and
-        destination_beat (zero-based quarter-note beats). Each copy uses its
-        source's full current length. Overlaps, clip envelopes and unverifiable
-        sources are rejected. Maximum 10,000 source notes across the plan.
+        destination_beat (absolute zero-based quarter-note beats, fractions allowed).
+        Optional name labels the new copy. MIDI copies use full source length;
+        optional variation accepts remove_pitches (0..127), keep_every (1..10000),
+        keep_offset (zero-based, below keep_every) and transpose (-127..127).
+        Pitches are removed first, surviving individual notes are sorted by onset
+        then pitch/values, thinning keeps every Nth note, and transpose follows.
+        Preview includes exact resulting MIDI note values. Original notes are untouched.
+
+        Audio optionally takes source_range={start, end, units}, using beats for
+        warped audio or seconds for unwarped. Ranges must stay within aligned source
+        start/loop/end markers. Copies become nonlooping. The destination must be
+        empty through reserved_end_beat, including temporary copy/trim space.
+        Unwarped audio requires unpitched clips and fixed, unautomated tempo with
+        Link and tempo follower disabled. Audio files are guarded by file identity
+        metadata, not a byte hash. Warping, gain, pitch and warp markers are preserved.
+        Overlaps, clip envelopes and unverifiable sources are rejected.
+        Maximum 10,000 source MIDI notes across the plan.
 
         Apply uses the returned plan_id and session_id, with placements omitted.
+        Plans containing unwarped audio return status="applying" while Live settles
+        their bounds. Poll apply with the same plan_id until applied/error/partial;
+        polling never creates more copies. New plans are blocked during this step.
         Plans expire after five minutes. Apply rechecks source identity, metadata,
         exposed MIDI note values and destination ranges on Live's execution tick.
         Reapplying a retained completed plan returns its result without new copies.

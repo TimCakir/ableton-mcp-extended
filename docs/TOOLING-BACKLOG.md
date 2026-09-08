@@ -2,34 +2,59 @@
 
 ## Current implementation handoff — 2026-09-08
 
-Build `2026-09-08.1` / package `1.1.0` implements recording ownership and
-manifests, MIDI validation/recovery, correlated requests and deadlines,
-structured batch results, stable track edits, guarded MIDI arrangement placement,
-session comparisons and local audio analysis. It is deployed in Live 12.4.5;
-after the Codex restart, the actual task connection reports matching builds and
-package fingerprints and exposes all 152 tools. See [release notes](RELEASE-1.1.0.md)
-and the [Live acceptance report](LIVE-ACCEPTANCE-2026-09-08.md) for scope and evidence.
+Build `2026-09-08.4` / package `1.2.0` extends `build_arrangement` with MIDI
+section variations and audio source-range placement. The tool count remains 152.
+The full automated suite passes 792 tests. The deployed build passed actual
+Live 12.4.5 workflow acceptance and saved-Set persistence checks. See
+[1.2.0 release notes](RELEASE-1.2.0.md) for supported inputs and limits and the
+[1.2.0 Live acceptance report](LIVE-ACCEPTANCE-1.2.0-2026-09-08.md) for evidence.
 
-Verified in the disposable Set: bounce, two distinct stems with measured audio,
-cancellation followed by another capture, MIDI transpose/probability, stable
-track targeting, guarded arrangement copying and save/reopen persistence. The
-unit suite passed 586 tests with each of MCP 1.28.1 and 1.30.0. The changes remain
-local and uncommitted; remote CI and a published release are still outstanding.
+The disposable Set now contains three verified MIDI variations and warped and
+unwarped audio excerpts at fractional beat positions. Preview/apply, retained-plan
+replay, overlap and invalid-input rejection, unchanged sources and stopped
+transport passed. All five placed clips passed verification after saving,
+unloading the Set and reopening it.
+
+Implemented in this build:
+
+- MIDI copies support pitch removal, deterministic thinning of individual notes
+  and transposition, in that order. Previews expose resulting notes; apply
+  preserves the source and verifies the copied values. Out-of-range pitches
+  reject the preview.
+- Audio copies support explicit source ranges in beats when warped and seconds
+  when unwarped, with fractional arrangement destinations. Source markers must
+  align with loop bounds. Unwarped sources require zero pitch offsets and fixed,
+  unautomated tempo with Link and tempo follower disabled.
+- Audio plans reserve the initial copy and intermediate trimming space as well
+  as the final excerpt. Apply checks source file identity metadata, audio
+  settings, warp markers and final bounds. File bytes are not hashed.
+- The existing stable identities, overlap checks, retained-plan replay and
+  operation-owned rollback apply to both workflows. Active Live or MCP
+  recording blocks previews and applies. Plans do not start playback or save.
+- Unwarped plans return `applying` until a later Live tick verifies all copied
+  content and final bounds. Poll the same plan's apply result; new plans are
+  blocked while it is pending. A failed finalizer rolls back only owned copies.
+
+The tested 1.1.0 baseline is committed as `d50b243` on
+`codex/arrangement-workflows`. Its [Live acceptance report](LIVE-ACCEPTANCE-2026-09-08.md)
+records bounce, two distinct measured stems, cancellation followed by a new
+capture, MIDI transpose/probability, stable track targeting, guarded MIDI copying
+and save/reopen persistence in Live 12.4.5. Its 586 tests passed with MCP 1.28.1
+and 1.30.0. Remote CI and a published release remain outstanding; this local
+acceptance does not establish either. The active Codex MCP host needs a restart
+to load the current tool descriptions; the acceptance runner used a fresh server
+process with matching build and package fingerprints.
 
 ## Next work, in order
 
-1. **Preserve the tested baseline.** Review the complete local diff, commit the
-   release changes and run the configured CI before claiming a published release.
-2. **MIDI section variations.** Extend the guarded arrangement workflow with
-   explicit transformations on new copies: remove selected pitches for a
-   breakdown, thin notes deterministically, or transpose an alternate phrase.
-   Preview the exact resulting notes; preserve the source, revalidate before
-   apply, read back the result and support replay without creating more copies.
-   This is proposed work, not part of build `2026-09-08.1`.
-3. **Audio arrangement plans.** Add guarded audio placement with explicit source
-   offsets, warp/seconds units and destination bounds. First reproduce the
-   historical off-bar placement and duplicate-clip defects on a scratch fixture.
-4. **Broader recording acceptance.** Exercise longer captures and the actual
+1. **Remote CI and publication.** Run the configured remote checks and publish
+   only when authorized. The local baseline, 1.2.0 implementation and real Live
+   acceptance are complete; no remote CI result or published release is claimed.
+2. **Extend arrangement coverage where needed.** Cross-track sources, direct
+   audio-file placement, chord-group thinning and note-density generation remain
+   outside the current planner. Existing same-track copies and pitch/thinning/
+   transpose variations are implemented; do not list them as proposed features.
+3. **Broader recording acceptance.** Exercise longer captures and the actual
    hardware routing. Test freeze-style source deactivation and scene capture
    independently; passing bounce tests does not establish these workflows.
 
@@ -48,8 +73,9 @@ they are not current outstanding tasks. In particular,
 probability before destructive writes. Batch rebasing only changes named index
 fields; it does not decrement arbitrary numeric values such as beat positions.
 Note probability, two-track stem export and host refresh have since passed the
-September acceptance checks. Native Freeze, complete comping and SDK v2 migration
-remain open.
+September baseline acceptance checks. Section variations and same-track audio
+planning are implemented in 1.2.0 and have passed actual Live and saved-Set checks.
+Native Freeze, complete comping and SDK v2 migration remain open.
 
 ---
 

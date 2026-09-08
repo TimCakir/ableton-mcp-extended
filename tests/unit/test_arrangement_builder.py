@@ -71,6 +71,7 @@ class Track:
     def __init__(self, name="Piano"):
         self.name = name
         self.is_foldable, self.is_frozen = False, False
+        self.has_midi_input, self.has_audio_input = True, False
         self.clip_slots = [types.SimpleNamespace(has_clip=True, clip=Clip())]
         self.arrangement_clips = []
         self.copy_calls, self.delete_calls = 0, []
@@ -832,6 +833,7 @@ class AudioClip:
 class AudioTrack(Track):
     def __init__(self, file_path, warped=True):
         super().__init__("Recorded audio")
+        self.has_midi_input, self.has_audio_input = False, True
         self.clip_slots[0].clip = AudioClip(file_path, warped)
         self.defer_bounds = False
 
@@ -1211,3 +1213,399 @@ def test_deferred_mixed_plan_rechecks_midi_copy_before_claiming_success(tmp_path
     assert midi_track.arrangement_clips == audio_track.arrangement_clips == []
     assert midi_track.clip_slots[0].clip.notes[0].pitch == 60
     assert midi_track.clip_slots[0].clip.notes[0].velocity == 90
+
+
+def cross_request(instance, source=0, destination=1, start=0, **options):
+    targets = instance._get_edit_targets()
+    handles = [row["track_handle"] for row in targets["tracks"]]
+    return targets["session_id"], dict(track_handle=handles[source],
+        destination_track_handle=handles[destination], source_slot=1,
+        destination_beat=start, **options)
+
+
+def cross_preview(instance, **options):
+    session, placement = cross_request(instance, **options)
+    return builder.build_arrangement(instance, "preview", session, [placement])
+
+
+def cross_audio_remote(tmp_path, warped=False):
+    instance, song = audio_remote(tmp_path, warped=warped)
+    source_track = song.tracks[0]
+    destination = AudioTrack(source_track.clip_slots[0].clip.file_path, warped=warped)
+    destination.name = "Audio destination"
+    destination.clip_slots = []  # A destination does not need a Session slot.
+    destination.defer_bounds = not warped
+    song.tracks.append(destination)
+    return instance, song
+
+
+def cross_audio_preview(instance):
+    warped = instance._song.tracks[0].clip_slots[0].clip.warping
+    return cross_preview(instance, start=0.5, name="Cross-track stem",
+        source_range={"start": 4.0, "end": 6.0, "units": "beats" if warped else "seconds"})
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_same_track_default_and_explicit_destination_keep_source_public_identity(explicit):
+    instance, song = remote()
+    session, placements = request(instance)
+    if explicit:
+        placements[0]["destination_track_handle"] = placements[0]["track_handle"]
+    plan = builder.build_arrangement(instance, "preview", session, placements)
+    for result in (plan, apply(instance, plan)):
+        row = result["placements"][0]
+        assert row["track_handle"] == row["destination_track_handle"] == placements[0]["track_handle"]
+        assert row["track_name"] == row["destination_track_name"] == song.tracks[0].name
+    assert song.tracks[0].copy_calls == 1
+
+
+def test_cross_track_chord_variation_preserves_source_and_ignores_source_arrangement_overlap():
+    instance, song = remote()
+    source = chord_source(song)
+    original = copy.deepcopy(vars(source))
+    source_track = song.tracks[0]
+    keep = Clip("Existing on source", start=32.5, length=8)
+    source_track.arrangement_clips.append(keep)
+    destination = Track("PAD")
+    destination.clip_slots = []
+    song.tracks.append(destination)
+    plan = cross_preview(instance, start=32.5, name="PAD breakdown",
+        variation={"thin_by": "onset", "keep_every": 2, "transpose": 12})
+    row = plan["placements"][0]
+    assert row["track_name"] == source_track.name and row["destination_track_name"] == "PAD"
+    assert row["track_handle"] != row["destination_track_handle"]
+    assert row["source_slot"] == 1 and row["source_name"] == "Four chords"
+    expected = [dict(note, pitch=note["pitch"] + 12) for note in musical_rows(source.notes)
+                if note["start_time"] in (0, 4)]
+    assert row["notes"] == expected
+    result = apply(instance, plan)
+    assert result["status"] == "applied"
+    assert result["placements"][0]["destination_track_name"] == "PAD"
+    assert musical_rows(destination.arrangement_clips[0].notes) == expected
+    assert destination.arrangement_clips[0].name == "PAD breakdown"
+    assert source_track.arrangement_clips == [keep] and vars(source) == original
+    assert (keep.start_time, keep.end_time) == (32.5, 40.5)
+    assert source_track.copy_calls == 0 and destination.copy_calls == 1
+    assert apply(instance, plan)["replayed"] is True and destination.copy_calls == 1
+
+
+@pytest.mark.parametrize("warped", [True, False])
+def test_cross_track_audio_trims_correct_destination_and_reads_only_source_slot(tmp_path, warped):
+    instance, song = cross_audio_remote(tmp_path, warped)
+    source_track, destination = song.tracks
+    source = source_track.clip_slots[0].clip
+    original = copy.deepcopy(vars(source))
+    keep = Clip("Source overlap", start=0.5, length=20)
+    source_track.arrangement_clips.append(keep)
+    plan = cross_audio_preview(instance)
+    result = apply(instance, plan)
+    if not warped:
+        assert result["status"] == "applying"
+        assert destination.arrangement_clips[0].end_time == 8.5
+        drain_callbacks(instance)
+        result = apply(instance, plan)
+    assert result["status"] == "applied"
+    copied = destination.arrangement_clips[0]
+    assert (copied.start_time, copied.end_time) == (0.5, 2.5 if warped else 4.5)
+    assert (copied.loop_start, copied.loop_end) == (4, 6)
+    assert copied.name == "Cross-track stem" and copied.looping is False
+    assert copied.warping is warped and vars(source) == original
+    assert source_track.arrangement_clips == [keep]
+    assert source_track.copy_calls == 0 and destination.copy_calls == 1
+
+
+@pytest.mark.parametrize("bad", [None, True, 1, 0.5, [], {}, "", "missing"])
+def test_invalid_destination_handle_is_rejected_before_copy(bad):
+    instance, song = remote()
+    song.tracks.append(Track("Destination"))
+    session, placement = cross_request(instance)
+    placement["destination_track_handle"] = bad
+    with pytest.raises(ValueError, match="regular track"):
+        builder.build_arrangement(instance, "preview", session, [placement])
+    assert all(track.copy_calls == 0 for track in song.tracks)
+
+
+def test_return_destination_is_rejected_before_copy():
+    instance, song = remote()
+    song.return_tracks.append(Track("Return"))
+    with pytest.raises(ValueError, match="regular track"):
+        cross_preview(instance)
+    assert song.tracks[0].copy_calls == song.return_tracks[0].copy_calls == 0
+
+
+@pytest.mark.parametrize("kind", ["midi", "audio"])
+@pytest.mark.parametrize("bad", [False, None, "yes", 1.0, "missing", "unreadable"])
+def test_destination_input_type_must_be_known_and_compatible(tmp_path, monkeypatch, kind, bad):
+    if kind == "audio":
+        instance, song = cross_audio_remote(tmp_path, warped=True)
+    else:
+        instance, song = remote()
+        song.tracks.append(Track("Destination"))
+    destination = song.tracks[1]
+    attribute = "has_midi_input" if kind == "midi" else "has_audio_input"
+    if bad == "missing":
+        delattr(destination, attribute)
+    elif bad == "unreadable":
+        def unavailable(_track):
+            raise RuntimeError("input metadata unavailable")
+        monkeypatch.setattr(type(destination), attribute, property(unavailable), raising=False)
+    else:
+        setattr(destination, attribute, bad)
+    with pytest.raises(ValueError, match="Destination track"):
+        cross_preview(instance)
+    assert all(track.copy_calls == 0 for track in song.tracks)
+
+
+@pytest.mark.parametrize("role", [0, 1])
+@pytest.mark.parametrize("attribute", ["is_foldable", "is_frozen"])
+@pytest.mark.parametrize("stage", ["preview", "apply", "finish"])
+def test_both_cross_track_roles_reject_group_or_frozen_tracks(tmp_path, role, attribute, stage):
+    instance, song = cross_audio_remote(tmp_path)
+    plan = cross_audio_preview(instance) if stage != "preview" else None
+    if stage == "finish":
+        assert apply(instance, plan)["status"] == "applying"
+    setattr(song.tracks[role], attribute, True)
+    if stage == "finish":
+        drain_callbacks(instance)
+        result = apply(instance, plan)
+        assert result["status"] == "error" and result["rollback_verified"] is True
+        assert song.tracks[1].arrangement_clips == []
+    else:
+        with pytest.raises(ValueError, match="Group|Frozen"):
+            apply(instance, plan) if plan else cross_audio_preview(instance)
+        assert all(track.copy_calls == 0 for track in song.tracks)
+
+
+@pytest.mark.parametrize("stage", ["apply", "finish"])
+def test_source_and_destination_rename_and_reorder_preserve_object_targets(tmp_path, stage):
+    instance, song = cross_audio_remote(tmp_path)
+    source_track, destination = song.tracks
+    plan = cross_audio_preview(instance)
+    if stage == "finish":
+        assert apply(instance, plan)["status"] == "applying"
+    source_track.name, destination.name = "Renamed source", "Renamed destination"
+    song.tracks = [Track("New"), destination, source_track]
+    if stage == "apply":
+        assert apply(instance, plan)["status"] == "applying"
+    drain_callbacks(instance)
+    result = apply(instance, plan)
+    assert result["status"] == "applied"
+    row = result["placements"][0]
+    assert row["track_name"] == "Renamed source" and row["destination_track_name"] == "Renamed destination"
+    assert row["track_handle"] == plan["placements"][0]["track_handle"]
+    assert row["destination_track_handle"] == plan["placements"][0]["destination_track_handle"]
+    assert source_track.copy_calls == 0 and destination.copy_calls == 1
+
+
+@pytest.mark.parametrize("role", [0, 1])
+@pytest.mark.parametrize("change", ["delete", "replace"])
+@pytest.mark.parametrize("stage", ["apply", "finish"])
+def test_cross_track_source_and_destination_identity_changes_are_detected(tmp_path, role, change, stage):
+    instance, song = cross_audio_remote(tmp_path)
+    source_track, destination = song.tracks
+    original_tracks = list(song.tracks)
+    keep = Clip("Original on changed track", start=40)
+    original_tracks[role].arrangement_clips.append(keep)
+    plan = cross_audio_preview(instance)
+    if stage == "finish":
+        assert apply(instance, plan)["status"] == "applying"
+    if change == "delete":
+        song.tracks.pop(role)
+    else:
+        replacement = AudioTrack(source_track.clip_slots[0].clip.file_path, warped=False)
+        replacement.name = original_tracks[role].name
+        song.tracks[role] = replacement
+    if stage == "apply":
+        with pytest.raises(ValueError, match="deleted|replaced|regular"):
+            apply(instance, plan)
+        assert all(track.copy_calls == 0 for track in original_tracks)
+    else:
+        drain_callbacks(instance)
+        result = apply(instance, plan)
+        assert result["status"] == "partial" and result["rollback_verified"] is False
+        assert "deleted or replaced" in result["message"]
+        assert keep not in original_tracks[role].delete_calls
+        if role == 0:
+            assert destination.arrangement_clips == []
+        else:
+            assert len(destination.arrangement_clips) == 2  # Detached owner cannot be safely edited.
+        if change == "replace":
+            assert replacement.arrangement_clips == [] and replacement.delete_calls == []
+
+
+@pytest.mark.parametrize("stage", ["apply", "finish"])
+@pytest.mark.parametrize("change", ["empty", "replace", "move", "notes"])
+def test_cross_track_source_slot_identity_is_checked_independently_of_destination(tmp_path, stage, change):
+    instance, song = cross_audio_remote(tmp_path)
+    source_track, destination = song.tracks
+    source = source_track.clip_slots[0].clip
+    # Having the original clip in the destination's slot cannot mask a changed source slot.
+    destination.clip_slots = [types.SimpleNamespace(has_clip=True, clip=source)]
+    plan = cross_audio_preview(instance)
+    if stage == "finish":
+        assert apply(instance, plan)["status"] == "applying"
+    if change == "empty":
+        source_track.clip_slots[0].has_clip = False
+    elif change == "replace":
+        source_track.clip_slots[0].clip = copy.deepcopy(source)
+    elif change == "move":
+        source_track.clip_slots.insert(0, types.SimpleNamespace(has_clip=False, clip=None))
+    else:
+        source.gain += 0.125
+    if stage == "apply":
+        with pytest.raises(ValueError, match="Source clip"):
+            apply(instance, plan)
+        assert destination.copy_calls == 0
+    else:
+        drain_callbacks(instance)
+        result = apply(instance, plan)
+        assert result["status"] == "error" and result["rollback_verified"] is True
+        assert "Source changed" in result["message"]
+        assert destination.arrangement_clips == []
+
+
+@pytest.mark.parametrize("stage", ["apply", "finish"])
+def test_cross_track_destination_input_kind_is_revalidated(tmp_path, stage):
+    instance, song = cross_audio_remote(tmp_path)
+    plan = cross_audio_preview(instance)
+    if stage == "finish":
+        assert apply(instance, plan)["status"] == "applying"
+    song.tracks[1].has_audio_input = False
+    if stage == "apply":
+        with pytest.raises(ValueError, match="Destination track"):
+            apply(instance, plan)
+        assert song.tracks[1].copy_calls == 0
+    else:
+        drain_callbacks(instance)
+        result = apply(instance, plan)
+        assert result["status"] == "error" and result["rollback_verified"] is True
+        assert song.tracks[1].arrangement_clips == []
+
+
+def test_cross_track_overlaps_are_grouped_by_destination_not_source():
+    instance, song = remote()
+    song.tracks.extend([Track("Source B"), Track("Destination A"), Track("Destination B")])
+    session, first = cross_request(instance, source=0, destination=2)
+    _session, second = cross_request(instance, source=1, destination=2, start=2)
+    with pytest.raises(ValueError, match="proposed placement"):
+        builder.build_arrangement(instance, "preview", session, [first, second])
+    _session, second = cross_request(instance, source=0, destination=3)
+    plan = builder.build_arrangement(instance, "preview", session, [first, second])
+    assert apply(instance, plan)["status"] == "applied"
+    assert [track.copy_calls for track in song.tracks] == [0, 0, 1, 1]
+
+
+def test_cross_track_capacity_counts_copies_on_each_destination(monkeypatch):
+    instance, song = remote()
+    song.tracks.extend([Track("Source B"), Track("Destination A"), Track("Destination B")])
+    monkeypatch.setattr(builder, "MAX_EXISTING_CLIPS", 2)
+    for track in song.tracks:
+        track.arrangement_clips.append(Clip("Existing", start=40))
+    # A source at its verification limit is still valid when no copy goes there.
+    song.tracks[0].arrangement_clips.append(Clip("Another source region", start=44))
+    session, first = cross_request(instance, source=0, destination=2)
+    _session, second = cross_request(instance, source=1, destination=2, start=4)
+    with pytest.raises(ValueError, match="Plan would exceed"):
+        builder.build_arrangement(instance, "preview", session, [first, second])
+    _session, second = cross_request(instance, source=0, destination=3, start=4)
+    plan = builder.build_arrangement(instance, "preview", session, [first, second])
+    assert apply(instance, plan)["status"] == "applied"
+    assert [len(track.arrangement_clips) for track in song.tracks] == [2, 1, 2, 2]
+
+
+@pytest.mark.parametrize("behavior", ["source_only", "both", "source_then_raise"])
+def test_misdirected_native_cross_track_copies_are_owned_and_rolled_back(behavior):
+    instance, song = remote()
+    source_track = song.tracks[0]
+    destination = Track("Destination")
+    song.tracks.append(destination)
+    keeps = [Clip("Source original", start=40), Clip("Destination original", start=40)]
+    for track, keep in zip(song.tracks, keeps):
+        track.arrangement_clips.append(keep)
+    native_copy = destination.duplicate_clip_to_arrangement
+
+    def misdirected_copy(clip, start):
+        source_track.duplicate_clip_to_arrangement(clip, start)
+        if behavior == "both":
+            native_copy(clip, start)
+        elif behavior == "source_then_raise":
+            raise RuntimeError("Native cross-track copy rejected after insertion")
+
+    destination.duplicate_clip_to_arrangement = misdirected_copy
+    result = apply(instance, cross_preview(instance))
+    assert result["status"] == "error" and result["rollback_verified"] is True
+    assert result["completed_before_failure"] == 0
+    for track, keep in zip(song.tracks, keeps):
+        assert track.arrangement_clips == [keep]
+        assert (keep.start_time, keep.end_time) == (40, 44)
+        assert keep not in track.delete_calls
+    assert len(source_track.delete_calls) == 1
+    assert len(destination.delete_calls) == (1 if behavior == "both" else 0)
+
+
+def test_cross_track_enumeration_failure_on_one_track_still_captures_other_track_delta(monkeypatch):
+    instance, song = remote()
+    source_track = song.tracks[0]
+    destination = Track("Destination")
+    song.tracks.append(destination)
+    plan = cross_preview(instance)
+
+    def misdirected_copy(clip, start):
+        source_track.duplicate_clip_to_arrangement(clip, start)
+    destination.duplicate_clip_to_arrangement = misdirected_copy
+    original = builder._arrangement
+    failed = []
+
+    def arrangement(track):
+        if track is destination and source_track.copy_calls and not failed:
+            failed.append(True)
+            raise RuntimeError("Destination enumeration temporarily unavailable")
+        return original(track)
+    monkeypatch.setattr(builder, "_arrangement", arrangement)
+    result = apply(instance, plan)
+    assert result["status"] == "error" and result["rollback_verified"] is True
+    assert "enumeration failed" in result["message"]
+    assert source_track.arrangement_clips == destination.arrangement_clips == []
+    assert len(source_track.delete_calls) == 1
+
+
+@pytest.mark.parametrize("damaged_role", [0, 1])
+def test_cross_track_copy_detects_existing_bounds_damage_on_both_tracks(damaged_role):
+    instance, song = remote()
+    song.tracks.append(Track("Destination"))
+    keeps = [Clip("Source original", start=40), Clip("Destination original", start=40)]
+    for track, keep in zip(song.tracks, keeps):
+        track.arrangement_clips.append(keep)
+    destination = song.tracks[1]
+    native_copy = destination.duplicate_clip_to_arrangement
+
+    def copy_and_trim_original(clip, start):
+        native_copy(clip, start)
+        keeps[damaged_role].end_time -= 1
+    destination.duplicate_clip_to_arrangement = copy_and_trim_original
+    result = apply(instance, cross_preview(instance))
+    assert result["status"] == "partial" and result["rollback_verified"] is False
+    assert "bounds changed" in result["message"]
+    assert any("bounds changed" in message for message in result["rollback_errors"])
+    for track, keep in zip(song.tracks, keeps):
+        assert track.arrangement_clips == [keep] and keep not in track.delete_calls
+
+
+def test_later_cross_track_failure_rolls_back_copies_across_destinations_only():
+    instance, song = remote()
+    song.tracks.extend([Track("Destination A"), Track("Destination B")])
+    originals = [Clip(track.name + " existing", start=40) for track in song.tracks]
+    for track, original in zip(song.tracks, originals):
+        track.arrangement_clips.append(original)
+    session, first = cross_request(instance, destination=1)
+    _session, second = cross_request(instance, destination=2)
+    plan = builder.build_arrangement(instance, "preview", session, [first, second])
+    song.tracks[2].copy_failure = (1, "after")
+    result = apply(instance, plan)
+    assert result["status"] == "error" and result["rollback_verified"] is True
+    assert result["completed_before_failure"] == 1
+    assert result["placements"][0]["destination_track_name"] == "Destination A"
+    for track, original in zip(song.tracks, originals):
+        assert track.arrangement_clips == [original]
+        assert original not in track.delete_calls
+    assert [len(track.delete_calls) for track in song.tracks] == [0, 1, 1]

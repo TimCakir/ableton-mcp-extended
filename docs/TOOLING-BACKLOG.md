@@ -2,6 +2,26 @@
 
 ## Current implementation handoff — 2026-09-08
 
+Build `2026-09-08.6` / package `1.4.0` adds optional
+`destination_track_handle` to `build_arrangement`. Session MIDI and audio clips
+can supply another compatible arrangement track. Same-track defaults, MIDI
+variations and audio ranges are preserved. Both track identities are rechecked;
+overlaps are destination-based, and new clips on either track are enumerated
+for verification and rollback. The full automated suite passed 896 tests.
+See [1.4.0 release notes](RELEASE-1.4.0.md).
+
+Actual Live 12.4.5 workflow and save/unload/reopen acceptance passed for one
+six-note chord variation and two audio excerpts on separate destinations.
+Only the three expected copies were added; Session sources and existing
+arrangement material stayed unchanged. See the
+[1.4.0 acceptance report](LIVE-ACCEPTANCE-1.4.0-2026-09-08.md).
+Live runs `.6`, and both acceptance phases used fresh stdio servers with matching
+build labels and source hashes. Codex's existing connection still holds `.4`
+and needs a host refresh for the current server and description. Remote CI and
+publication remain outstanding.
+
+## Verified 1.3.0 baseline
+
 Build `2026-09-08.5` / package `1.3.0` adds whole-onset MIDI thinning through
 `variation.thin_by="onset"`. It keeps all notes sharing an exact start time,
 after pitch removal; offsets count surviving groups. Individual-note thinning
@@ -10,10 +30,10 @@ automated suite passed 829 tests. See [1.3.0 release notes](RELEASE-1.3.0.md).
 
 Both real Live 12.4.5 workflow and save/unload/reopen acceptance passed, verifying
 three copies with 18 notes in total and the unchanged 12-note source. See the
-[1.3.0 acceptance report](LIVE-ACCEPTANCE-1.3.0-2026-09-08.md). Live is running
+[1.3.0 acceptance report](LIVE-ACCEPTANCE-1.3.0-2026-09-08.md). Live ran
 `.5`; the acceptance runner's fresh stdio servers matched build and hashes.
-The existing Codex connection still holds `.4` and needs a host refresh for this
-new build. Remote CI and publication remain outstanding.
+At that checkpoint the existing Codex connection held `.4`; this historical
+baseline does not claim remote CI or publication.
 
 ## Verified 1.2.0 baseline
 
@@ -62,11 +82,11 @@ acceptance does not establish either. Codex's subsequent restart verified all
 ## Next work, in order
 
 1. **Remote CI and publication.** Run the configured remote checks and publish
-   only when authorized. The local baseline, 1.3.0 implementation and real Live
+   only when authorized. The local baseline, 1.4.0 implementation and real Live
    acceptance are complete; no remote CI result or published release is claimed.
-2. **Extend arrangement coverage where needed.** Cross-track sources, direct
-   audio-file placement, grouping staggered notes and note-density generation
-   remain outside the current planner. Same-track copies, pitch removal,
+2. **Extend arrangement coverage where needed.** Direct audio-file placement,
+   grouping staggered notes and note-density generation remain outside the
+   current planner. Same-track and cross-track copies, pitch removal,
    individual-note/whole-onset thinning and transposition are implemented.
 3. **Broader recording acceptance.** Exercise longer captures and the actual
    hardware routing. Test freeze-style source deactivation and scene capture

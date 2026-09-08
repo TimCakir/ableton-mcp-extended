@@ -124,9 +124,38 @@ def _check_ranges(entries):
 
 def _eligible(track):
     if getattr(track, "is_foldable", False):
-        raise ValueError("Group tracks cannot receive clip placements")
+        raise ValueError("Group tracks cannot be used for clip placements")
     if getattr(track, "is_frozen", False):
-        raise ValueError("Frozen tracks cannot receive clip placements")
+        raise ValueError("Frozen tracks cannot be used for clip placements")
+
+
+def _destination_kind(track, kind):
+    attribute = "has_midi_input" if kind == "midi" else "has_audio_input"
+    try:
+        compatible = getattr(track, attribute)
+    except Exception as exc:
+        raise ValueError("Destination track input kind cannot be verified: " + str(exc))
+    if not isinstance(compatible, (bool, int)) or compatible not in (True, 1):
+        raise ValueError("Destination track must have " + kind.upper() + " input")
+
+
+def _entry_tracks(entry):
+    tracks = [entry["track"]]
+    if not _same(entry["source_track"], entry["track"]):
+        tracks.append(entry["source_track"])
+    return tracks
+
+
+def _validate_entry_tracks(remote, song, entry):
+    current = tuple(song.tracks)
+    for handle, track in ((entry["source_handle"], entry["source_track"]),
+                          (entry["handle"], entry["track"])):
+        if not _same(remote._target_refs.get(handle), track):
+            raise ValueError("Plan track was deleted or replaced")
+        if not _contains(current, track):
+            raise ValueError("Plan requires a current regular track")
+        _eligible(track)
+    _destination_kind(entry["track"], entry["source"]["kind"])
 
 
 def _targets(remote, session_id):
@@ -148,8 +177,9 @@ def _check_recording(remote, song):
 
 
 def _public(entry, index):
-    row = {"index": index + 1, "track_handle": entry["handle"],
-            "track_name": entry["track"].name, "source_slot": entry["slot"] + 1,
+    row = {"index": index + 1, "track_handle": entry["source_handle"],
+            "track_name": entry["source_track"].name, "source_slot": entry["slot"] + 1,
+            "destination_track_handle": entry["handle"], "destination_track_name": entry["track"].name,
             "source_name": entry["source"]["metadata"]["name"],
             "kind": entry["source"]["kind"], "name": entry["name"],
             "destination_beat": entry["start"], "end_beat": entry["end"],
@@ -178,24 +208,33 @@ def _preview(remote, session_id, placements, plans):
     entries, note_count = [], 0
     for placement in placements:
         required = {"track_handle", "source_slot", "destination_beat"}
-        optional = {"variation", "source_range", "name"}
+        optional = {"variation", "source_range", "name", "destination_track_handle"}
         if (not isinstance(placement, dict) or not required.issubset(placement)
                 or set(placement) - required - optional):
             raise ValueError("Each placement requires track_handle, source_slot and destination_beat; "
-                             "optional fields are variation, source_range and name")
-        handle = placement["track_handle"]
-        if not isinstance(handle, str) or handle not in rows or rows[handle]["kind"] != "track":
-            raise ValueError("Placement requires a current regular track handle")
-        track = remote._target_refs[handle]
-        _eligible(track)
+                             "optional fields are variation, source_range, name and destination_track_handle")
+        source_handle = placement["track_handle"]
+        handle = placement.get("destination_track_handle", source_handle)
+        resolved = []
+        for candidate in (source_handle, handle):
+            if (not isinstance(candidate, str) or candidate not in rows
+                    or rows[candidate]["kind"] != "track"):
+                raise ValueError("Placement requires current regular track handles for source and destination")
+            target = remote._target_refs.get(candidate)
+            if target is None or not _contains(tuple(song.tracks), target):
+                raise ValueError("Placement requires a current regular track")
+            _eligible(target)
+            resolved.append(target)
+        source_track, track = resolved
         slot_index = placement["source_slot"]
         if isinstance(slot_index, bool) or not isinstance(slot_index, int) or slot_index < 1:
             raise ValueError("source_slot must be a 1-based integer")
-        slots = tuple(track.clip_slots)
+        slots = tuple(source_track.clip_slots)
         if slot_index > len(slots) or not slots[slot_index - 1].has_clip:
             raise ValueError("Source slot is empty or out of range")
         clip = slots[slot_index - 1].clip
         source = _source(remote, clip)
+        _destination_kind(track, source["kind"])
         name = placement.get("name", source["metadata"]["name"])
         if "name" in placement and (not isinstance(name, str) or not name.strip() or len(name) > 1024):
             raise ValueError("name must be nonempty text of at most 1024 characters")
@@ -219,6 +258,7 @@ def _preview(remote, session_id, placements, plans):
         end = _number(start + length, "placement end", positive=True)
         reserved_end = _number(start + reserved_length, "reserved end", positive=True)
         entries.append({"handle": handle, "track": track, "clip": clip,
+                        "source_handle": source_handle, "source_track": source_track,
                         "slot": slot_index - 1, "source": source,
                         "start": start, "end": end, "reserved_end": reserved_end,
                         "name": name, "variation": variation, "audio": audio})
@@ -233,7 +273,7 @@ def _preview(remote, session_id, placements, plans):
               "placement_count": len(entries), "source_note_count": note_count,
               "note_count": sum(len(entry["variation"]["notes"]) if entry["variation"] is not None
                                 else len(entry["source"]["notes"]) for entry in entries),
-              "warnings": ["Copies session clips on their own tracks. No source changes, playback or file save.",
+              "warnings": ["Copies session clips to compatible regular tracks. No source changes, playback or file save.",
                            "MIDI guards cover exposed note values; per-note expression is not inspected.",
                            "Audio requires empty space through reserved_end_beat, including temporary copy and trim bounds. "
                            "Audio files are guarded by file identity metadata, not a content hash."]}
@@ -250,13 +290,8 @@ def _validate_plan(remote, plan, session_id):
         raise ValueError("Plan belongs to a different Set instance")
     _check_recording(remote, plan["song"])
     for entry in plan["entries"]:
-        handle, track = entry["handle"], entry["track"]
-        if handle not in remote._target_refs or not _same(remote._target_refs[handle], track):
-            raise ValueError("Plan track was deleted or replaced")
-        if not _contains(tuple(plan["song"].tracks), track):
-            raise ValueError("Plan requires a current regular track")
-        _eligible(track)
-        slots = tuple(track.clip_slots)
+        _validate_entry_tracks(remote, plan["song"], entry)
+        slots = tuple(entry["source_track"].clip_slots)
         index = entry["slot"]
         if index >= len(slots) or not slots[index].has_clip or not _same(slots[index].clip, entry["clip"]):
             raise ValueError("Source clip was moved, deleted or replaced since preview")
@@ -290,6 +325,8 @@ def _rollback(remote, plan, exc, owned, placed, initial, undo_song=None):
             rollback_errors.append(str(rollback_exc))
     for track, originals in initial:
         try:
+            if not _same(remote._song, plan["song"]) or not _contains(tuple(plan["song"].tracks), track):
+                raise RuntimeError("Owning Set or track is no longer available")
             current = _arrangement(track)
             _unchanged_bounds(current, originals)
             original_clips = [clip for clip, _start, _end in originals]
@@ -320,14 +357,14 @@ def _finish(remote, plan, owned, placed, initial):
         if not _same(remote._song, plan["song"]):
             raise RuntimeError("Set changed before arrangement verification")
         _check_recording(remote, plan["song"])
+        if len(owned) != len(plan["entries"]):
+            raise RuntimeError("Not every placement could be identified for verification")
         verified = []
         for index, (entry, (track, clip)) in enumerate(zip(plan["entries"], owned)):
-            if (not _contains(tuple(plan["song"].tracks), track)
-                    or not _same(remote._target_refs.get(entry["handle"]), track)
-                    or not _contains(_arrangement(track), clip)):
+            _validate_entry_tracks(remote, plan["song"], entry)
+            if not _same(entry["track"], track) or not _contains(_arrangement(track), clip):
                 raise RuntimeError("Placed clip or owning track disappeared before verification")
-            _eligible(track)
-            slots = tuple(track.clip_slots)
+            slots = tuple(entry["source_track"].clip_slots)
             if (entry["slot"] >= len(slots) or not slots[entry["slot"]].has_clip
                     or not _same(slots[entry["slot"]].clip, entry["clip"])
                     or _source(remote, entry["clip"])["fingerprint"] != entry["source"]["fingerprint"]):
@@ -389,29 +426,41 @@ def _apply(remote, session_id, plan_id, plans):
                    for entry in plan["entries"])
     initial = []
     for entry in plan["entries"]:
-        if not any(_same(track, entry["track"]) for track, _clips in initial):
-            initial.append((entry["track"], _bounds(_arrangement(entry["track"]))))
+        for target in _entry_tracks(entry):
+            if not any(_same(track, target) for track, _clips in initial):
+                initial.append((target, _bounds(_arrangement(target))))
     plan["status"] = "applying"
     undo_song = None
     try:
         undo_song = remote._begin_note_undo()
         for index, entry in enumerate(plan["entries"]):
             track = entry["track"]
-            before = _arrangement(track)
-            before_bounds = _bounds(before)
+            snapshots = []
+            for target in _entry_tracks(entry):
+                before = _arrangement(target)
+                snapshots.append((target, before, _bounds(before)))
             verification = {}
             try:
                 track.duplicate_clip_to_arrangement(entry["clip"], entry["start"])
             finally:
-                after = _arrangement(track)
-                created = [clip for clip in after if not _contains(before, clip)]
-                owned.extend((track, clip) for clip in created)
-            if len(created) != 1:
-                raise RuntimeError("Copy did not produce exactly one identifiable arrangement clip")
-            clip = created[0]
-            if not all(_contains(after, old) for old in before):
-                raise RuntimeError("Copy unexpectedly replaced existing arrangement material")
-            _unchanged_bounds(after, before_bounds)
+                created, enumeration_errors = [], []
+                # A native cross-track copy may fail after inserting on either
+                # track. Enumerate both in this same tick before claiming ownership.
+                for target, before, _originals in snapshots:
+                    try:
+                        after = _arrangement(target)
+                        additions = [(target, clip) for clip in after if not _contains(before, clip)]
+                        created.extend(additions)
+                        owned.extend(additions)
+                    except Exception as exc:
+                        enumeration_errors.append(str(exc))
+                if enumeration_errors:
+                    raise RuntimeError("Post-copy enumeration failed: " + "; ".join(enumeration_errors))
+            if len(created) != 1 or not _same(created[0][0], track):
+                raise RuntimeError("Copy did not produce exactly one identifiable arrangement clip on the destination track")
+            clip = created[0][1]
+            for target, _before, originals in snapshots:
+                _unchanged_bounds(_arrangement(target), originals)
             actual_start = _number(clip.start_time, "placed clip start")
             actual_end = _number(clip.end_time, "placed clip end", positive=True)
             if entry["audio"] is not None:
@@ -440,7 +489,8 @@ def _apply(remote, session_id, plan_id, plans):
                 raise RuntimeError("Placed clip name differs from the preview")
             if _source(remote, entry["clip"])["fingerprint"] != entry["source"]["fingerprint"]:
                 raise RuntimeError("Source changed while placing the copy")
-            _unchanged_bounds(_arrangement(track), before_bounds)
+            for target, _before, originals in snapshots:
+                _unchanged_bounds(_arrangement(target), originals)
             record = _public(entry, index)
             record.update(verification)
             record.update(status="awaiting_verification" if deferred else "verified", actual_start_beat=clip.start_time,

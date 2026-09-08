@@ -65,11 +65,19 @@ def register_workflow_tools(mcp, get_connection):
     def build_arrangement(action: Literal["preview", "apply"], session_id: str,
                           placements: list[dict[str, Any]] | None = None,
                           plan_id: str = "") -> ArrangementBuild:
-        """Preview then place session MIDI or audio clips on their own tracks.
+        """Preview then place session MIDI or audio clips on compatible tracks.
 
         First call get_edit_targets. Preview requires its session_id and 1..64
         placements, each containing track_handle, source_slot (1-based) and
         destination_beat (absolute zero-based quarter-note beats, fractions allowed).
+        track_handle identifies the source track. Optional destination_track_handle
+        identifies the receiving track; omit it to copy onto the source track.
+        Both must be current regular tracks, not group, return or frozen tracks.
+        MIDI requires a MIDI destination; audio requires an audio destination.
+        Preview/result track_handle and track_name still describe the source;
+        destination_track_handle and destination_track_name describe the receiver.
+        Only the receiving track's arrangement range must be empty. Its existing
+        instruments, devices and routing are used; this copies clips, not tracks.
         Optional name labels the new copy. MIDI copies use full source length;
         optional variation accepts remove_pitches (0..127), keep_every (1..10000),
         keep_offset (zero-based, below keep_every), transpose (-127..127), and
@@ -94,7 +102,7 @@ def register_workflow_tools(mcp, get_connection):
         Plans containing unwarped audio return status="applying" while Live settles
         their bounds. Poll apply with the same plan_id until applied/error/partial;
         polling never creates more copies. New plans are blocked during this step.
-        Plans expire after five minutes. Apply rechecks source identity, metadata,
+        Plans expire after five minutes. Apply rechecks both track identities, source metadata,
         exposed MIDI note values and destination ranges on Live's execution tick.
         Reapplying a retained completed plan returns its result without new copies.
         Per-note expression is not inspected. This does not start playback or save

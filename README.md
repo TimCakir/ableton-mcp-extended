@@ -5,7 +5,25 @@ Control Ableton Live through an MCP-compatible assistant. The Python MCP server 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-## Version 1.3.0
+## Version 1.4.0
+
+Build `2026-09-08.6` adds cross-track placement to `build_arrangement`. Supply
+`destination_track_handle` to copy a Session clip onto another compatible
+arrangement track. MIDI variations and warped/unwarped audio ranges carry over;
+omitting the field keeps same-track behavior. See [1.4.0 examples](docs/RELEASE-1.4.0.md).
+
+Both track identities are checked again on apply. Overlap checks use the
+destination, and unexpected copies on either track are detected for rollback.
+Devices and routing stay with their existing tracks. The tool count remains 152.
+
+The full suite passed **896 tests**. Actual Live 12.4.5 acceptance verified a
+six-note chord variation and two audio excerpts on separate destination tracks,
+with the original Session clips and arrangement material unchanged. See the
+[1.4.0 acceptance report](docs/LIVE-ACCEPTANCE-1.4.0-2026-09-08.md). All three
+copies and the unchanged sources passed again after saving, unloading and
+reopening the Set.
+
+## Version 1.3.0 baseline
 
 Build `2026-09-08.5` adds whole-chord thinning to `build_arrangement`: set
 `variation.thin_by="onset"` to keep every Nth group of simultaneous notes.
@@ -101,13 +119,14 @@ See [INSTALLATION.md](INSTALLATION.md) for platform paths, upgrade steps and tro
 - “Preview a breakdown copy without pitch 36, and an alternate phrase transposed up seven semitones.”
 - “Preview thinning this clip by keeping every second note. Show the resulting notes before applying.”
 - “Preview a breakdown keeping every second chord, with all simultaneous notes intact.”
+- “Preview copying this chord variation to the PAD arrangement track at beat 64.5.”
 - “Preview placing seconds 2–5 of this unwarped Session audio clip at beat 128.25.”
 - “Check the latest recording operation and measure every file in its output manifest.”
 - “Analyze this local WAV file for duration, sample peak, RMS and possible silence.”
 
 `edit_track` previews by default; applying requires `preview=false`. Use the actual `session_id` and `track_handle` returned by `get_edit_targets`. [The release examples](docs/RELEASE-1.1.0.md#stable-track-edit-preview-and-apply) show the exact arguments.
 
-For `build_arrangement`, use `action="preview"` with placements, inspect the result, then use `action="apply"` with its `plan_id` and `session_id`. MIDI thinning counts individual notes by default; `thin_by="onset"` counts groups sharing an exact start time after pitch removal. Transposition rejects pitches outside 0–127. Audio uses the units appropriate to the source's existing warp state. See [chord thinning](docs/RELEASE-1.3.0.md) and [MIDI and audio placement examples](docs/RELEASE-1.2.0.md).
+For `build_arrangement`, use `action="preview"` with placements, inspect the result, then use `action="apply"` with its `plan_id` and `session_id`. `track_handle` identifies the source; optional `destination_track_handle` identifies the receiving track. MIDI thinning counts individual notes by default; `thin_by="onset"` counts groups sharing an exact start time after pitch removal. Transposition rejects pitches outside 0–127. Audio uses the units appropriate to the source's existing warp state. See [cross-track copying](docs/RELEASE-1.4.0.md), [chord thinning](docs/RELEASE-1.3.0.md) and [MIDI and audio placement examples](docs/RELEASE-1.2.0.md).
 
 Plans containing unwarped audio return `status="applying"` while Live settles the clip bounds. Poll `apply` with the same plan ID until `applied`, `error` or `partial`. Polling never creates another copy; new arrangement plans are blocked while this verification is pending.
 
@@ -136,6 +155,8 @@ Or use pip in the existing virtual environment:
 
 The default test command excludes tests marked `integration`. Automated tests simulate Live objects and scheduled ticks; they cannot establish that a recording is audible or that an edit survives saving a real Set.
 
+- [Release 1.4.0](docs/RELEASE-1.4.0.md)
+- [1.4.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.4.0-2026-09-08.md)
 - [Release 1.3.0](docs/RELEASE-1.3.0.md)
 - [1.3.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.3.0-2026-09-08.md)
 - [Release 1.2.0](docs/RELEASE-1.2.0.md)

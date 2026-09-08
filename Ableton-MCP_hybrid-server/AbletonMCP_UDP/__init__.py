@@ -23,9 +23,8 @@ def create_instance(c_instance):
 class AbletonMCP(ControlSurface):
     def __init__(self, c_instance):
         ControlSurface.__init__(self, c_instance)
-        self.log_message("AbletonMCP: Initializing (Hybrid TCP/UDP)...")
+        self.log_message("AbletonMCP: Initializing UDP companion...")
         
-        self._song = self.song()
         self.running = False # Set to True once servers start
 
         self.tcp_server_socket = None
@@ -35,11 +34,14 @@ class AbletonMCP(ControlSurface):
         self.udp_server_socket = None
         self.udp_server_thread = None
 
-        self.start_tcp_server()
         self.start_udp_server() 
         
         self.log_message("AbletonMCP: Initialized.")
-        self.show_message(f"AbletonMCP: TCP on {TCP_PORT}, UDP on {UDP_PORT}")
+        self.show_message(f"AbletonMCP: UDP companion on {UDP_PORT}; use primary script for TCP")
+
+    @property
+    def _song(self):
+        return self.song()
     
     def disconnect(self):
         self.log_message("AbletonMCP: Disconnecting...")
@@ -61,20 +63,8 @@ class AbletonMCP(ControlSurface):
         self.log_message("AbletonMCP: Disconnected.")
 
     def start_tcp_server(self):
-        try:
-            self.tcp_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.tcp_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.tcp_server_socket.bind((HOST, TCP_PORT))
-            self.tcp_server_socket.listen(5)
-            
-            self.running = True 
-            self.tcp_server_thread = threading.Thread(target=self._tcp_server_loop)
-            self.tcp_server_thread.daemon = True
-            self.tcp_server_thread.start()
-            self.log_message(f"TCP Server started on port {TCP_PORT}")
-        except Exception as e:
-            self.log_message(f"Error starting TCP server: {e}")
-            self.show_message(f"AbletonMCP: TCP Server Error - {e}")
+        raise NotImplementedError(
+            "The companion is UDP-only; use AbletonMCP_Remote_Script for TCP commands")
 
     def _tcp_server_loop(self):
         try:
@@ -197,8 +187,14 @@ class AbletonMCP(ControlSurface):
         self.log_message("--- UDP: _process_udp_command called with: " + str(command.get("type", "UNKNOWN_TYPE"))) # DEBUGGING LINE
         command_type = command.get("type", "")
         params = command.get("params", {})
+        if command_type not in ("set_device_parameter", "batch_set_device_parameters"):
+            raise NotImplementedError("Unsupported UDP command: " + command_type)
+        song = self._song
         def task():
             try:
+                if not self.running or self._song != song:
+                    self.log_message("UDP command expired after disconnect or Set change")
+                    return
                 if command_type == "set_device_parameter":
                     self.log_message(f"UDP: MainThread processing set_device_parameter with params: {str(params)}") # DEBUGGING
                     self._set_device_parameter(params.get("track_index", 0), 
@@ -374,38 +370,42 @@ class AbletonMCP(ControlSurface):
             self.log_message(f"Error in _batch_set_device_parameters: {e}\n{traceback.format_exc()}")
             return {"error": str(e)}
             
-    # Placeholder for other command implementations that should be present
-    def _create_midi_track(self, index): self.log_message("_create_midi_track called"); return {"status": "ok_placeholder"}
-    def _set_track_name(self, track_index, name): self.log_message("_set_track_name called"); return {"status": "ok_placeholder"}
-    def _create_clip(self, track_index, clip_index, length): self.log_message("_create_clip called"); return {"status": "ok_placeholder"}
-    def _add_notes_to_clip(self, track_index, clip_index, notes): self.log_message("_add_notes_to_clip called"); return {"status": "ok_placeholder"}
-    def _set_clip_name(self, track_index, clip_index, name): self.log_message("_set_clip_name called"); return {"status": "ok_placeholder"}
+    # The companion only handles fast parameter updates. Legacy entry points
+    # fail explicitly so accidentally routing here can never look successful.
+    def _unsupported(self, command):
+        raise NotImplementedError(command + " is not implemented in the UDP companion; use the primary MCP script")
+
+    def _create_midi_track(self, index): return self._unsupported("create_midi_track")
+    def _set_track_name(self, track_index, name): return self._unsupported("set_track_name")
+    def _create_clip(self, track_index, clip_index, length): return self._unsupported("create_clip")
+    def _add_notes_to_clip(self, track_index, clip_index, notes): return self._unsupported("add_notes_to_clip")
+    def _set_clip_name(self, track_index, clip_index, name): return self._unsupported("set_clip_name")
     def _set_tempo(self, tempo): self.log_message("_set_tempo called"); self._song.tempo = tempo; return {"tempo": self._song.tempo}
-    def _fire_clip(self, track_index, clip_index): self.log_message("_fire_clip called"); return {"status": "ok_placeholder"}
-    def _stop_clip(self, track_index, clip_index): self.log_message("_stop_clip called"); return {"status": "ok_placeholder"}
+    def _fire_clip(self, track_index, clip_index): return self._unsupported("fire_clip")
+    def _stop_clip(self, track_index, clip_index): return self._unsupported("stop_clip")
     def _start_playback(self): self.log_message("_start_playback called"); self._song.start_playing(); return {"playing": True}
     def _stop_playback(self): self.log_message("_stop_playback called"); self._song.stop_playing(); return {"playing": False}
-    def _load_instrument_or_effect(self, track_index, item_uri): self.log_message("_load_instrument_or_effect called"); return {"status": "ok_placeholder"}
-    def _add_clip_envelope_point(self, track_index, clip_index, device_index, parameter_index, time_val, value, curve_type): self.log_message("_add_clip_envelope_point called"); return {"status": "ok_placeholder"}
-    def _clear_clip_envelope(self, track_index, clip_index, device_index, parameter_index): self.log_message("_clear_clip_envelope called"); return {"status": "ok_placeholder"}
-    def _create_scene(self, index): self.log_message("_create_scene called"); return {"status": "ok_placeholder"}
-    def _set_scene_name(self, index, name): self.log_message("_set_scene_name called"); return {"status": "ok_placeholder"}
-    def _delete_scene(self, index): self.log_message("_delete_scene called"); return {"status": "ok_placeholder"}
-    def _fire_scene(self, index): self.log_message("_fire_scene called"); return {"status": "ok_placeholder"}
-    def _batch_edit_notes_in_clip(self, track_index, clip_index, note_ids, note_data_array): self.log_message("_batch_edit_notes_in_clip called"); return {"status": "ok_placeholder"}
-    def _delete_notes_from_clip(self, track_index, clip_index, from_time, to_time, from_pitch, to_pitch): self.log_message("_delete_notes_from_clip called"); return {"status": "ok_placeholder"}
-    def _transpose_notes_in_clip(self, track_index, clip_index, semitones, from_time, to_time, from_pitch, to_pitch): self.log_message("_transpose_notes_in_clip called"); return {"status": "ok_placeholder"}
-    def _create_audio_track(self, index): self.log_message("_create_audio_track called"); return {"status": "ok_placeholder"}
-    def _set_clip_loop_parameters(self, track_index, clip_index, loop_start, loop_end, loop_enabled): self.log_message("_set_clip_loop_parameters called"); return {"status": "ok_placeholder"}
-    def _set_clip_follow_action(self, track_index, clip_index, action, target_clip, chance, time_val): self.log_message("_set_clip_follow_action called"); return {"status": "ok_placeholder"}
-    def _quantize_notes_in_clip(self, track_index, clip_index, grid_size, strength, from_time, to_time, from_pitch, to_pitch): self.log_message("_quantize_notes_in_clip called"); return {"status": "ok_placeholder"}
-    def _randomize_note_timing(self, track_index, clip_index, amount, from_time, to_time, from_pitch, to_pitch): self.log_message("_randomize_note_timing called"); return {"status": "ok_placeholder"}
-    def _set_note_probability(self, track_index, clip_index, probability, from_time, to_time, from_pitch, to_pitch): self.log_message("_set_note_probability called"); return {"status": "ok_placeholder"}
-    def _import_audio_file(self, uri, track_index, clip_index, create_track_if_needed): self.log_message("_import_audio_file called"); return {"status": "ok_placeholder"}
-    def _set_track_level(self, track_index, level): self.log_message("_set_track_level called"); return {"status": "ok_placeholder"}
-    def _set_track_pan(self, track_index, pan): self.log_message("_set_track_pan called"); return {"status": "ok_placeholder"}
-    def _get_clip_envelope(self, track_index, clip_index, device_index, parameter_index): self.log_message("_get_clip_envelope called"); return {"status": "placeholder_no_data"}
-    def _get_notes_from_clip(self, track_index, clip_index): self.log_message("_get_notes_from_clip called"); return {"status": "placeholder_no_data"}
-    def get_browser_tree(self, category_type="all"): self.log_message("get_browser_tree called"); return {"status": "placeholder_no_data"}
-    def get_browser_items_at_path(self, path): self.log_message("get_browser_items_at_path called"); return {"status": "placeholder_no_data"}
-    def _get_scenes_info(self): self.log_message("_get_scenes_info called"); return {"status": "placeholder_no_data"}
+    def _load_instrument_or_effect(self, track_index, item_uri): return self._unsupported("load_instrument_or_effect")
+    def _add_clip_envelope_point(self, track_index, clip_index, device_index, parameter_index, time_val, value, curve_type): return self._unsupported("add_clip_envelope_point")
+    def _clear_clip_envelope(self, track_index, clip_index, device_index, parameter_index): return self._unsupported("clear_clip_envelope")
+    def _create_scene(self, index): return self._unsupported("create_scene")
+    def _set_scene_name(self, index, name): return self._unsupported("set_scene_name")
+    def _delete_scene(self, index): return self._unsupported("delete_scene")
+    def _fire_scene(self, index): return self._unsupported("fire_scene")
+    def _batch_edit_notes_in_clip(self, track_index, clip_index, note_ids, note_data_array): return self._unsupported("batch_edit_notes_in_clip")
+    def _delete_notes_from_clip(self, track_index, clip_index, from_time, to_time, from_pitch, to_pitch): return self._unsupported("delete_notes_from_clip")
+    def _transpose_notes_in_clip(self, track_index, clip_index, semitones, from_time, to_time, from_pitch, to_pitch): return self._unsupported("transpose_notes_in_clip")
+    def _create_audio_track(self, index): return self._unsupported("create_audio_track")
+    def _set_clip_loop_parameters(self, track_index, clip_index, loop_start, loop_end, loop_enabled): return self._unsupported("set_clip_loop_parameters")
+    def _set_clip_follow_action(self, track_index, clip_index, action, target_clip, chance, time_val): return self._unsupported("set_clip_follow_action")
+    def _quantize_notes_in_clip(self, track_index, clip_index, grid_size, strength, from_time, to_time, from_pitch, to_pitch): return self._unsupported("quantize_notes_in_clip")
+    def _randomize_note_timing(self, track_index, clip_index, amount, from_time, to_time, from_pitch, to_pitch): return self._unsupported("randomize_note_timing")
+    def _set_note_probability(self, track_index, clip_index, probability, from_time, to_time, from_pitch, to_pitch): return self._unsupported("set_note_probability")
+    def _import_audio_file(self, uri, track_index, clip_index, create_track_if_needed): return self._unsupported("import_audio_file")
+    def _set_track_level(self, track_index, level): return self._unsupported("set_track_level")
+    def _set_track_pan(self, track_index, pan): return self._unsupported("set_track_pan")
+    def _get_clip_envelope(self, track_index, clip_index, device_index, parameter_index): return self._unsupported("get_clip_envelope")
+    def _get_notes_from_clip(self, track_index, clip_index): return self._unsupported("get_notes_from_clip")
+    def get_browser_tree(self, category_type="all"): return self._unsupported("get_browser_tree")
+    def get_browser_items_at_path(self, path): return self._unsupported("get_browser_items_at_path")
+    def _get_scenes_info(self): return self._unsupported("get_scenes_info")

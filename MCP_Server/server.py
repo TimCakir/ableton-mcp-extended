@@ -5,16 +5,24 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mcp.server.fastmcp import FastMCP, Context
-import socket
 import json
+import hashlib
 import logging
 import os
 import re
 import threading
+import asyncio
 import time
-from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Union
+
+from MCP_Server.transport import AbletonConnection, PROTOCOL_VERSION
+from MCP_Server.mcp_adapter import (
+    ResponsiveMCP, raise_if_tool_cancelled, wait_for_tool_cancellation,
+)
+from MCP_Server.result_models import (
+    BatchResult, BuildInfo, RecordingStatus, NotePage, NoteEditResult,
+)
 
 from MCP_Server.plugin_aliases import (
     get_alias_for_param,
@@ -37,168 +45,45 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-07-26.20"
+SERVER_BUILD_ID = "2026-09-08.1"
 
-@dataclass
-class AbletonConnection:
-    host: str
-    port: int
-    sock: socket.socket = None
-    
-    def connect(self) -> bool:
-        """Connect to the Ableton Remote Script socket server"""
-        if self.sock:
-            return True
-            
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((self.host, self.port))
-            logger.info(f"Connected to Ableton at {self.host}:{self.port}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to Ableton: {str(e)}")
-            self.sock = None
-            return False
-    
-    def disconnect(self):
-        """Disconnect from the Ableton Remote Script"""
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception as e:
-                logger.error(f"Error disconnecting from Ableton: {str(e)}")
-            finally:
-                self.sock = None
 
-    def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
-        chunks = []
-        sock.settimeout(15.0)  # Increased timeout for operations that might take longer
-        
-        try:
-            while True:
-                try:
-                    chunk = sock.recv(buffer_size)
-                    if not chunk:
-                        if not chunks:
-                            raise Exception("Connection closed before receiving any data")
-                        break
-                    
-                    chunks.append(chunk)
-                    
-                    # Check if we've received a complete JSON object
-                    try:
-                        data = b''.join(chunks)
-                        json.loads(data.decode('utf-8'))
-                        logger.info(f"Received complete response ({len(data)} bytes)")
-                        return data
-                    except json.JSONDecodeError:
-                        # Incomplete JSON, continue receiving
-                        continue
-                except socket.timeout:
-                    logger.warning("Socket timeout during chunked receive")
-                    break
-                except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-                    logger.error(f"Socket connection error during receive: {str(e)}")
-                    raise
-        except Exception as e:
-            logger.error(f"Error during receive: {str(e)}")
-            raise
-            
-        # If we get here, we either timed out or broke out of the loop
-        if chunks:
-            data = b''.join(chunks)
-            logger.info(f"Returning data after receive completion ({len(data)} bytes)")
-            try:
-                json.loads(data.decode('utf-8'))
-                return data
-            except json.JSONDecodeError:
-                raise Exception("Incomplete JSON response received")
-        else:
-            raise Exception("No data received")
+def _source_sha256(path):
+    try:
+        with open(path, "rb") as source:
+            return hashlib.sha256(source.read()).hexdigest()
+    except OSError:
+        return None
 
-    def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Send a command to Ableton and return the response"""
-        if not self.sock and not self.connect():
-            raise ConnectionError("Not connected to Ableton")
-        
-        command = {
-            "type": command_type,
-            "params": params or {}
-        }
-        
-        # Check if this is a state-modifying command
-        is_modifying_command = command_type in [
-            "create_midi_track", "create_audio_track", "set_track_name",
-            "create_clip", "add_notes_to_clip", "set_clip_name",
-            "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
-            "start_playback", "stop_playback", "load_instrument_or_effect",
-            "set_song_time", "set_arrangement_loop", "jump_to_cue",
-            "create_cue_point", "delete_cue_point",
-            "create_arrangement_clip", "create_arrangement_audio_clip",
-            "duplicate_to_arrangement", "delete_arrangement_clip",
-            "set_arrangement_clip_property",
-            "set_view", "control_arrangement_view",
-            "manage_clip_automation",
-            "add_notes_to_arrangement_clip",
-            "modify_clip_notes", "remove_clip_notes", "add_notes_extended",
-            "set_device_parameter", "set_device_enabled",
-            "delete_device", "navigate_preset",
-            "set_track_volume", "set_track_panning",
-        ]
-        
-        try:
-            logger.info(f"Sending command: {command_type} with params: {params}")
-            
-            # Send the command
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
-            logger.info(f"Command sent, waiting for response...")
-            
-            # For state-modifying commands, add a small delay to give Ableton time to process
-            if is_modifying_command:
-                import time
-                time.sleep(0.1)  # 100ms delay
-            
-            # Set timeout based on command type
-            timeout = 15.0 if is_modifying_command else 10.0
-            self.sock.settimeout(timeout)
-            
-            # Receive the response
-            response_data = self.receive_full_response(self.sock)
-            logger.info(f"Received {len(response_data)} bytes of data")
-            
-            # Parse the response
-            response = json.loads(response_data.decode('utf-8'))
-            logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
-            
-            if response.get("status") == "error":
-                logger.error(f"Ableton error: {response.get('message')}")
-                raise Exception(response.get("message", "Unknown error from Ableton"))
-            
-            # For state-modifying commands, add another small delay after receiving response
-            if is_modifying_command:
-                import time
-                time.sleep(0.1)  # 100ms delay
-            
-            return response.get("result", {})
-        except socket.timeout:
-            logger.error("Socket timeout while waiting for response from Ableton")
-            self.sock = None
-            raise Exception("Timeout waiting for Ableton response")
-        except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-            logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
-            raise Exception(f"Connection to Ableton lost: {str(e)}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON response from Ableton: {str(e)}")
-            if 'response_data' in locals() and response_data:
-                logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
-            self.sock = None
-            raise Exception(f"Invalid response from Ableton: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error communicating with Ableton: {str(e)}")
-            self.sock = None
-            raise Exception(f"Communication error with Ableton: {str(e)}")
+
+def _package_sha256(directory):
+    """Hash every Python source with its relative name, independent of location."""
+    def fail_walk(error):
+        raise error
+
+    try:
+        if not os.path.isfile(os.path.join(directory, "__init__.py")):
+            return None
+        paths = []
+        for parent, directories, files in os.walk(directory, onerror=fail_walk):
+            directories[:] = [name for name in directories if name != "__pycache__"]
+            paths.extend(os.path.join(parent, name) for name in files if name.endswith(".py"))
+        digest = hashlib.sha256(b"ableton-mcp-python-package-v1\0")
+        for path in sorted(paths, key=lambda item: os.path.relpath(item, directory)):
+            name = os.path.relpath(path, directory).replace(os.sep, "/").encode("utf-8")
+            with open(path, "rb") as source:
+                content = source.read()
+            for value in (name, content):
+                digest.update(str(len(value)).encode("ascii") + b"\0")
+                digest.update(value)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+# Captured when this process imports the module, not when diagnostics run.
+SERVER_SOURCE_SHA256 = _source_sha256(__file__)
+SERVER_PACKAGE_SHA256 = _package_sha256(os.path.dirname(os.path.abspath(__file__)))
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
@@ -207,7 +92,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         logger.info("AbletonMCP server starting up")
         
         try:
-            ableton = get_ableton_connection()
+            ableton = await asyncio.to_thread(get_ableton_connection)
             logger.info("Successfully connected to Ableton on startup")
         except Exception as e:
             logger.warning(f"Could not connect to Ableton on startup: {str(e)}")
@@ -218,17 +103,17 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         global _ableton_connection
         if _ableton_connection:
             logger.info("Disconnecting from Ableton on shutdown")
-            _ableton_connection.disconnect()
+            await asyncio.to_thread(_ableton_connection.disconnect)
             _ableton_connection = None
         _invalidate_external_plugin_cache()
         logger.info("AbletonMCP server shut down")
 
 # Create the MCP server with lifespan support
-mcp = FastMCP(
+mcp = ResponsiveMCP(FastMCP(
     "AbletonMCP",
     instructions="Ableton Live integration through the Model Context Protocol",
     lifespan=server_lifespan
-)
+))
 
 # ── Index conversion helpers ─────────────────────────────────────
 #
@@ -324,6 +209,7 @@ def beat_to_bar(beat: float, numerator: int = 4, denominator: int = 4) -> int:
 
 # Global connection for resources
 _ableton_connection = None
+_connection_lock = threading.Lock()
 _EXTERNAL_PLUGIN_CACHE_TTL_SECONDS = 120.0
 _external_plugin_cache_lock = threading.Lock()
 _external_plugin_cache: Dict[str, Any] = {
@@ -339,72 +225,22 @@ def _invalidate_external_plugin_cache() -> None:
         _external_plugin_cache["built_at"] = 0.0
 
 def get_ableton_connection():
-    """Get or create a persistent Ableton connection"""
+    """Get the single connection owner; reconnect only before a new command.
+
+    A failed command is never replayed. The transport closes ambiguous sockets
+    and reports its request ID for explicit outcome reconciliation.
+    """
     global _ableton_connection
-    
-    if _ableton_connection is not None:
-        try:
-            # Test the connection with a simple ping
-            # We'll try to send an empty message, which should fail if the connection is dead
-            # but won't affect Ableton if it's alive
-            _ableton_connection.sock.settimeout(1.0)
-            _ableton_connection.sock.sendall(b'')
-            return _ableton_connection
-        except Exception as e:
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _ableton_connection.disconnect()
-            except:
-                pass
-            _ableton_connection = None
-            _invalidate_external_plugin_cache()
-    
-    # Connection doesn't exist or is invalid, create a new one
-    if _ableton_connection is None:
-        # Try to connect up to 3 times with a short delay between attempts
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                logger.info(f"Connecting to Ableton (attempt {attempt}/{max_attempts})...")
-                _ableton_connection = AbletonConnection(
-                    host=os.getenv("ABLETON_HOST", "localhost"),
-                    port=int(os.getenv("ABLETON_PORT", "9877")),
-                )
-                if _ableton_connection.connect():
-                    logger.info("Created new persistent connection to Ableton")
-                    
-                    # Validate connection with a simple command
-                    try:
-                        # Get session info as a test
-                        _ableton_connection.send_command("get_session_info")
-                        logger.info("Connection validated successfully")
-                        return _ableton_connection
-                    except Exception as e:
-                        logger.error(f"Connection validation failed: {str(e)}")
-                        _ableton_connection.disconnect()
-                        _ableton_connection = None
-                        _invalidate_external_plugin_cache()
-                        # Continue to next attempt
-                else:
-                    _ableton_connection = None
-            except Exception as e:
-                logger.error(f"Connection attempt {attempt} failed: {str(e)}")
-                if _ableton_connection:
-                    _ableton_connection.disconnect()
-                    _ableton_connection = None
-                    _invalidate_external_plugin_cache()
-            
-            # Wait before trying again, but only if we have more attempts left
-            if attempt < max_attempts:
-                import time
-                time.sleep(1.0)
-        
-        # If we get here, all connection attempts failed
+    with _connection_lock:
         if _ableton_connection is None:
-            logger.error("Failed to connect to Ableton after multiple attempts")
-            raise Exception("Could not connect to Ableton. Make sure the Remote Script is running.")
-    
-    return _ableton_connection
+            _ableton_connection = AbletonConnection(
+                host=os.getenv("ABLETON_HOST", "localhost"),
+                port=int(os.getenv("ABLETON_PORT", "9877")),
+            )
+        if not _ableton_connection.connect():
+            _invalidate_external_plugin_cache()
+            raise ConnectionError("Could not connect to Ableton. Make sure the Remote Script is running.")
+        return _ableton_connection
 
 
 # Core Tool endpoints
@@ -641,7 +477,9 @@ def get_clip_notes(
     pitch_span: int = 128,
     arrangement: bool = False,
     clip_name: str | None = None,
-) -> str:
+    offset: int = 0,
+    limit: int = 200,
+) -> NotePage:
     """Read the notes in a MIDI clip — pitch, timing, velocity, probability.
 
     Essential before editing anything that already exists: a part recorded
@@ -649,16 +487,25 @@ def get_clip_notes(
 
     Parameters:
     - track_index / clip_index: 1-based.
-    - from_time / time_span: Beat window. Defaults to the whole clip.
+    - from_time / time_span: Beat window. Omitting time_span reads all stored
+      notes at or after from_time, including notes outside the loop. Older Live
+      APIs report marker_bounds_fallback and a scope warning.
     - from_pitch / pitch_span: MIDI note window. Defaults to all notes.
     - arrangement: Read an ARRANGEMENT clip instead of a session clip.
       `clip_index` then indexes the track's arrangement clips in timeline
       order (1-based) — call `get_arrangement_info` to see that order.
       Note times stay clip-relative, NOT absolute timeline position.
+    - offset / limit: Result page (offset >= 0, limit 1..2000). Follow
+      next_offset until null. Each page reads current state; avoid editing
+      between pages. Filtering happens before pagination.
     - clip_name: With arrangement=True, address the clip by name instead of
       index. Errors if the name is ambiguous on that track.
     """
     try:
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be an integer >= 0")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 2000:
+            raise ValueError("limit must be an integer between 1 and 2000")
         ableton = get_ableton_connection()
         ti = _to_zero_based(track_index, "track_index")
         ci = _to_zero_based(clip_index, "clip_index")
@@ -673,23 +520,12 @@ def get_clip_notes(
             payload["clip_name"] = clip_name
         r = ableton.send_command("get_clip_notes", payload)
         notes = r.get("notes") or []
-        where = "arrangement" if r.get("arrangement") else "session"
-        header = (
-            f"'{r.get('clip_name')}' on '{r.get('track_name')}' ({where}) — "
-            f"{r.get('note_count')} notes, {r.get('length')} beats, "
-            f"pitch range {r.get('pitch_range')}"
-        )
-        lines = [header, ""]
-        for n in notes[:200]:
-            prob = n.get("probability")
-            prob_s = f" p={prob}" if prob is not None and prob < 1 else ""
-            lines.append(
-                f"  {n.get('start_time')}: pitch {n.get('pitch')} "
-                f"dur {n.get('duration')} vel {n.get('velocity')}{prob_s}"
-            )
-        if len(notes) > 200:
-            lines.append(f"  … {len(notes) - 200} more")
-        return "\n".join(lines)
+        page = notes[offset:offset + limit]
+        return {
+            **r, "notes": page, "total": len(notes), "offset": offset,
+            "limit": limit, "returned": len(page),
+            "next_offset": offset + len(page) if offset + len(page) < len(notes) else None,
+        }
     except Exception as e:
         logger.error(f"Error reading clip notes: {str(e)}")
         return f"Error reading clip notes: {str(e)}"
@@ -711,12 +547,12 @@ def modify_clip_notes(
     pitch_span: int = 128,
     arrangement: bool = False,
     clip_name: str | None = None,
-) -> str:
+) -> NoteEditResult:
     """Transform notes already in a clip, in place, without rewriting it.
 
     Notes are read, changed and written back by id, so nothing outside the
-    selected window is disturbed. Humanisation is deterministic, so calling
-    it twice does not compound into sloppiness.
+    selected window is disturbed. Humanization applies deterministic offsets
+    to the current note times; repeated calls accumulate timing changes.
 
     This CANNOT delete notes — use `remove_clip_notes` for that.
 
@@ -725,7 +561,8 @@ def modify_clip_notes(
     - transpose: Semitones, positive or negative.
     - velocity_scale: Multiply velocities, e.g. 0.8 to soften.
     - velocity_set: Set all velocities to one value (overrides scale).
-    - humanize_ms: Timing spread in milliseconds.
+    - humanize_ms: Timing spread in milliseconds. Repeated calls add new offsets
+      to the current note times; humanization is cumulative, not idempotent.
     - probability: Set per-note probability, 0.0-1.0.
     - from_time / time_span / from_pitch / pitch_span: Restrict the window,
       e.g. pitch 42 only to affect just the hats in a drum clip.
@@ -750,7 +587,7 @@ def modify_clip_notes(
             if val is not None:
                 payload[key] = val
         r = ableton.send_command("modify_clip_notes", payload)
-        return f"Modified {r.get('modified')} notes in '{r.get('clip_name')}'"
+        return r
     except Exception as e:
         logger.error(f"Error modifying clip notes: {str(e)}")
         return f"Error modifying clip notes: {str(e)}"
@@ -767,7 +604,7 @@ def remove_clip_notes(
     pitch_span: int = 128,
     arrangement: bool = False,
     clip_name: str | None = None,
-) -> str:
+) -> NoteEditResult:
     """Delete notes from a MIDI clip within a pitch and time window.
 
     The only way to take notes OUT of a part. `modify_clip_notes` transposes
@@ -782,7 +619,9 @@ def remove_clip_notes(
 
     Parameters:
     - track_index / clip_index: 1-based.
-    - from_time / time_span: Beat window. Defaults to the whole clip.
+    - from_time / time_span: Beat window. Omitting time_span targets all stored
+      notes at or after from_time; inspect read_scope and scope_warning for
+      older Live API fallbacks.
     - from_pitch / pitch_span: MIDI note window. Defaults to ALL notes.
     - arrangement / clip_name: Target an ARRANGEMENT clip instead of a session
       clip. Each placed copy is independent, so removing a note from a part
@@ -802,21 +641,7 @@ def remove_clip_notes(
         if clip_name is not None:
             payload["clip_name"] = clip_name
         r = ableton.send_command("remove_clip_notes", payload)
-        where = "arrangement" if r.get("arrangement") else "session"
-        removed = r.get("removed_notes") or []
-        lines = [
-            f"Removed {r.get('removed')} note(s) from '{r.get('clip_name')}' "
-            f"on '{r.get('track_name')}' ({where}) — "
-            f"{r.get('remaining')} remaining"
-        ]
-        for n in removed[:20]:
-            lines.append(
-                f"  {n.get('start_time')}: pitch {n.get('pitch')} "
-                f"dur {n.get('duration')} vel {n.get('velocity')}"
-            )
-        if len(removed) > 20:
-            lines.append(f"  … {len(removed) - 20} more")
-        return "\n".join(lines)
+        return r
     except Exception as e:
         logger.error(f"Error removing clip notes: {str(e)}")
         return f"Error removing clip notes: {str(e)}"
@@ -3041,7 +2866,7 @@ def add_notes_extended(
     replace: bool = False,
     arrangement: bool = False,
     clip_name: str | None = None,
-) -> str:
+) -> NoteEditResult:
     """Add MIDI notes with per-note probability and velocity deviation.
 
     The standard note API cannot express probability, which is what makes
@@ -3055,7 +2880,9 @@ def add_notes_extended(
     - notes: list of {"pitch", "start_time", "duration", "velocity",
       "mute", "probability" (0.0-1.0), "velocity_deviation",
       "release_velocity"}.
-    - replace: Clear existing notes first.
+    - replace: Validate the entire input before replacing stored notes.
+      Failed insertion attempts restore the prior scalar note data; Live
+      may assign new note IDs during recovery.
     - arrangement / clip_name: Write into an ARRANGEMENT clip instead of a
       session clip. `start_time` stays clip-relative, not absolute timeline
       position. This is how a single section is varied in place, rather than
@@ -3073,12 +2900,7 @@ def add_notes_extended(
         if clip_name is not None:
             payload["clip_name"] = clip_name
         r = ableton.send_command("add_notes_extended", payload)
-        where = "arrangement" if r.get("arrangement") else "session"
-        return (
-            f"Added {r.get('notes_added')} notes to '{r.get('clip_name')}' "
-            f"({where})"
-            + (" (replaced existing)" if r.get("replaced") else "")
-        )
+        return r
     except Exception as e:
         logger.error(f"Error adding extended notes: {str(e)}")
         return f"Error adding extended notes: {str(e)}"
@@ -3217,6 +3039,18 @@ def write_arrangement_automation(
         return f"Error writing arrangement automation: {str(e)}"
 
 
+def _recording_result(result: dict) -> dict:
+    """Expose job identity and manifests without inventing legacy verification."""
+    out = dict(result)
+    out.setdefault("status", "unknown")
+    out.setdefault("operation_id", None)
+    out.setdefault("progress", None)
+    out.setdefault("requested", None)
+    out.setdefault("captured", None)
+    out.setdefault("outputs", [])
+    return out
+
+
 @mcp.tool()
 def record_arrangement_automation(
     ctx: Context,
@@ -3225,7 +3059,7 @@ def record_arrangement_automation(
     points: list,
     device_index: int | None = None,
     return_to_start: bool = True,
-) -> str:
+) -> RecordingStatus:
     """Write REAL arrangement automation, by recording it off the transport.
 
     This is how automation actually reaches the arrangement. Clip envelopes
@@ -3265,13 +3099,7 @@ def record_arrangement_automation(
         if device_index is not None:
             payload["device_index"] = _to_zero_based(device_index, "device_index")
         r = ableton.send_command("record_arrangement_automation", payload)
-        secs = r.get("estimated_seconds")
-        secs_txt = f" (~{secs:.1f}s)" if isinstance(secs, (int, float)) else ""
-        return (
-            f"Recording '{r.get('parameter')}' on '{r.get('track')}' from beat "
-            f"{r.get('from_beat')} to {r.get('to_beat')}{secs_txt}. "
-            f"Poll get_automation_record_status until status is 'done'."
-        )
+        return _recording_result(r)
     except Exception as e:
         logger.error(f"Error recording arrangement automation: {str(e)}")
         return f"Error recording arrangement automation: {str(e)}"
@@ -3285,7 +3113,7 @@ def record_over_range(
     to_bar: int,
     arm_track: bool = True,
     return_to_start: bool = True,
-) -> str:
+) -> RecordingStatus:
     """Record a track's live input into the arrangement over a bar range.
 
     Punches a take without hand-timing the record button: arms the track,
@@ -3296,8 +3124,8 @@ def record_over_range(
     Whatever the track monitors is what lands. If the take comes back silent,
     check input routing with `get_routing_options` first.
 
-    The arm state of every track is captured and restored afterwards, because
-    arming one track makes Live's exclusive arm silently disarm the others.
+    The arm state of every track is captured and restored afterwards;
+    unrelated tracks are disarmed during the pass.
 
     Parameters:
     - track_index: Track number (1-based). Must be armable — group and return
@@ -3318,13 +3146,7 @@ def record_over_range(
             "arm_track": arm_track,
             "return_to_start": return_to_start,
         })
-        secs = r.get("estimated_seconds")
-        secs_txt = f" (~{secs:.1f}s)" if isinstance(secs, (int, float)) else ""
-        return (
-            f"Recording input on '{r.get('track')}' over bars "
-            f"{from_bar}-{to_bar - 1}{secs_txt}. "
-            f"Poll get_automation_record_status until status is 'done'."
-        )
+        return _recording_result(r)
     except Exception as e:
         logger.error(f"Error recording over range: {str(e)}")
         return f"Error recording over range: {str(e)}"
@@ -3518,23 +3340,16 @@ def export_stems(
     from_bar: int,
     to_bar: int,
     track_names: list | None = None,
-) -> str:
-    """Bounce every track to its own audio file in ONE transport pass.
+) -> RecordingStatus:
+    """Start a real-time stem capture in one transport pass.
 
-    The obvious way costs N real-time passes. But an audio track can take any
-    other track as its input, so N resampling tracks can be armed together
-    and captured in a single playthrough — 11 stems for the price of one.
+    Creates one recording track per selected source. Snapshots arm state
+    before track creation, disarms unrelated tracks during the pass, and
+    restores captured state on completion or cancellation.
 
-    Requires `exclusive_arm` OFF, which this handles and restores: with it
-    on, arming each stem track disarms the previous one and only the last
-    would record.
-
-    Real time: 32 bars costs 32 bars, once, regardless of how many stems.
-    Returns immediately; poll `get_automation_record_status`.
-
-    Leaves one new audio track per stem, named "STEM <source>", each holding
-    the recorded clip. Delete them once the files are collected — the files
-    live in the project's Samples/Recorded folder.
+    Returns an operation ID immediately. Poll get_automation_record_status;
+    inspect each output's status and file path, then use verify_export_outputs
+    to measure the recorded files. Recording tracks remain in the Set.
 
     Parameters:
     - from_bar / to_bar: Bar range (1-based, to_bar exclusive).
@@ -3550,14 +3365,7 @@ def export_stems(
         if track_names:
             payload["track_names"] = track_names
         r = ableton.send_command("export_stems", payload)
-        secs = r.get("estimated_seconds")
-        secs_txt = f" (~{secs:.1f}s)" if isinstance(secs, (int, float)) else ""
-        names = ", ".join(s.get("source", "?") for s in (r.get("stems") or []))
-        return (
-            f"Recording {r.get('stem_count')} stems over bars "
-            f"{from_bar}-{to_bar - 1}{secs_txt} in ONE pass: {names}\n"
-            f"Poll get_automation_record_status until status is 'done'."
-        )
+        return _recording_result(r)
     except Exception as e:
         logger.error(f"Error exporting stems: {str(e)}")
         return f"Error exporting stems: {str(e)}"
@@ -3570,13 +3378,13 @@ def freeze_track(
     from_bar: int = 1,
     to_bar: int = 0,
     deactivate: bool = True,
-) -> str:
-    """Bounce a track to audio and switch the original off — a real freeze.
+) -> RecordingStatus:
+    """Bounce a track to audio and optionally deactivate the original.
 
-    Live's own freeze is not in the API (`is_frozen` has no setter). This
-    reaches the same end differently: resample the track, then drop its
-    `track_activator` so its devices stop costing CPU. Fully reversible —
-    turn the original back on and delete the bounce track.
+    This records in real time and switches off the original track only after
+    the output has been verified. It does not invoke Live's native Freeze or
+    disable the device chain, and no CPU saving is promised. Turn the original
+    back on and remove the bounce track to reverse the audible change.
 
     Use `get_performance_report` (while rolling) to find what is worth
     freezing.
@@ -3588,8 +3396,8 @@ def freeze_track(
     - track_index: Track to freeze (1-based).
     - from_bar / to_bar: Range to bounce. to_bar defaults to the end of the
       arrangement, which is what you normally want.
-    - deactivate: Switch the original off afterwards. False bounces without
-      touching it.
+    - deactivate: Switch the original off only after a verified complete
+      bounce. False leaves the original enabled.
     """
     try:
         ableton = get_ableton_connection()
@@ -3604,15 +3412,7 @@ def freeze_track(
             "to_beat": bar_to_beat(to_bar, num, denom),
             "deactivate": deactivate,
         })
-        secs = r.get("estimated_seconds")
-        secs_txt = f" (~{secs:.0f}s)" if isinstance(secs, (int, float)) else ""
-        tail = (" The original will be switched off when it finishes."
-                if deactivate else "")
-        return (
-            f"Freezing '{r.get('frozen_source')}' over bars "
-            f"{from_bar}-{to_bar - 1}{secs_txt}.{tail}\n"
-            f"Poll get_automation_record_status until status is 'done'."
-        )
+        return _recording_result(r)
     except Exception as e:
         logger.error(f"Error freezing track: {str(e)}")
         return f"Error freezing track: {str(e)}"
@@ -3624,7 +3424,7 @@ def capture_session_to_arrangement(
     scene_index: int,
     from_bar: int,
     to_bar: int,
-) -> str:
+) -> RecordingStatus:
     """Record a firing scene into the arrangement.
 
     Live's oldest songwriting move: play session clips, hit arrangement
@@ -3650,13 +3450,7 @@ def capture_session_to_arrangement(
             "from_beat": bar_to_beat(from_bar, num, denom),
             "to_beat": bar_to_beat(to_bar, num, denom),
         })
-        secs = r.get("estimated_seconds")
-        secs_txt = f" (~{secs:.1f}s)" if isinstance(secs, (int, float)) else ""
-        return (
-            f"Capturing scene '{r.get('scene')}' into bars "
-            f"{from_bar}-{to_bar - 1}{secs_txt}.\n"
-            f"Poll get_automation_record_status until status is 'done'."
-        )
+        return _recording_result(r)
     except Exception as e:
         logger.error(f"Error capturing session to arrangement: {str(e)}")
         return f"Error capturing session to arrangement: {str(e)}"
@@ -3669,25 +3463,16 @@ def bounce_to_audio(
     to_bar: int,
     source: str = "Resampling",
     name: str | None = None,
-) -> str:
-    """Render a bar range to an audio file, by resampling it in real time.
+) -> RecordingStatus:
+    """Record a bar range to a new audio track in real time.
 
-    Live exposes no render/export call — but an audio track accepts
-    "Resampling" (the main bus) or any individual track as its INPUT, so
-    arming one and rolling the transport writes a real audio file into the
-    project's Samples/Recorded folder. Verified: bars 33-35 produced a 48 kHz
-    stereo AIFF peaking at -8.5 dBFS.
+    Resampling captures the main bus; a track name selects that source from
+    Live's input routing options. The new track and recorded clip remain in
+    the Set. This does not invoke offline export or native Freeze/Flatten.
 
-    This covers three things the API supposedly cannot do:
-    - `source="Resampling"` — bounce the full mix (export/mixdown)
-    - `source="<track name>"` — bounce one track (stem export)
-    - the same, then disable the original — a freeze/flatten stand-in
-
-    Real time: bouncing 32 bars takes 32 bars. Returns immediately; poll
-    `get_automation_record_status`, which reports `file_path` once done.
-
-    Creates a new audio track to record onto and leaves it in place, so the
-    result is audible and editable. Delete it when finished with it.
+    Returns an operation ID immediately. Poll get_automation_record_status
+    for completion and output file paths. Use verify_export_outputs to
+    measure the files before judging the capture's audio quality.
 
     Parameters:
     - from_bar / to_bar: Bar range (1-based, to_bar exclusive).
@@ -3707,63 +3492,34 @@ def bounce_to_audio(
         if name:
             payload["name"] = name
         r = ableton.send_command("bounce_to_audio", payload)
-        secs = r.get("estimated_seconds")
-        secs_txt = f" (~{secs:.1f}s)" if isinstance(secs, (int, float)) else ""
-        return (
-            f"Bouncing '{r.get('source')}' over bars {from_bar}-{to_bar - 1}"
-            f"{secs_txt} onto new track '{r.get('bounce_track')}'. "
-            f"Poll get_automation_record_status for status and file_path."
-        )
+        return _recording_result(r)
     except Exception as e:
         logger.error(f"Error bouncing to audio: {str(e)}")
         return f"Error bouncing to audio: {str(e)}"
 
 
 @mcp.tool()
-def get_automation_record_status(ctx: Context) -> str:
-    """Progress of an in-flight `record_arrangement_automation` pass.
+def get_automation_record_status(ctx: Context) -> RecordingStatus:
+    """Inspect the latest recording job, its progress and every expected output.
 
-    Status is one of: idle, recording, done, cancelled, failed.
+    A recording/export start returns operation_id. Check that identity when
+    polling. Only status='done' indicates a completed capture; inspect outputs
+    and analyze recorded files before judging audio quality. Failure/cancelled
+    states retain partial or missing outputs instead of claiming success.
     """
-    try:
-        ableton = get_ableton_connection()
-        r = ableton.send_command("get_automation_record_status", {})
-        status = r.get("status", "idle")
-        if status == "idle":
-            return "No automation recording has run this session."
-        head = (
-            f"{status.upper()} — '{r.get('parameter')}' on '{r.get('track')}' "
-            f"(beats {r.get('from_beat')}-{r.get('to_beat')})"
-        )
-        pos = r.get("position")
-        if isinstance(pos, (int, float)):
-            head += f"\nPlayhead at beat {pos:.2f}, {r.get('samples')} points written"
-        if r.get("file_path"):
-            head += f"\nRecorded file: {r.get('file_path')}"
-        return head
-    except Exception as e:
-        logger.error(f"Error reading automation record status: {str(e)}")
-        return f"Error reading automation record status: {str(e)}"
+    ableton = get_ableton_connection()
+    return _recording_result(ableton.send_command("get_automation_record_status", {}))
 
 
 @mcp.tool()
-def cancel_automation_record(ctx: Context) -> str:
-    """Abort an in-flight automation record pass and disarm the transport.
+def cancel_automation_record(ctx: Context) -> RecordingStatus:
+    """Cancel the active recording/export job and restore captured transport state.
 
-    Whatever was already recorded stays — undo it in Live if unwanted.
+    Returns the operation ID and partial output manifest. Audio or automation
+    already recorded remains in the Set; cancellation does not undo it.
     """
-    try:
-        ableton = get_ableton_connection()
-        r = ableton.send_command("cancel_automation_record", {})
-        if not r.get("cancelled"):
-            return f"Nothing to cancel: {r.get('reason')}"
-        return (
-            f"Cancelled recording '{r.get('parameter')}' on "
-            f"'{r.get('track')}' at beat {r.get('stopped_at_beat')}"
-        )
-    except Exception as e:
-        logger.error(f"Error cancelling automation record: {str(e)}")
-        return f"Error cancelling automation record: {str(e)}"
+    ableton = get_ableton_connection()
+    return _recording_result(ableton.send_command("cancel_automation_record", {}))
 
 
 @mcp.tool()
@@ -4040,7 +3796,7 @@ def set_track_monitoring(ctx: Context, track_index: int, state: str) -> str:
         mapping = {"in": 0, "auto": 1, "off": 2}
         key = str(state).strip().lower()
         if key not in mapping:
-            return f"Invalid state '{state}'. Use 'in', 'auto' or 'off'."
+            return f"Error: Invalid state '{state}'. Use 'in', 'auto' or 'off'."
         ableton = get_ableton_connection()
         ti = _to_zero_based(track_index, "track_index")
         r = ableton.send_command("set_track_monitoring", {
@@ -4064,7 +3820,7 @@ def set_crossfade_assign(ctx: Context, track_index: int, assign: str) -> str:
         mapping = {"a": 0, "none": 1, "b": 2}
         key = str(assign).strip().lower()
         if key not in mapping:
-            return f"Invalid assign '{assign}'. Use 'a', 'b' or 'none'."
+            return f"Error: Invalid assign '{assign}'. Use 'a', 'b' or 'none'."
         ableton = get_ableton_connection()
         ti = _to_zero_based(track_index, "track_index")
         r = ableton.send_command("set_crossfade_assign", {
@@ -4825,7 +4581,7 @@ def load_instrument_or_effect(ctx: Context, track_index: int, uri: str) -> str:
                 return f"Loaded '{item_name}' on track {track_index}."
             return f"Loaded instrument with URI '{uri}' on track {track_index}."
         else:
-            return f"Failed to load instrument with URI '{uri}'"
+            return f"Error: Failed to load instrument with URI '{uri}'"
     except Exception as e:
         logger.error(f"Error loading instrument by URI: {str(e)}")
         return f"Error loading instrument by URI: {str(e)}"
@@ -5275,7 +5031,7 @@ def load_external_plugin(
             return (
                 "Loaded external plugin '{0}' on track {1} (matched '{2}')."
             ).format(chosen.get("name", "?"), track_index, plugin_name)
-        return "Failed to load external plugin '{0}'.".format(chosen.get("name", "?"))
+        return "Error: Failed to load external plugin '{0}'.".format(chosen.get("name", "?"))
     except Exception as e:
         logger.error(f"Error loading external plugin: {str(e)}")
         return f"Error loading external plugin: {str(e)}"
@@ -5310,7 +5066,7 @@ def load_drum_kit(ctx: Context, track_index: int, rack_uri: str, kit_path: str) 
             "item_uri": rack_uri,
         })
         if not rack_result.get("loaded", False):
-            return f"Failed to load drum rack with URI '{rack_uri}'"
+            return f"Error: Failed to load drum rack with URI '{rack_uri}'"
 
         if _looks_like_browser_uri(kit_path):
             kit_uri = kit_path
@@ -5502,7 +5258,7 @@ def batch(
     commands: list,
     stop_on_error: bool = True,
     indices_are_one_based: bool = True,
-) -> str:
+) -> BatchResult:
     """Run many commands in one call instead of one call each.
 
     Every other tool is a full round trip, and above the socket each one
@@ -5511,8 +5267,9 @@ def batch(
     impractical. Use this for anything repetitive: placing clips across an
     arrangement, setting levels on every track, renaming a batch of scenes.
 
-    Commands run in order, through exactly the same code path as sending
-    them individually.
+    Commands run in order. Returns each result with a 1-based index and
+    success/error/skipped status. Partial application is an MCP error result
+    whose structured content preserves every completed result.
 
     Parameters:
     - commands: list of {"command": <name>, "params": {...}}, e.g.
@@ -5546,93 +5303,111 @@ def batch(
         r = ableton.send_command("batch", {
             "commands": prepared, "stop_on_error": stop_on_error})
 
-        ran = r.get("ran", 0)
-        total = r.get("total", 0)
-        ok = r.get("succeeded", 0)
-        bad = r.get("failed", 0)
-        lines = [f"Batch: {ok}/{total} succeeded, {bad} failed"
-                 + (f" (stopped early after {ran})"
-                    if r.get("stopped_early") else "")]
-        for record in r.get("results") or []:
-            if record.get("status") == "error":
-                lines.append(
-                    f"  #{record.get('index', 0) + 1} {record.get('command')}: "
-                    f"{record.get('message')}")
-        if bad == 0:
-            lines.append("  (all clean)")
-        return "\n".join(lines)
+        records = {record["index"]: record for record in r.get("results", [])}
+        results = []
+        for index, command in enumerate(prepared):
+            record = records.get(index)
+            if record is None:
+                record = {
+                    "status": "skipped" if r.get("stopped_early") else "error",
+                    "message": "Not run after an earlier error." if r.get("stopped_early")
+                    else "Remote script omitted this command's result; outcome unknown.",
+                }
+            item = dict(record)
+            item["index"] = index + 1
+            item.setdefault("command", command["command"])
+            item.setdefault("result", None)
+            results.append(item)
+        succeeded = sum(row["status"] == "success" for row in results)
+        failed = sum(row["status"] == "error" for row in results)
+        skipped = sum(row["status"] == "skipped" for row in results)
+        status = "success" if succeeded == len(prepared) else ("partial" if succeeded else "error")
+        return {
+            **r,
+            "status": status,
+            "total": len(prepared), "ran": len(prepared) - skipped,
+            "succeeded": succeeded, "failed": failed, "skipped": skipped,
+            "stopped_early": bool(r.get("stopped_early")), "results": results,
+        }
     except Exception as e:
         logger.error(f"Error running batch: {str(e)}")
         return f"Error running batch: {str(e)}"
 
 
 @mcp.tool()
-def get_build_info(ctx: Context) -> str:
-    """Check that Live, this server, and the repo are running the same build.
+def get_build_info(ctx: Context) -> BuildInfo:
+    """Compare the loaded remote script, this process, repo and wire protocol.
 
-    RUN THIS FIRST when a command seems to be missing, a parameter the docs
-    describe is rejected, or Live "cannot" do something you believe it can.
-    Three copies of this integration run at once — the repo on disk, the
-    remote script Live loaded at its own startup, and this server process —
-    and they drift apart constantly, because Live only re-reads a remote
-    script when Live restarts and this server only re-reads its source when
-    the MCP host restarts.
-
-    Every limitation found so far that turned out not to be real was one of
-    those copies being stale, not a limit in the Live API.
+    Missing values remain unknown. Matching build labels establish version
+    agreement, not evidence that an individual Live API operation is supported.
     """
+    repo_build = None
+    repo_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "AbletonMCP_Remote_Script", "__init__.py")
     try:
-        server_build = SERVER_BUILD_ID
-        repo_build = None
-        repo_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "AbletonMCP_Remote_Script", "__init__.py")
-        try:
-            with open(repo_path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    m = re.match(r'^BUILD_ID\s*=\s*["\'](.+?)["\']', line)
-                    if m:
-                        repo_build = m.group(1)
-                        break
-        except OSError:
-            pass
-
+        with open(repo_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                match = re.match(r'^BUILD_ID\s*=\s*["\'](.+?)["\']', line)
+                if match:
+                    repo_build = match.group(1)
+                    break
+    except OSError:
+        pass
+    common = {
+        "server_build": SERVER_BUILD_ID, "repo_build": repo_build,
+        "server_protocol_version": PROTOCOL_VERSION,
+        "repo_source_sha256": _source_sha256(repo_path),
+        "server_loaded_source_sha256": SERVER_SOURCE_SHA256,
+        "server_disk_source_sha256": _source_sha256(__file__),
+        "repo_package_sha256": _package_sha256(os.path.dirname(repo_path)),
+        "server_loaded_package_sha256": SERVER_PACKAGE_SHA256,
+        "server_disk_package_sha256": _package_sha256(os.path.dirname(os.path.abspath(__file__))),
+    }
+    try:
         ableton = get_ableton_connection()
-        r = ableton.send_command("get_build_info", {})
-        live_build = r.get("remote_script_build")
-
-        lines = [
-            f"Live {r.get('live_version', '?')}",
-            f"  open Set : {r.get('set_name', '?')}",
-            f"             {r.get('set_file_path', '?')}",
-            f"  remote script loaded by Live : {live_build}",
-            f"  this MCP server process      : {server_build}",
-            f"  repo on disk                 : {repo_build or '?'}",
-            f"  script file: {r.get('script_file', '?')}",
-        ]
-        builds = {b for b in (live_build, server_build, repo_build) if b}
-        if len(builds) > 1:
-            lines.append("")
-            lines.append("MISMATCH — these are not the same build.")
-            if repo_build and live_build != repo_build:
-                lines.append(
-                    "  Live is stale: redeploy the remote script, then "
-                    "restart Ableton Live (it only reads the script at "
-                    "startup).")
-            if repo_build and server_build != repo_build:
-                lines.append(
-                    "  This server is stale: restart the MCP host (Claude "
-                    "Code) so it re-imports server.py.")
-            lines.append(
-                "  Until they match, a missing command means a stale build, "
-                "NOT a Live API limitation.")
-        else:
-            lines.append("")
-            lines.append("All three match — a missing command is a real gap.")
-        return "\n".join(lines)
-    except Exception as e:
-        logger.error(f"Error getting build info: {str(e)}")
-        return f"Error getting build info: {str(e)}"
+        remote = ableton.send_command("get_build_info", {})
+    except Exception as exc:
+        return {**common, "status": "unreachable", "message": str(exc),
+                "recovery": ["Start Live with AbletonMCP enabled, then query build info again."]}
+    live_build = remote.get("remote_script_build")
+    protocol = remote.get("protocol_version")
+    known = {value for value in (live_build, SERVER_BUILD_ID, repo_build) if value}
+    recovery = []
+    remote_hash = remote.get("source_sha256")
+    repo_hash = common["repo_source_sha256"]
+    disk_server_hash = common["server_disk_source_sha256"]
+    remote_package_hash = remote.get("package_sha256")
+    remote_disk_package_hash = remote.get("disk_package_sha256")
+    repo_package_hash = common["repo_package_sha256"]
+    disk_server_package_hash = common["server_disk_package_sha256"]
+    remote_changed = any(left and right and left != right for left, right in (
+        (remote_hash, repo_hash), (remote_package_hash, repo_package_hash),
+        (remote_package_hash, remote_disk_package_hash),
+    ))
+    server_changed = any(left and right and left != right for left, right in (
+        (SERVER_SOURCE_SHA256, disk_server_hash), (SERVER_PACKAGE_SHA256, disk_server_package_hash),
+    ))
+    if len(known) > 1 or (protocol and protocol != PROTOCOL_VERSION) or remote_changed or server_changed:
+        status = "mismatch"
+        if (repo_build and live_build and live_build != repo_build) or remote_changed:
+            recovery.append("Redeploy the remote script and restart Ableton Live.")
+        if (repo_build and SERVER_BUILD_ID != repo_build) or server_changed:
+            recovery.append("Restart the MCP host to load the current server code.")
+        if protocol and protocol != PROTOCOL_VERSION:
+            recovery.append("Deploy matching remote-script and MCP-server protocol versions.")
+    elif not all((live_build, SERVER_BUILD_ID, repo_build, protocol, remote_hash, repo_hash,
+                  SERVER_SOURCE_SHA256, disk_server_hash, remote_package_hash,
+                  remote_disk_package_hash, repo_package_hash, SERVER_PACKAGE_SHA256,
+                  disk_server_package_hash)):
+        status = "unknown"
+        recovery.append("At least one build, protocol or source hash is unavailable; agreement is unverified.")
+    else:
+        status = "match"
+    return {**remote, **common, "status": status,
+            "remote_script_build": live_build, "protocol_version": protocol,
+            "remote_source_sha256": remote_hash, "remote_package_sha256": remote_package_hash,
+            "remote_disk_package_sha256": remote_disk_package_hash, "recovery": recovery}
 
 
 @mcp.tool()
@@ -5942,20 +5717,16 @@ def measure_section(
     to_bar: int = 0,
     samples: int = 16,
 ) -> str:
-    """Play a section and MEASURE it — peak, average and headroom per track.
+    """Play a section and sample per-track Live meter values in real time.
 
-    `get_meters` on its own returns one instantaneous reading, which catches
-    whatever happened to be sounding at that millisecond. A kick that only
-    hits on beat 1 reads either "loudest in the mix" or "silent" depending on
-    when you asked. That makes single readings close to useless for mix
-    decisions.
+    Reports peak, mean and how often each track exceeded the meter threshold.
+    These are Live meter units, not dBFS, LUFS or measured audio headroom.
+    Use verify_export_outputs for file-based measurements.
 
-    This rolls the section and samples repeatedly, then reports per track:
-    peak, mean, and how often it was audible at all. Tracks that never rise
-    above the noise floor are called out — that is usually a routing mistake
-    or something buried, and it is invisible in a single sample.
-
-    Runs in real time: measuring 8 bars takes 8 bars.
+    Normal completion stops playback. Cancelling this MCP call stops future
+    sampling and suppresses its final stop command; playback already started
+    remains running. Use stop_playback explicitly when desired. An already
+    issued remote command may finish before the worker observes cancellation.
 
     Parameters:
     - from_bar: Bar to start at (1-based).
@@ -5969,14 +5740,19 @@ def measure_section(
             to_bar = from_bar + 4
         samples = max(3, min(int(samples), 200))
 
+        raise_if_tool_cancelled()
         ableton = get_ableton_connection()
-        num, denom = _get_time_signature()
+        raise_if_tool_cancelled()
         info = ableton.send_command("get_session_info", {})
+        raise_if_tool_cancelled()
+        num = info.get("signature_numerator", 4)
+        denom = info.get("signature_denominator", 4)
         tempo = float(info.get("tempo", 120.0))
         beats = bar_to_beat(to_bar, num, denom) - bar_to_beat(from_bar, num, denom)
         window = beats * 60.0 / tempo
         gap = window / samples
 
+        raise_if_tool_cancelled()
         ableton.send_command("play_section", {
             "from_beat": bar_to_beat(from_bar, num, denom),
             "loop": False, "play": True})
@@ -5984,13 +5760,15 @@ def measure_section(
         collected: dict = {}
         master_peak = 0.0
         taken = 0
-        deadline = time.time() + window
-        while time.time() < deadline and taken < samples:
-            time.sleep(gap)
+        deadline = time.monotonic() + window
+        while time.monotonic() < deadline and taken < samples:
+            wait_for_tool_cancellation(gap)
+            raise_if_tool_cancelled()
             try:
                 m = ableton.send_command("get_meters", {})
             except Exception:
                 break
+            raise_if_tool_cancelled()
             taken += 1
             for row in m.get("tracks") or []:
                 key = row.get("name")
@@ -6006,6 +5784,7 @@ def measure_section(
                 master_peak,
                 float((m.get("master") or {}).get("output_meter_level") or 0.0))
 
+        raise_if_tool_cancelled()
         ableton.send_command("stop_playback", {})
 
         if not taken:
@@ -6034,8 +5813,8 @@ def measure_section(
         lines.append(f"{'MASTER':<16} {_level(master_peak):>7}")
         if master_peak >= 0.999:
             lines.append(
-                "\nMASTER METER IS PINNED at full scale — almost certainly "
-                "clipping. Confirm by bouncing and measuring the file.")
+                "\nMaster meter reached full scale. Confirm sample clipping "
+                "by bouncing and measuring the file.")
         if silent:
             lines.append(
                 "\nNever audible in this section: " + ", ".join(silent) +
@@ -6907,6 +6686,11 @@ def navigate_device_preset(
     except Exception as e:
         logger.error(f"Error navigating preset: {str(e)}")
         return f"Error navigating preset: {str(e)}"
+
+
+from MCP_Server.workflow_tools import register_workflow_tools
+
+register_workflow_tools(mcp, get_ableton_connection)
 
 
 # Main execution

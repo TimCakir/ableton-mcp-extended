@@ -1,374 +1,175 @@
-# Installation Guide
-**Get Ableton MCP Extended running in under 10 minutes**
+# Installation and upgrades
 
-> **Want to see what's possible first?** Check out our [capabilities demonstration video](#-capabilities-demonstration) to see Ableton MCP Extended in action before installing!
+The assistant runs the Python MCP server; Ableton Live loads a separate Remote Script. Both components must be updated and restarted to use a new build.
 
----
+## Requirements
 
-## Prerequisites
+- Python 3.10 or newer and Git.
+- Ableton Live 11 or 12. Individual features depend on the Live version, edition and exposed API; see [Live 11 notes](LIVE_11_NOTES.md).
+- An assistant that can launch a local stdio MCP server.
+- Optional: `ffmpeg` and `ffprobe` for file-level audio measurements.
 
-Before we start, make sure you have:
+The current implementation keeps the MCP Python SDK on `>=1.28.1,<2`. Install the project's declared dependencies rather than upgrading the SDK to version 2 independently.
 
-- [ ] **Ableton Live 11 or newer** (any edition - Intro, Standard, or Suite)
-- [ ] **Python 3.10 or higher** ([Download here](https://www.python.org/downloads/))
-- [ ] **Git** command-line tool.
-- [ ] **Claude Desktop** or **Cursor IDE** ([Claude](https://claude.ai/download) | [Cursor](https://cursor.sh/)) | **Gemini CLI** works, but I've tested it and it's nowhere as good as the previous.
-- [ ] **15 minutes** of uninterrupted time
-- [ ] **Administrator privileges** on your computer
+## 1. Install the Python package
 
----
+Keep this checkout in a normal local code directory, outside cloud-synced Documents folders.
 
-## Installation Steps
+### macOS
 
-The installation process involves three main steps: getting the code, installing the remote script in Ableton, and configuring your AI assistant.
-
-### Step 1: Get the Code
-
-First, clone the repository and install the required Python package.
-
-1.  **Clone the Repository:**
-    ```bash
-    git clone https://github.com/uisato/ableton-mcp-extended.git
-    cd ableton-mcp-extended
-    ```
-
-2.  **Install the Package:**
-    This command installs the project in "editable" mode, which is recommended.
-    ```bash
-    pip install -e .
-    ```
-
-3.  **Verify Installation:**
-    Run the following command. A success message indicates the Python component is correctly installed.
-    ```bash
-    python -c "from mcp.server.fastmcp import FastMCP; print('✅ Python package installed successfully!')"
-    ```
-
----
-
-### Step 2: Install the Ableton Remote Script
-
-Ableton Live loads control scripts from a specific user directory.
-
-Your Ableton Remote Scripts location depends on your operating system:
-
-![image](https://github.com/user-attachments/assets/24997e12-8a80-433f-9070-ac72be684a87)
-
-#### 🪟 Windows
-```
-C:\Users\[YourUsername]\Documents\Ableton\User Library\Remote Scripts\
-```
-**Quick way to find it:**
-1. Open **File Explorer**
-2. Paste this in the address bar: `%USERPROFILE%\Documents\Ableton\User Library\Remote Scripts`
-3. Press **Enter**
-
-#### 🍎 macOS
-```
-~/Library/Preferences/Ableton/Live [Version]/User Remote Scripts/
-```
-**Quick way to find it:**
-1. Open **Finder**
-2. Press **Cmd + Shift + G**
-3. Paste: `~/Library/Preferences/Ableton/`
-4. Navigate to your Live version folder, then `User Remote Scripts`
-
-### Install the Main Remote Script
-
-1. **Create folder:** In your Remote Scripts directory, create a new folder called `AbletonMCP`
-2. **Copy file:** Copy `AbletonMCP_Remote_Script/__init__.py` into the `AbletonMCP` folder
-
-**Your folder structure should look like:**
-```
-Remote Scripts/
-├── AbletonMCP/
-│   └── __init__.py
-└── (other scripts...)
+```bash
+git clone https://github.com/TimCakir/ableton-mcp-extended.git
+cd ableton-mcp-extended
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/python -c "import MCP_Server.server; print('MCP server imports successfully')"
 ```
 
-Same would apply if you want to install the UDP version of Ableton MCP server. Create another folder (I called it "AbletonMCP_UDP") and place its corresponding '__init__.py' inside. Both servers can co-exist.
+### Windows PowerShell
 
-> 💡 **Tip:** Double-check this folder structure - it's the most common source of installation issues.
+```powershell
+git clone https://github.com/TimCakir/ableton-mcp-extended.git
+cd ableton-mcp-extended
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -c "import MCP_Server.server; print('MCP server imports successfully')"
+```
 
----
+For an existing checkout, run the install command from that repository directory. The import check verifies the Python package, not the connection to Live.
 
-### Step 3: Configure Ableton Live
+### Reproducible setup with uv
 
-Enable the Remote Script:
+If you use uv, run `uv sync --locked` from the repository instead of creating and installing the environment with pip. This creates `.venv` using the versions in `uv.lock`. For development, include the test extra:
 
-1.  **Open or restart Ableton Live.**
-2.  Navigate to **Preferences** (`Ctrl + ,` or `Cmd + ,`).
-3.  Go to the **Link, Tempo & MIDI** tab.
-4.  In an empty **Control Surface** slot, select **AbletonMCP** from the dropdown menu.
-5.  Set the **Input** and **Output** for the `AbletonMCP` surface to **None**.
-6.  Close the Preferences window.
+```bash
+uv sync --locked --extra dev
+uv run --locked --extra dev pytest -q
+```
 
-When the script is loaded correctly, you will see a message in Ableton's status bar: **"AbletonMCP: Listening for commands on port 9877"**.
+Pip remains supported, but it resolves versions within the declared dependency ranges rather than consuming `uv.lock`.
 
----
+## 2. Install the Remote Script
 
-### Step 4: Connect Your AI Assistant
+Find the actual **User Library** location in Live's library preferences. If it has been moved, use that location. The usual defaults are:
 
-Choose your preferred AI assistant:
+| Platform | Remote Script destination |
+| --- | --- |
+| macOS | `~/Music/Ableton/User Library/Remote Scripts/AbletonMCP/` |
+| Windows | `%USERPROFILE%\Documents\Ableton\User Library\Remote Scripts\AbletonMCP\` |
 
-### 🔵 Claude Desktop
+Create the destination directory and copy every `.py` file from `AbletonMCP_Remote_Script/` into it. The resulting path must include `Remote Scripts/AbletonMCP/__init__.py`.
 
-1. **Open Claude Desktop**
-2. Go to **Claude** → **Settings** → **Developer**
-3. Click **"Edit Config"**
-4. **Replace the entire content** with:
+On macOS, the helper performs the copy and compares the installed files with the source:
+
+```bash
+./deploy.sh
+```
+
+For a custom User Library, pass the full **AbletonMCP destination directory**:
+
+```bash
+ABLETON_MCP_REMOTE_SCRIPT_DIR="/absolute/path/to/User Library/Remote Scripts/AbletonMCP" ./deploy.sh
+```
+
+The default macOS helper also updates older `User Remote Scripts` locations when those folders already exist. The current User Library path is the primary installation destination. The helper does not restart Live or verify which build Live has loaded.
+
+## 3. Enable the script in Live
+
+1. Save the Set you are working on, then restart Live to load the installed code.
+2. Open **Settings/Preferences → Link, Tempo & MIDI**.
+3. Select **AbletonMCP** in an available **Control Surface** slot.
+4. Set its **Input** and **Output** to **None**.
+
+The primary script listens on local TCP port **9877**. A copied file and an enabled Control Surface are setup steps; the build check below establishes which code is answering.
+
+## 4. Configure the assistant
+
+Use the absolute path to the Python executable inside the virtual environment. Launch the installed package as a module, so its imports work independently of the assistant's working directory.
+
+For hosts that use an `mcpServers` JSON object, add or update only its `AbletonMCP` entry. Preserve all existing servers and unrelated settings; the following is an example for a fresh configuration:
 
 ```json
 {
   "mcpServers": {
     "AbletonMCP": {
-      "command": "python",
-      "args": [
-        "C:\\path\\to\\ableton-mcp-extended\\MCP_Server\\server.py"
-      ]
+      "command": "/absolute/path/to/ableton-mcp-extended/.venv/bin/python",
+      "args": ["-m", "MCP_Server.server"]
     }
   }
 }
 ```
 
-5. **Update the path:** Replace `C:\\path\\to\\ableton-mcp-extended` with your actual installation path
-6. **Save** and **restart Claude Desktop**
+For Windows, use a Python path such as `C:\\Developer\\ableton-mcp-extended\\.venv\\Scripts\\python.exe` in JSON. The `args` stay the same. Hosts with another configuration format need the same executable and argument list.
 
-#### 🔍 Finding Your Installation Path
-**Windows:**
+Restart the MCP server in the assistant after saving the configuration. To print the interpreter path from the repository:
+
 ```bash
-# In your ableton-mcp-extended folder, run:
-echo %CD%\MCP_Server\server.py
+.venv/bin/python -c "import sys; print(sys.executable)"
 ```
 
-**macOS:**
+The default connection is `localhost:9877`. `ABLETON_HOST` and `ABLETON_PORT` override the Python client's connection target; setting them does not reconfigure the Remote Script listener.
+
+## 5. Verify the installed build
+
+Start with read-only tool calls:
+
+1. Run `get_build_info`. For a source checkout with both components loaded correctly, `status` should be `match`, with build `2026-09-08.1` and protocol `2.1`.
+2. If the result is `mismatch`, follow its `recovery` messages. Redeploy and restart Live for stale Remote Script code; restart the assistant's MCP server for stale Python server code.
+3. If it is `unknown`, a build value or source hash is unavailable. This is not confirmation of agreement. If `unreachable`, check that Live is running and the Control Surface is loaded.
+4. Run `get_session_overview` and confirm the Set name and tracks.
+5. Run `get_edit_targets`, then preview an `edit_track` call using a returned identity. The default preview does not change Live.
+
+For an actual edit or recording test, use a disposable copy of a Set. Check the result in Live and, when testing persistence, save and reopen that copy. Local automated tests do not verify a real recording or saved-Set behavior.
+
+## Upgrade checklist
+
+1. Update the intended checkout and install its dependencies into the same virtual environment used by the assistant.
+2. Copy the Remote Script with `./deploy.sh` or the manual instructions above.
+3. Save your current work and restart Live; restart the MCP server in the assistant.
+4. Repeat `get_build_info` and the read-only Set checks.
+5. Update integrations that parse old text results: note operations, recording operations, batch results and build diagnostics now expose structured result objects. See [release compatibility notes](docs/RELEASE-1.1.0.md#response-and-compatibility-changes).
+
+## Optional audio analysis
+
+Install FFmpeg through your normal package manager and ensure both `ffmpeg` and `ffprobe` are available on the MCP process's `PATH`. On macOS with Homebrew:
+
 ```bash
-# In your ableton-mcp-extended folder, run:
-echo $PWD/MCP_Server/server.py
+brew install ffmpeg
+ffmpeg -version
+ffprobe -version
 ```
 
-### 🟡 Cursor IDE
+If a desktop host has a restricted `PATH`, add an `env.PATH` entry to this server's configuration containing the directory where these executables are installed, along with the usual system paths. Restart that MCP server after changing its environment.
 
-1. **Open Cursor**
-2. Go to **Settings** → **MCP**
-3. **Add new MCP server:**
-   - **Paste this**:
+`analyze_audio_file` reads the first 60 seconds by default and accepts `analysis_seconds` greater than zero and up to 600. It reports total duration and whether the measured segment covers the entire file. Sample peak and RMS use FFmpeg's 16-bit `volumedetect` measurement at 0.1 dB precision; these are not LUFS or true-peak measurements.
 
-```json
-{
-  "mcpServers": {
-    "AbletonMCP": {
-      "command": "python",
-      "args": [
-        "C:/path/to/ableton-mcp-extended/MCP_Server/server.py"
-      ]
-    }
-  }
-}
-```
+`verify_export_outputs` reads the latest recording manifest and measures available files. It skips analysis while a recording is active. Missing files, partial captures and file-analysis errors remain visible in the result.
 
-4. **Save settings**
+## Optional UDP companion
 
-### Verify AI Connection
+Copy `Ableton-MCP_hybrid-server/AbletonMCP_UDP/__init__.py` into a separate `Remote Scripts/AbletonMCP_UDP/` directory and enable that Control Surface with Input/Output set to None.
 
-**For Claude Desktop:**
-Look for a **🔨 hammer icon** in the chat interface - this indicates MCP tools are loaded.
+This version starts only UDP port **9878**, leaving TCP port **9877** to the primary script. Older companion versions started a competing TCP listener, so update the companion before enabling both. It is an experimental parameter-controller interface; unsupported commands raise errors. See the [XY controller example](experimental_tools/xy_mouse_controller/README.md) for its own requirements.
 
-**For Cursor:**
-You'll see a green dot next to the MCP server icon, and a message saying "40 tools enabled".
+## Optional ElevenLabs server
 
-You might have to restart your AI assistant in order for changes to impact.
+The separate ElevenLabs server requires `ELEVENLABS_API_KEY`. With that variable set in your environment, the setup helper can add its entry to an existing Claude configuration:
 
----
-
-### Step 5: Test Your Installation
-
-To confirm everything is working, try these commands in your AI assistant:
-
-### Basic Tests
-1. **"Get information about my current Ableton session"**
-   - Should return details about your Ableton project
-
-2. **"Create a new MIDI track"**
-   - Should create a new track in Ableton
-
-3. **"What tracks do I currently have?"**
-   - Should list your tracks
-
-If all three commands work correctly, congratulations! 🎉 Your installation is complete.
-
----
-
-### Optional: Advanced Features
-
-<details>
-<summary><strong>⚡ High-Performance UDP Server (For Real-Time Control)</strong></summary>
-
-For ultra-low latency parameter control (like the XY Mouse Controller example):
-
-1. **Install UDP Remote Script:**
-   - Create folder: `Remote Scripts/AbletonMCP_UDP/`
-   - Copy: `Ableton-MCP_hybrid-server/AbletonMCP_UDP/__init__.py`
-
-2. **Configure in Ableton:**
-   - Add another Control Surface: "AbletonMCP_UDP"
-   - Input/Output: "None"
-
-3. **Test XY Mouse Controller:**
-   ```bash
-   cd experimental_tools/xy_mouse_controller
-   pip install -r requirements.txt
-   python mouse_parameter_controller_udp.py
-   ```
-
-**Perfect for:** Live performance, real-time effects, expressive control.
-
-Note: both remote scripts (TCP and UDP) can co-exist without issues.
-</details>
-
-<details>
-<summary><strong>🎤 ElevenLabs Voice Integration</strong></summary>
-
-Add AI voice generation to your workflow:
-
-1. **Get ElevenLabs API Key:**
-   - Sign up at [elevenlabs.io](https://elevenlabs.io)
-   - Get your API key from account settings
-
-2. **Add to AI Assistant Config:**
-   ```json
-   {
-     "mcpServers": {
-       "AbletonMCP": {
-         "command": "python",
-         "args": ["C:/path/to/MCP_Server/server.py"]
-       },
-       "ElevenLabs": {
-         "command": "python",
-         "args": ["C:/path/to/elevenlabs_mcp/server.py"],
-         "env": {
-           "ELEVENLABS_API_KEY": "your-api-key-here"
-         }
-       }
-     }
-   }
-   ```
-
-3. **Test Voice Generation:**
-   Try: *"Generate a voice saying 'Hello from ElevenLabs' and import it into Ableton"*
-
-**Perfect for:** Vocals, narration, podcast production, creative voice effects
-</details>
-
----
-
-## 🛠️ Troubleshooting
-
-### ❌ Common Issues & Solutions
-
-<details>
-<summary><strong>🔴 "AbletonMCP not found in Control Surface list"</strong></summary>
-
-**Possible causes:**
-- Remote Script not in correct folder
-- File permissions issue
-- Incorrect folder name
-
-**Solutions:**
-1. Verify folder path: `Remote Scripts/AbletonMCP/__init__.py`
-2. Check file permissions (should be readable)
-3. Restart Ableton Live completely
-4. Check Ableton's log for error messages
-</details>
-
-<details>
-<summary><strong>🟡 "No hammer icon in Claude Desktop"</strong></summary>
-
-**Possible causes:**
-- Incorrect path in config file
-- Python not in system PATH
-- MCP server file missing
-
-**Solutions:**
-1. Verify Python installation: `python --version`
-2. Check absolute path to server.py file
-3. Use double backslashes on Windows: `C:\\path\\to\\file`
-4. Restart Claude Desktop after config changes
-</details>
-
-<details>
-<summary><strong>🟠 "Connection refused" or "Socket error"</strong></summary>
-
-**Possible causes:**
-- Ableton not running
-- Remote Script not loaded
-- Firewall blocking connection
-
-**Solutions:**
-1. Make sure Ableton Live is running
-2. Verify Remote Script is selected in Ableton preferences
-3. Check Windows Firewall/macOS firewall settings
-4. Try restarting both Ableton and your AI assistant
-</details>
-
-<details>
-<summary><strong>🔵 "Python not found" error</strong></summary>
-
-**Solutions:**
-1. **Install Python:** Download from [python.org](https://python.org)
-2. **Add to PATH:** During installation, check "Add Python to PATH"
-3. **Verify installation:** Open terminal, type `python --version`
-4. **Use full path:** If still issues, use full Python path in config
-</details>
-
-### 🔧 Advanced Troubleshooting
-
-**Enable Debug Mode:**
-1. Set environment variable: `ABLETON_MCP_DEBUG=1`
-2. Restart your AI assistant
-3. Check console output for detailed logs
-
-**Test Components Individually:**
 ```bash
-# Test Python installation
-python --version
-
-# Test MCP server directly
-python MCP_Server/server.py
-
-# Test Ableton connection (with Ableton running)
-python -c "import socket; s = socket.socket(); s.connect(('localhost', 9877)); print('✅ Connected')"
+.venv/bin/python -m elevenlabs_mcp --config-path "/absolute/path/to/claude_desktop_config.json"
 ```
 
----
+The helper merges the ElevenLabs entry, preserves other servers and settings, creates a backup when the existing file changes, and replaces the configuration atomically. It refuses malformed JSON or concurrent changes. This configures ElevenLabs only; configure Ableton separately as above. The configuration and backup may contain the API key, so keep them private.
 
-## Capabilities Demonstration
+## Troubleshooting
 
-📹 **See Ableton MCP Extended in action:** [Link to your capabilities demonstration]
+| Symptom | Check |
+| --- | --- |
+| `AbletonMCP` is missing from Control Surfaces | Confirm the actual User Library and `Remote Scripts/AbletonMCP/__init__.py` layout, then restart Live and inspect its log for import errors. |
+| Python module cannot be imported | Run the import check with the exact executable in the host configuration; install the package into that environment. |
+| `Connection refused` | Confirm Live is running and the primary Control Surface is enabled. A tool list in the assistant does not establish a Live connection. |
+| Build `mismatch` | Follow `get_build_info.recovery`; both Live and the MCP process may need restarting after their files are updated. |
+| A command timed out after it may have started | Use the returned request ID with `get_command_status`. `unknown` does not mean it was unapplied; inspect the Set before issuing another edit. |
+| Audio analysis cannot find FFmpeg | Check `ffmpeg` and `ffprobe` on the MCP process's `PATH`, then restart that process. |
 
----
-
-## Installation Complete!
-
-**You're now ready to co-create with your AI assistant!**
-
-### 🚀 Next Steps:
-1. **[Watch the Demo Video](#-capabilities-demonstration)** - See the amazing possibilities
-2. **[Join the Community](https://patreon.com/uisato)** - Share your creations
-
----
-
-## 💬 Need Help?
-
-- **🐛 Found a bug?** [Open an issue](https://github.com/uisato/ableton-mcp-extended/issues)
-- **❓ Have questions?** [Join discussions](https://github.com/uisato/ableton-mcp-extended/discussions)
-
----
-
-<div align="center">
-
-**Welcome to the future of music production!**
-
-*Ready to make music through conversation? Let's create something amazing together.*
-
-</div> 
+For Python-side diagnostics, launch `.venv/bin/python -m MCP_Server.server` from a terminal. It waits for MCP messages on stdin and logs to stderr; it is not an interactive command prompt. See [release examples](docs/RELEASE-1.1.0.md) for request reconciliation and recording verification.

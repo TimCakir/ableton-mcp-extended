@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #
-# Deploy the remote script to every place Live might read it from, and say
-# plainly whether Live needs restarting.
+# Copy the remote-script package and distinguish installed from loaded code.
 #
 # Live reads a remote script exactly once, at startup. Copying the file over a
 # running Live changes nothing until Live is restarted — which is how this repo
@@ -17,67 +16,54 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$REPO/AbletonMCP_Remote_Script/__init__.py"
+SOURCE_DIR="$REPO/AbletonMCP_Remote_Script"
 
 [ -f "$SRC" ] || { echo "no remote script at $SRC" >&2; exit 1; }
 
 BUILD_ID="$(sed -n 's/^BUILD_ID *= *["'"'"']\(.*\)["'"'"']/\1/p' "$SRC" | head -1)"
-SRC_SUM="$(shasum "$SRC" | cut -d' ' -f1)"
 
 echo "Deploying build ${BUILD_ID:-<unstamped>} ($(wc -c < "$SRC" | tr -d ' ') bytes)"
 echo
 
 targets=()
-# Live 12's real location.
-targets+=("$HOME/Music/Ableton/User Library/Remote Scripts/AbletonMCP")
-# Legacy per-version locations, only where the folder already exists.
-while IFS= read -r d; do
-  [ -n "$d" ] && targets+=("$d/AbletonMCP")
-done < <(find "$HOME/Library/Preferences/Ableton" -maxdepth 2 -type d \
-           -name "User Remote Scripts" 2>/dev/null || true)
+if [ -n "${ABLETON_MCP_REMOTE_SCRIPT_DIR:-}" ]; then
+  # Custom User Library locations, and isolated installation verification.
+  targets+=("$ABLETON_MCP_REMOTE_SCRIPT_DIR")
+else
+  targets+=("$HOME/Music/Ableton/User Library/Remote Scripts/AbletonMCP")
+  # Legacy per-version locations, only where the folder already exists.
+  while IFS= read -r d; do
+    [ -n "$d" ] && targets+=("$d/AbletonMCP")
+  done < <(find "$HOME/Library/Preferences/Ableton" -maxdepth 2 -type d \
+             -name "User Remote Scripts" 2>/dev/null || true)
+fi
 
 updated=0
 for dest in "${targets[@]}"; do
   mkdir -p "$dest"
-  if [ -f "$dest/__init__.py" ] &&
-     [ "$(shasum "$dest/__init__.py" | cut -d' ' -f1)" = "$SRC_SUM" ]; then
-    echo "  = $dest"
-  else
-    cp "$SRC" "$dest/__init__.py"
-    echo "  > $dest"
+  location_changed=0
+  for source_file in "$SOURCE_DIR"/*.py; do
+    installed_file="$dest/$(basename "$source_file")"
+    if ! [ -f "$installed_file" ] || ! cmp -s "$source_file" "$installed_file"; then
+      cp "$source_file" "$installed_file"
+      location_changed=1
+    fi
+    cmp -s "$source_file" "$installed_file" || {
+      echo "Installed file verification failed: $installed_file" >&2
+      exit 1
+    }
+  done
+  if [ "$location_changed" -eq 1 ]; then
+    echo "  > Installed and verified: $dest"
     updated=$((updated + 1))
+  else
+    echo "  = Installed files already match: $dest"
   fi
 done
 
-# The MCP server is not deployed anywhere — the host imports it at launch —
-# so this script cannot see what the running process has. But it CAN see
-# whether server.py changed since the last deploy, which is the trigger for
-# needing a host restart. Twice the advice given was "restart Ableton" when
-# server.py had gained new tools and Claude Code needed restarting too; the
-# tools then appeared missing and looked like Live limitations.
-SERVER="$REPO/MCP_Server/server.py"
-STAMP="$REPO/.deploy-server-hash"
-server_changed=0
-if [ -f "$SERVER" ]; then
-  now="$(shasum "$SERVER" | cut -d' ' -f1)"
-  [ -f "$STAMP" ] && prev="$(cat "$STAMP")" || prev=""
-  [ "$now" != "$prev" ] && server_changed=1
-  printf '%s' "$now" > "$STAMP"
-fi
-
 echo
-if [ "$updated" -eq 0 ] && [ "$server_changed" -eq 0 ]; then
-  echo "Everything already current. Nothing to restart."
-  exit 0
-fi
-
-[ "$updated" -gt 0 ] && echo "$updated remote-script location(s) updated." || true
+echo "$updated remote-script location(s) updated; all package .py files verified."
+echo "Loaded Ableton and MCP server versions were not checked by this copy operation."
+echo "Restart Ableton Live and the MCP server in your host to load changed code."
 echo
-if [ "$updated" -gt 0 ]; then
-  echo "  RESTART ABLETON LIVE      — it only reads the remote script at startup."
-fi
-if [ "$server_changed" -eq 1 ]; then
-  echo "  RESTART CLAUDE CODE       — server.py changed; the host only re-imports"
-  echo "                              it on restart, so new tools stay invisible."
-fi
-echo
-echo "Then run get_build_info and believe what it says — all three must match."
+echo "Then run get_build_info to compare the running build, protocol, and file hashes."

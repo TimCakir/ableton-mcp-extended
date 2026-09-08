@@ -1,285 +1,115 @@
 # Ableton MCP Extended
-**Control Ableton Live using natural language via AI assistants like Claude or Cursor. This project provides a robust Model Context Protocol (MCP) server that translates natural language commands into precise actions within your Ableton Live session.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Control Ableton Live through an MCP-compatible assistant. The Python MCP server communicates with a Remote Script running inside Live, exposing tools for tracks, clips, notes, devices, routing, arrangement work and recording.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Ableton Live 11+](https://img.shields.io/badge/Ableton%20Live-11+-orange.svg)](https://www.ableton.com/)
 
----
+## Version 1.1.0
 
-Video demonstration: https://www.youtube.com/watch?v=7ZKPIrJuuKk
+Build `2026-09-08.1` adds eight workflow tools and addresses recording, MIDI-edit and connection failures found in the [September review](docs/MCP-REVIEW-2026-09-03.md) and subsequent real Live testing.
 
-This tool is designed for producers, developers, and AI enthusiasts who want to streamline their music production workflow, experiment with generative music, and build custom integrations with Ableton Live.
+- **Keep targeting the same track:** discover stable track handles, preview an edit, and resolve the handle again when Live executes it. Deleted tracks and changed Sets are rejected.
+- **See what changed:** capture session metadata and compare track, mixer, routing, device and clip changes by handle.
+- **Build an arrangement from MIDI clips:** preview placements, reject overlaps and changed sources, then apply a retained plan without duplicate copies on retry.
+- **Inspect recorded files:** recording jobs return operation IDs and output manifests. Optional FFmpeg analysis measures duration, channels, sample rate, sample peak and RMS, with silence and possible-clipping flags.
+- **Recover from uncertain commands:** requests have IDs, bounded deadlines and status lookup. Expired queued writes do not run later, and uncertain writes are not automatically replayed.
+- **Read and edit MIDI more safely:** paginated structured note results expose the read scope; edit inputs are validated before mutation, with compensation when a note edit partially fails.
+- **Diagnose the code actually loaded:** `get_build_info` compares build labels, protocol and source hashes. Copying a Remote Script does not reload it in Live.
 
-**You can transform this conversation:**
-```
-👤 "Create a brief minimalist/neo-classical composition in a style similar to Ólafur Arnalds'. (Ableton MCP) / I've loaded four MIDI tracks called "Noire" and "Noire (2) ["Emotional Felt" presets], "Noire (2) ["Reversed Felt" preset, for ambient background], and "Noire (3) ["Ethereal Felt" preset, also for ambient background]. All loaded with nice piano instruments. You have also a MIDI track called "Strings" with a nice string ensemble instrument loaded. Feel free to add new instruments and effects, if pertinent."
-🤖 "Creating MIDI clips... Adding effects... Done!"
-👤 "Then, use ElevenLabs MCP to create a spoken-word audio clip (default voice and settings) with a relevant poem in the style of “Jim Morrison” to accompany the composition."  
-🤖 "Generating poem... Transforming it into speech... Importing it into your session... Done!"
-```
+Verified in Live 12.4.5: short bounce and stem captures, cancellation followed by a new job, stable track edits, MIDI edits, arrangement placement safeguards, and saved-Set persistence. The automated suite passes 586 tests. See the [Live acceptance report](docs/LIVE-ACCEPTANCE-2026-09-08.md) for evidence and limits, and [release examples](docs/RELEASE-1.1.0.md) for tool arguments.
 
-**Into this music production session**:
+## Existing capabilities
 
-https://github.com/user-attachments/assets/d6ef2de5-bdeb-4097-acc0-67d70f7f85b3
+| Area | Tools cover |
+| --- | --- |
+| Session and transport | Session inspection, tempo, playback, scenes and cue points |
+| Tracks and routing | Audio/MIDI/return tracks, names, mixer state, sends and routing |
+| Clips and MIDI | Session and arrangement clips, notes, loop settings and supported transformations |
+| Devices | Browser loading, device parameters, racks, chains, drum pads and supported instrument controls |
+| Automation | Clip envelopes and real-time arrangement automation recording, subject to Live API constraints |
+| Recording | Input recording, scene capture, real-time mix bounce and stem capture |
+| Diagnostics | Session overview, meters, performance information, build agreement and command status |
 
----
+The existing `freeze_track` tool performs a real-time bounce and can switch off the original track after output verification. It does not invoke Live's native Freeze/Flatten or promise CPU savings. Features depend on the Live version, edition, device and available API; consult [Live API facts](docs/LIVE-API-FACTS.md) and [Live 11 notes](LIVE_11_NOTES.md).
 
-## Key Features
+## Quick start
 
-This project provides comprehensive, programmatic control over the Ableton Live environment.
+Use Python 3.10 or newer, Ableton Live 11 or 12, and an assistant that supports local stdio MCP servers. The current release work targets Live 12; Live 11 behavior has not been revalidated for this build.
 
-* **Session and Transport Control:**
-    * Start and stop playback.
-    * Get session info, including tempo, time signature, and track count.
-    * Manage scenes: create, delete, rename, and fire.
-
-* **Track Management:**
-    * Create, rename, and get detailed information for MIDI and audio tracks.
-    * Control track properties: volume, panning, mute, solo, and arm.
-    * Manage track grouping and folding states.
-
-* **MIDI Clip and Note Manipulation:**
-    * Create and name MIDI clips with specified lengths.
-    * Add, delete, transpose, and quantize notes within clips.
-    * Perform batch edits on multiple notes in a single operation.
-    * Adjust clip loop parameters and follow actions.
-
-* **Device and Parameter Control:**
-    * Load instruments and effects from Ableton's browser by URI.
-    * Get a full list of parameters for any device on a track.
-    * Set and batch-set device parameters using normalized values (0.0 to 1.0).
-
-* **Automation and Envelopes:**
-    * Add and clear automation points for any device parameter within a clip. [This feature isn't working perfectly yet.]
-    * Get information about existing clip envelopes.
-
-* **Browser Integration:**
-    * Navigate and list items from Ableton's browser.
-    * Load instruments, effects, and samples directly from a browser path or URI.
-    * Import audio files directly into audio tracks or clip slots.
-
-* **Voice & Audio Generation** 
-    * Text-to-Speech Integration: Generate narration, vocal samples, or spoken elements through ElevenLabs MCP [included].
-    * Custom Voice Creation: Clone voices for unique character in your tracks  
-    * Sound Effects: Create custom SFX with AI
-    * Direct Import: Generated audio appears instantly in your Ableton session
-
-* **Extensible Framework for Custom Tools**
-    * Example: XY Mouse Controller: Demonstrates creating custom Ableton controllers with the MCP framework
-    * Ultra-Low Latency: High-performance UDP protocol enables responsive real-time control
-    * Unlimited Possibilities: Build your own custom tools and controllers for Ableton Live
-
----
-
-##  Quick Start (5 Minutes)
-
-### Prerequisites
-- Ableton Live 11+ (any edition)
-- Python 3.10 or higher
-- Claude Desktop or Cursor IDE
-
-### 1. **Get the Code**
 ```bash
-git clone https://github.com/uisato/ableton-mcp-extended.git
+git clone https://github.com/TimCakir/ableton-mcp-extended.git
 cd ableton-mcp-extended
-pip install -e .
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
 ```
 
-### 2. **Install Ableton Script**
-1. Find your Ableton User Library Remote Scripts folder:
-   - **Windows**: `C:\Users\[You]\Documents\Ableton\User Library\Remote Scripts\`
-   - **Mac**: `~/Music/Ableton/User Library/Remote Scripts/`
-2. Create folder: `AbletonMCP`
-3. Copy `AbletonMCP_Remote_Script/__init__.py` into this folder
+On Windows, use `py -3 -m venv .venv` and `.venv\Scripts\python.exe` in place of the macOS commands. Existing checkouts should install from their current repository directory. If you use uv, `uv sync --locked` installs the versions recorded in `uv.lock` instead of resolving fresh dependencies.
 
-### 3. **Configure Ableton**
-1. Open Ableton Live
-2. Go to **Preferences** → **Link, Tempo & MIDI**
-3. Set **Control Surface** to "AbletonMCP"
-4. Set Input/Output to "None"
+1. Copy all `.py` files from `AbletonMCP_Remote_Script/` into `<your Ableton User Library>/Remote Scripts/AbletonMCP/`. On macOS, `./deploy.sh` handles the default User Library location and verifies the copied files.
+2. In Live's MIDI preferences, select **AbletonMCP** as a Control Surface with **Input** and **Output** set to **None**. Restart Live after updating its script.
+3. Add the entry below to your assistant's existing MCP configuration, preserving its other servers and settings. Replace the Python path with your virtual environment's absolute path.
 
-### 4. **Connect AI Assistant**
-
-**For Claude Desktop:**
 ```json
 {
   "mcpServers": {
     "AbletonMCP": {
-      "command": "python",
-      "args": ["C:/path/to/ableton-mcp-extended/MCP_Server/server.py"]
+      "command": "/absolute/path/to/ableton-mcp-extended/.venv/bin/python",
+      "args": ["-m", "MCP_Server.server"]
     }
   }
 }
 ```
 
-**For Cursor:**
-Add MCP server in Settings → MCP with the same path.
+Restart the MCP server in the assistant. Ask it to run `get_build_info`, then `get_session_overview`, and confirm the expected Set. Use a disposable copy of a Set for the first edit or recording test.
 
-### 5. **Start Creating!** 
-Open your AI assistant and try:
-- *"Create a new MIDI track with a piano"*
-- *"Add a simple drum beat"*
-- *"What tracks do I currently have?"*
+See [INSTALLATION.md](INSTALLATION.md) for platform paths, upgrade steps and troubleshooting.
 
----
+## Try the new workflows
 
-## How It Works
+- “List stable edit targets. Preview changing the Bass track's volume to 0.7.”
+- “Take a session snapshot before this edit, then compare it with a new snapshot.”
+- “Preview placing this session MIDI clip at beats 0 and 4, then apply that plan.”
+- “Check the latest recording operation and measure every file in its output manifest.”
+- “Analyze this local WAV file for duration, sample peak, RMS and possible silence.”
 
-```mermaid
-graph TB
-    A[You: Natural Language] --> B[AI Assistant]
-    B --> C[MCP Server]
-    C --> D[Ableton Remote Script]
-    D --> E[Ableton Live API]
-    E --> F[🎵 Your Music]
-    
-    G[ElevenLabs AI] --> H[Generated Audio]
-    H --> C
-```
+`edit_track` previews by default; applying requires `preview=false`. Use the actual `session_id` and `track_handle` returned by `get_edit_targets`. [The release examples](docs/RELEASE-1.1.0.md#stable-track-edit-preview-and-apply) show the exact arguments.
 
-1. You issue a command in plain English to your AI assistant (e.g., "Create a new MIDI track and name it 'Bass'").
-2. The AI Assistant understands the intent and calls the appropriate tool from the MCP server.
-3. The MCP Server (server.py) receives the tool call and constructs a specific JSON command.
-4. The Ableton Remote Script (__init__.py), running inside Live, receives the JSON command via a socket connection.
-5. The Remote Script executes the command using the official Ableton Live API, making the change in your session instantly.
+## Optional components
 
----
+- **Audio analysis:** install `ffmpeg` and `ffprobe` on the MCP process's `PATH`. Analysis reads the first 60 seconds by default, with a maximum of 600 seconds, and reports whether that covers the full file. It measures sample peak and RMS, not true peak or LUFS.
+- **UDP companion:** `Ableton-MCP_hybrid-server/AbletonMCP_UDP/` is an experimental UDP-only companion on port 9878 for parameter controllers. The primary Remote Script owns TCP port 9877. Unsupported companion commands fail explicitly.
+- **ElevenLabs:** the repository includes a separate MCP server for supported voice/audio generation workflows. It requires its own API key and configuration. Generated audio can then be imported using the Ableton tools.
+- **XY controller:** see [the experimental controller example](experimental_tools/xy_mouse_controller/README.md).
 
-## Advanced Features
+## Development and documentation
 
-<details>
-<summary><strong>🚀 High-Performance Mode (UDP Server)</strong></summary>
-
-
-For real-time parameter control with ultra-low latency:
+With uv, use the recorded dependency versions:
 
 ```bash
-# Install the hybrid server
-cp -r Ableton-MCP_hybrid-server/AbletonMCP_UDP/ ~/Remote\ Scripts/AbletonMCP_UDP/
-
-# Try the XY Mouse Controller example
-cd experimental_tools/xy_mouse_controller
-python mouse_parameter_controller_udp.py
+uv sync --locked --extra dev
+uv run --locked --extra dev pytest -q
 ```
 
-This demonstrates how to build:
-- Custom real-time controllers for Ableton
-- Expressive performance tools
-- Interactive music applications
-</details>
+Or use pip in the existing virtual environment:
 
-<details>
-<summary><strong>🎤 ElevenLabs Voice Integration</strong></summary>
-
-
-This repository can be integrated with other MCP servers, such as one for ElevenLabs, to generate and import audio directly into your project.
-
-Set up the ElevenLabs MCP server according to its instructions.
-
-Update your AI assistant's config to include both servers.
-
-Example mcp-config.json:
-
-```json
-{
-  "mcpServers": {
-    "AbletonMCP": {
-      "command": "python",
-      "args": ["/path/to/ableton-mcp-extended/server.py"]
-    },
-    "ElevenLabs": {
-      "command": "python",
-      "args": ["/path/to/elevenlabs_mcp/server.py"],
-      "env": {
-        "ELEVENLABS_API_KEY": "your-api-key-here"
-      }
-    }
-  }
-}
+```bash
+.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -m pytest -q
 ```
 
-</details>
+The default test command excludes tests marked `integration`. Automated tests simulate Live objects and scheduled ticks; they cannot establish that a recording is audible or that an edit survives saving a real Set.
 
----
+- [Release 1.1.0](docs/RELEASE-1.1.0.md)
+- [Installation and upgrades](INSTALLATION.md)
+- [Code and MCP review](docs/MCP-REVIEW-2026-09-03.md)
+- [Live API observations](docs/LIVE-API-FACTS.md)
+- [Tooling backlog](docs/TOOLING-BACKLOG.md)
 
-## Components Overview
+## License and credits
 
-This project includes several specialized components:
+Licensed under the [MIT License](LICENSE). This fork builds on [uisato's Ableton MCP Extended](https://github.com/uisato/ableton-mcp-extended), inspired by [ahujasid's ableton-mcp](https://github.com/ahujasid/ableton-mcp).
 
-### **Core MCP Server**
-- Standard TCP communication for reliable AI control
-- Extensive Ableton Live API integration
-- Compatible with Claude Desktop, Cursor, and Gemini CLI.
+Built with the [Model Context Protocol](https://github.com/modelcontextprotocol), [Ableton Live](https://www.ableton.com) and the optional [ElevenLabs API](https://elevenlabs.io).
 
-### **Hybrid TCP/UDP Server** 
-- High-performance real-time parameter control
-- Ultra-low latency for live performance
-- Perfect for controllers and interactive tools
-
-### **ElevenLabs Integration**
-- Professional text-to-speech generation
-- Custom voice creation and cloning
-- Direct import into Ableton sessions
-- Real-time SFX generation
-
-### **Experimental Tools & Examples**
-- **XY Mouse Controller**: Example demonstrating how to build custom Ableton controllers
-- **Extensible Framework**: Foundation for creating your own control interfaces
-- **Proof of Concept**: Shows the power and flexibility of the MCP approach
-
----
-
-## Documentation
-
-- **[Installation Guide](INSTALLATION.md)** - Detailed setup instructions
-- **[User Guide](README.md)** - What, which, and how  
-- **[Live 11 Compatibility Notes](LIVE_11_NOTES.md)** - End-user behavior differences vs. Live 12
-
----
-
-## Community & Support
-
-- **GitHub Issues**: Bug reports and feature requests
-- **Discussions**: Share your creations and get help
-
-### **Share Your Creations**
-Tag me with your AI-generated experiments! I love seeing what the community creates:
-
-[YouTube](https://www.youtube.com/@uisato_) |
-[Instagram](https://www.instagram.com/uisato_) |
-[Patreon](https://www.patreon.com/c/uisato) |
-[Website](https://www.uisato.art/) 
-
----
-
-## What's Next
-
-- **Fixing Automation Point Placement Bugs**
-- ~**VST Plugin Support** - Control third-party plugins [Though it can be achieved throught the "Configure" parameter function]~ → Done!
-- **Arrangement View** - Full timeline control
-- **Hardware Integration** - Bridge MIDI controllers through AI
-- **Advanced AI** - Smarter and better music understanding and generation
-
----
-
-## License & Credits
-
-This project is licensed under the MIT License - see [LICENSE](LICENSE) for details.
-
-**Built with:**
-- [Model Context Protocol](https://github.com/modelcontextprotocol) - AI integration framework
-- [ElevenLabs API](https://elevenlabs.io) - Professional voice generation
-- [Ableton Live](https://www.ableton.com) - Digital audio workstation
-
-**Inspired by:** The original [ableton-mcp](https://github.com/ahujasid/ableton-mcp) project
-
----
-
-<div align="center">
-
-**Made with ❤️ for the music production community**
-
-*If this project helps your creativity, consider giving it a ⭐ star!*
-
-</div> 
+Original demonstration: [YouTube](https://www.youtube.com/watch?v=7ZKPIrJuuKk). More from uisato: [YouTube](https://www.youtube.com/@uisato_) · [Instagram](https://www.instagram.com/uisato_) · [Patreon](https://www.patreon.com/c/uisato) · [Website](https://www.uisato.art/).

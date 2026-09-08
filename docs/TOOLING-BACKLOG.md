@@ -1,12 +1,65 @@
 # Tooling backlog
 
+## Current implementation handoff — 2026-09-08
+
+Build `2026-09-08.1` / package `1.1.0` implements recording ownership and
+manifests, MIDI validation/recovery, correlated requests and deadlines,
+structured batch results, stable track edits, guarded MIDI arrangement placement,
+session comparisons and local audio analysis. It is deployed in Live 12.4.5;
+after the Codex restart, the actual task connection reports matching builds and
+package fingerprints and exposes all 152 tools. See [release notes](RELEASE-1.1.0.md)
+and the [Live acceptance report](LIVE-ACCEPTANCE-2026-09-08.md) for scope and evidence.
+
+Verified in the disposable Set: bounce, two distinct stems with measured audio,
+cancellation followed by another capture, MIDI transpose/probability, stable
+track targeting, guarded arrangement copying and save/reopen persistence. The
+unit suite passed 586 tests with each of MCP 1.28.1 and 1.30.0. The changes remain
+local and uncommitted; remote CI and a published release are still outstanding.
+
+## Next work, in order
+
+1. **Preserve the tested baseline.** Review the complete local diff, commit the
+   release changes and run the configured CI before claiming a published release.
+2. **MIDI section variations.** Extend the guarded arrangement workflow with
+   explicit transformations on new copies: remove selected pitches for a
+   breakdown, thin notes deterministically, or transpose an alternate phrase.
+   Preview the exact resulting notes; preserve the source, revalidate before
+   apply, read back the result and support replay without creating more copies.
+   This is proposed work, not part of build `2026-09-08.1`.
+3. **Audio arrangement plans.** Add guarded audio placement with explicit source
+   offsets, warp/seconds units and destination bounds. First reproduce the
+   historical off-bar placement and duplicate-clip defects on a scratch fixture.
+4. **Broader recording acceptance.** Exercise longer captures and the actual
+   hardware routing. Test freeze-style source deactivation and scene capture
+   independently; passing bounce tests does not establish these workflows.
+
+**Per-clip scale remains an API investigation, not a missing wrapper.** On
+September 8, `inspect_lom` against the acceptance Set's MIDI clip returned no
+members for either `scale` or `root` in Live 12.4.5. The current
+[Clip reference](https://docs.cycling74.com/apiref/lom/clip/) also lists neither.
+Do not implement guessed property writes; offline Set editing would be separate
+work with its own persistence checks.
+
+## Historical July/August observations
+
+The observations below retain the state and priorities from their original runs;
+they are not current outstanding tasks. In particular,
+`batch` now preserves each read result, and `_add_notes_extended` validates
+probability before destructive writes. Batch rebasing only changes named index
+fields; it does not decrement arbitrary numeric values such as beat positions.
+Note probability, two-track stem export and host refresh have since passed the
+September acceptance checks. Native Freeze, complete comping and SDK v2 migration
+remain open.
+
+---
+
 What still needs building or fixing in this integration, ordered by how much it
 blocks actual music work. See `LIVE-API-FACTS.md` for what is already verified
 and what is genuinely impossible.
 
 ---
 
-## START HERE — build 2026-07-26.20, five tools never executed
+## Historical handoff — build 2026-07-26.20, five tools then unexecuted
 
 Run `get_build_info` first. Live and the MCP host were last restarted at build
 `.18`; the repo is at `.20`, so **both need restarting** before any of the below
@@ -173,7 +226,25 @@ costs 16 bars. Worth wrapping only if something actually needs it.
 ## Known rough edges
 
 - `call_lom` truncates its "Available:" member list at 80 entries, which once made
-  a survey silently incomplete. Use `inspect_lom` for a full list.
+  a survey silently incomplete. Use `inspect_lom` for a full list. It truncates
+  **alphabetically**, so a member late in the alphabet looks absent: the list for
+  `Clip` stopped at `is_overdubbing`, and "`Clip` has no member `scale_name`" was
+  briefly accepted as proof when the list had simply not reached `s`.
+- **`batch` discards read results.** Eight `get_track_volume` commands returned only
+  "8/8 succeeded, 0 failed" with no values. Treat `batch` as write-only; any command
+  whose point is its return value has to be sent individually. Worth either
+  surfacing per-command results or documenting the limitation in the tool
+  description, because it silently wastes a round trip.
+- **`batch` param semantics bite on `position`.** `insert_device`'s tool-level
+  `position=0` means "append", but the wire command reads 0 as index 0, which for an
+  audio effect fails with "Insert audio effects after instruments. A valid index
+  would be 1." The tool description warns params differ; this is the concrete case.
+  Failure was clean (0/3 applied, stopped early), which is the right behaviour.
+- **`indices_are_one_based=False` is the safer mode for hand-built batches.** With it
+  false nothing is converted, so 0-based indices and real values (beats, times) pass
+  through untouched. With it true there is ambiguity about whether a non-index
+  numeric ≥ 1 gets converted — passing `destination_time` in beats through a
+  converting batch is a silent-misplacement risk.
 - `manage_clip_automation` (the original) can only create or clear an empty
   envelope — superseded by `write_clip_automation`, but still present.
 - Several batch-6 wrappers were written against `class_deltas.json` rather than a

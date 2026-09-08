@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 from dotenv import load_dotenv
 import argparse
+import tempfile
 
 load_dotenv()
 
@@ -59,6 +60,67 @@ def generate_config(api_key: str | None = None):
     return config
 
 
+def write_claude_config(config_file: Path, generated: dict) -> dict:
+    """Merge one server into an existing config, with a recoverable write."""
+    config_file = Path(config_file).resolve()
+    original_bytes = config_file.read_bytes() if config_file.exists() else None
+    current = json.loads(original_bytes.decode("utf-8")) if original_bytes is not None else {}
+    if not isinstance(current, dict):
+        raise ValueError("Existing Claude configuration must be a JSON object")
+    servers = current.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise ValueError("Existing mcpServers must be a JSON object")
+    merged = dict(current)
+    merged_servers = dict(servers)
+    for name, entry in generated.get("mcpServers", {}).items():
+        existing = servers.get(name, {})
+        if not isinstance(existing, dict):
+            raise ValueError("Existing server configuration must be a JSON object: " + name)
+        merged_entry = dict(existing)
+        merged_entry.update(entry)
+        if "env" in entry:
+            previous_env = existing.get("env", {})
+            if not isinstance(previous_env, dict):
+                raise ValueError("Existing server env must be a JSON object: " + name)
+            merged_entry["env"] = dict(previous_env, **entry["env"])
+        merged_servers[name] = merged_entry
+    merged["mcpServers"] = merged_servers
+    if original_bytes is not None and merged == current:
+        return {"path": config_file, "backup": None, "changed": False}
+
+    content = (json.dumps(merged, indent=2) + "\n").encode("utf-8")
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    backup_path = None
+    if original_bytes is not None:
+        backup_fd, backup_name = tempfile.mkstemp(
+            prefix=config_file.name + ".backup.", dir=str(config_file.parent))
+        backup_path = Path(backup_name)
+        try:
+            with os.fdopen(backup_fd, "wb") as backup:
+                backup.write(original_bytes)
+                backup.flush()
+                os.fsync(backup.fileno())
+        except Exception:
+            backup_path.unlink(missing_ok=True)
+            raise
+    temp_fd, temp_name = tempfile.mkstemp(
+        prefix="." + config_file.name + ".", suffix=".tmp", dir=str(config_file.parent))
+    temporary_path = Path(temp_name)
+    try:
+        with os.fdopen(temp_fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Preserve edits made by another process while this file was prepared.
+        latest = config_file.read_bytes() if config_file.exists() else None
+        if latest != original_bytes:
+            raise RuntimeError("Claude configuration changed during setup; no changes were applied")
+        os.replace(temporary_path, config_file)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return {"path": config_file, "backup": backup_path, "changed": True}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -73,7 +135,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config-path",
         type=Path,
-        help="Custom path to Claude config directory",
+        help="Custom Claude config directory or claude_desktop_config.json file",
     )
     args = parser.parse_args()
 
@@ -85,11 +147,17 @@ if __name__ == "__main__":
         claude_path = args.config_path if args.config_path else get_claude_config_path()
         if claude_path is None:
             print(
-                "Could not find Claude config path automatically. Please specify it using --config-path argument. The argument should be an absolute path of the claude_desktop_config.json file."
+                "Could not find Claude config path automatically. Use --config-path with the config directory or JSON file."
             )
             sys.exit(1)
 
-        claude_path.mkdir(parents=True, exist_ok=True)
-        print("Writing config to", claude_path / "claude_desktop_config.json")
-        with open(claude_path / "claude_desktop_config.json", "w") as f:
-            json.dump(config, f, indent=2)
+        config_file = (claude_path if claude_path.suffix == ".json"
+                       else claude_path / "claude_desktop_config.json")
+        try:
+            result = write_claude_config(config_file, config)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print("Could not update Claude configuration:", exc, file=sys.stderr)
+            sys.exit(1)
+        print("Updated config:" if result["changed"] else "Config already current:", result["path"])
+        if result["backup"] is not None:
+            print("Previous config saved to", result["backup"])

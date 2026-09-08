@@ -2,6 +2,23 @@
 
 ## Current implementation handoff — 2026-09-08
 
+Build `2026-09-08.7` / package `1.5.0` adds direct PCM WAV file placement to
+`build_arrangement`. Preview reserves a full-file arrangement span and an empty
+Session slot per placement. Apply stages and normalizes unwarped audio, verifies
+the copy, then removes its temporary Session clips. Retained plans prevent
+duplicate imports; ordinary file replacements, stale targets and expanded native
+clip geometry reject the operation. See [1.5.0 release notes](RELEASE-1.5.0.md).
+
+The full automated suite passed 1,031 tests. Actual Live 12.4.5 acceptance passed
+for one excerpt and one full WAV, including replay, cleanup, unchanged originals
+and save/unload/reopen persistence. See the
+[1.5.0 acceptance report](LIVE-ACCEPTANCE-1.5.0-2026-09-08.md).
+Live runs `.7`; fresh acceptance servers matched the loaded build and source
+hashes. Codex's existing connection still holds `.4` and needs a host refresh.
+Remote CI and publication remain outstanding.
+
+## Verified 1.4.0 baseline
+
 Build `2026-09-08.6` / package `1.4.0` adds optional
 `destination_track_handle` to `build_arrangement`. Session MIDI and audio clips
 can supply another compatible arrangement track. Same-track defaults, MIDI
@@ -15,10 +32,9 @@ six-note chord variation and two audio excerpts on separate destinations.
 Only the three expected copies were added; Session sources and existing
 arrangement material stayed unchanged. See the
 [1.4.0 acceptance report](LIVE-ACCEPTANCE-1.4.0-2026-09-08.md).
-Live runs `.6`, and both acceptance phases used fresh stdio servers with matching
-build labels and source hashes. Codex's existing connection still holds `.4`
-and needs a host refresh for the current server and description. Remote CI and
-publication remain outstanding.
+Live ran `.6`, and both acceptance phases used fresh stdio servers with matching
+build labels and source hashes. At that checkpoint Codex's existing connection
+still held `.4`. This historical baseline does not claim remote CI or publication.
 
 ## Verified 1.3.0 baseline
 
@@ -82,12 +98,13 @@ acceptance does not establish either. Codex's subsequent restart verified all
 ## Next work, in order
 
 1. **Remote CI and publication.** Run the configured remote checks and publish
-   only when authorized. The local baseline, 1.4.0 implementation and real Live
+   only when authorized. The local baseline, 1.5.0 implementation and real Live
    acceptance are complete; no remote CI result or published release is claimed.
-2. **Extend arrangement coverage where needed.** Direct audio-file placement,
-   grouping staggered notes and note-density generation remain outside the
-   current planner. Same-track and cross-track copies, pitch removal,
-   individual-note/whole-onset thinning and transposition are implemented.
+2. **Extend arrangement coverage where needed.** File formats beyond integer
+   PCM WAV, grouping staggered notes and note-density generation remain outside
+   the current planner. Same-track and cross-track copies, pitch removal,
+   individual-note/whole-onset thinning and transposition are implemented;
+   direct PCM WAV placement passed 1.5.0 workflow and saved-Set acceptance.
 3. **Broader recording acceptance.** Exercise longer captures and the actual
    hardware routing. Test freeze-style source deactivation and scene capture
    independently; passing bounce tests does not establish these workflows.

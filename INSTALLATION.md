@@ -113,7 +113,7 @@ The default connection is `localhost:9877`. `ABLETON_HOST` and `ABLETON_PORT` ov
 
 Start with read-only tool calls:
 
-1. Run `get_build_info`. For a source checkout with both components loaded correctly, `status` should be `match`, with build `2026-09-08.6` and protocol `2.1`.
+1. Run `get_build_info`. For a source checkout with both components loaded correctly, `status` should be `match`, with build `2026-09-08.7` and protocol `2.1`.
 2. If the result is `mismatch`, follow its `recovery` messages. Redeploy and restart Live for stale Remote Script code; restart the assistant's MCP server for stale Python server code.
 3. If it is `unknown`, a build value or source hash is unavailable. This is not confirmation of agreement. If `unreachable`, check that Live is running and the Control Surface is loaded.
 4. Run `get_session_overview` and confirm the Set name and tracks.

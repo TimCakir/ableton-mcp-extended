@@ -65,10 +65,10 @@ def register_workflow_tools(mcp, get_connection):
     def build_arrangement(action: Literal["preview", "apply"], session_id: str,
                           placements: list[dict[str, Any]] | None = None,
                           plan_id: str = "") -> ArrangementBuild:
-        """Preview then place session MIDI or audio clips on compatible tracks.
+        """Preview then place Session clips or local PCM WAV files in arrangement.
 
         First call get_edit_targets. Preview requires its session_id and 1..64
-        placements, each containing track_handle, source_slot (1-based) and
+        placements. Session-clip placements contain track_handle, source_slot (1-based) and
         destination_beat (absolute zero-based quarter-note beats, fractions allowed).
         track_handle identifies the source track. Optional destination_track_handle
         identifies the receiving track; omit it to copy onto the source track.
@@ -107,6 +107,26 @@ def register_workflow_tools(mcp, get_connection):
         Reapplying a retained completed plan returns its result without new copies.
         Per-note expression is not inspected. This does not start playback or save
         the Set. A partial result means rollback could not be verified.
+
+        File plans use a separate placement form: file_path (absolute local PCM WAV),
+        destination_track_handle, destination_beat, optional name and optional
+        source_range={start, end, units:"seconds"}. Do not mix file placements with
+        Session-clip placements in one plan. Supports mono/stereo 8/16/24/32-bit
+        uncompressed PCM WAV; other encodings/formats fail explicitly.
+        File copies are unwarped, nonlooping, unpitched, unmuted and at unity gain.
+        Fixed tempo is required, with Link, tempo follower and tempo automation off.
+        Preview reads bounded file metadata without changing Live; apply rechecks
+        filesystem identity, sample metadata, Set/track identity and destination.
+        Files are guarded by filesystem metadata, not a cryptographic byte hash.
+        Each file needs an empty Session slot on its destination for temporary
+        import. Preview reserves the entire file duration in arrangement beats,
+        even for an excerpt. If Live's settled staging clip needs more space,
+        the operation fails without enlarging that reservation.
+        File plans return applying while staging, copying and cleanup finish.
+        Poll the same plan until terminal status; applied includes verified removal
+        of temporary Session clips. Existing clips are never used as staging slots.
+        Deferred callbacks and apply polls check a 30-second pending deadline;
+        expiry attempts owned-clip cleanup and returns error or partial.
         """
         return get_connection().send_command("build_arrangement", {
             "action": action, "session_id": session_id,

@@ -101,6 +101,22 @@ def _unchanged_bounds(current, originals):
             raise RuntimeError("Existing arrangement material was removed or its bounds changed")
 
 
+def _owned_bounds(entries, owned):
+    """Owned unwarped edges may settle during a later native call in this tick."""
+    if len(owned) > len(entries):
+        raise RuntimeError("Created arrangement clip ownership is ambiguous")
+    for entry, (track, clip) in zip(entries, owned):
+        if not _same(track, entry["track"]) or not _contains(_arrangement(track), clip):
+            raise RuntimeError("Previously created arrangement clip was removed or moved")
+        start = _number(clip.start_time, "owned clip start")
+        end = _number(clip.end_time, "owned clip end", positive=True)
+        unwarped = entry["audio"] is not None and not entry["source"]["metadata"]["warping"]
+        if (abs(start - entry["start"]) > 0.00001 or end <= start
+                or end > entry["reserved_end"] + 0.00001
+                or (not unwarped and abs(end - entry["end"]) > 0.00001)):
+            raise RuntimeError("Created arrangement clip bounds left the previewed reservation")
+
+
 def _check_ranges(entries):
     for index, entry in enumerate(entries):
         start, end = entry["start"], entry["reserved_end"]
@@ -352,6 +368,8 @@ def _rollback(remote, plan, exc, owned, placed, initial, undo_song=None):
 
 def _finish(remote, plan, owned, placed, initial):
     """Read back settled clips; unwarped audio invokes this on the next tick."""
+    if plan["status"] != "applying":
+        return copy.deepcopy(plan["result"])
     try:
         _targets(remote, plan["session_id"])
         if not _same(remote._song, plan["song"]):
@@ -438,7 +456,12 @@ def _apply(remote, session_id, plan_id, plans):
             snapshots = []
             for target in _entry_tracks(entry):
                 before = _arrangement(target)
-                snapshots.append((target, before, _bounds(before)))
+                owned_here = [clip for owner, clip in owned if _same(owner, target)]
+                # Earlier unwarped copies can settle when this next native copy
+                # flushes Live's pending edges. They are checked against their
+                # reserved spans, never mistaken for immutable original material.
+                originals = [clip for clip in before if not _contains(owned_here, clip)]
+                snapshots.append((target, before, _bounds(originals)))
             verification = {}
             try:
                 track.duplicate_clip_to_arrangement(entry["clip"], entry["start"])
@@ -461,6 +484,7 @@ def _apply(remote, session_id, plan_id, plans):
             clip = created[0][1]
             for target, _before, originals in snapshots:
                 _unchanged_bounds(_arrangement(target), originals)
+            _owned_bounds(plan["entries"], owned[:-1])
             actual_start = _number(clip.start_time, "placed clip start")
             actual_end = _number(clip.end_time, "placed clip end", positive=True)
             if entry["audio"] is not None:
@@ -491,6 +515,7 @@ def _apply(remote, session_id, plan_id, plans):
                 raise RuntimeError("Source changed while placing the copy")
             for target, _before, originals in snapshots:
                 _unchanged_bounds(_arrangement(target), originals)
+            _owned_bounds(plan["entries"], owned)
             record = _public(entry, index)
             record.update(verification)
             record.update(status="awaiting_verification" if deferred else "verified", actual_start_beat=clip.start_time,
@@ -523,9 +548,16 @@ def build_arrangement(remote, action, session_id, placements=None, plan_id=""):
     if action == "preview":
         if plan_id:
             raise ValueError("Preview does not accept plan_id")
+        if isinstance(placements, list) and any(isinstance(row, dict) and "file_path" in row
+                                                for row in placements):
+            from . import file_arrangement
+            return file_arrangement.preview(remote, session_id, placements, plans)
         return _preview(remote, session_id, placements, plans)
     if placements:
         raise ValueError("Apply accepts the retained plan_id, not replacement placements")
     if not isinstance(plan_id, str) or not plan_id:
         raise ValueError("Apply requires plan_id from a successful preview")
+    if plans.get(plan_id, {}).get("kind") == "file":
+        from . import file_arrangement
+        return file_arrangement.apply(remote, session_id, plan_id, plans)
     return _apply(remote, session_id, plan_id, plans)

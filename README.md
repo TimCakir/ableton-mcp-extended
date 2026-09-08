@@ -5,7 +5,26 @@ Control Ableton Live through an MCP-compatible assistant. The Python MCP server 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-## Version 1.4.0
+## Version 1.5.0
+
+Build `2026-09-08.7` adds direct PCM WAV placement to `build_arrangement`.
+Supply an absolute file path, an audio-track handle and a destination beat.
+Use the whole file or choose an excerpt in seconds. Preview checks the file and
+available space; apply imports, verifies the arrangement copy and removes its
+temporary Session clips before reporting success. See [1.5.0 examples](docs/RELEASE-1.5.0.md).
+
+This version accepts mono/stereo integer PCM WAV and places unwarped audio at
+fixed tempo. Each placement needs an empty Session slot and arrangement space
+for the full file, even for an excerpt. Existing Session-copy workflows remain
+available. The top-level tool count stays 152.
+
+The full automated suite passed **1,031 tests**. Actual Live 12.4.5 acceptance
+verified a three-second excerpt and a full 12-second WAV, replay without
+duplicates, empty staging slots and unchanged original material. Both imports
+passed again after saving, unloading and reopening the Set. See the
+[1.5.0 acceptance report](docs/LIVE-ACCEPTANCE-1.5.0-2026-09-08.md).
+
+## Version 1.4.0 baseline
 
 Build `2026-09-08.6` adds cross-track placement to `build_arrangement`. Supply
 `destination_track_handle` to copy a Session clip onto another compatible
@@ -121,6 +140,7 @@ See [INSTALLATION.md](INSTALLATION.md) for platform paths, upgrade steps and tro
 - “Preview a breakdown keeping every second chord, with all simultaneous notes intact.”
 - “Preview copying this chord variation to the PAD arrangement track at beat 64.5.”
 - “Preview placing seconds 2–5 of this unwarped Session audio clip at beat 128.25.”
+- “Preview placing seconds 2–5 of this local PCM WAV file on the FX track at beat 128.5.”
 - “Check the latest recording operation and measure every file in its output manifest.”
 - “Analyze this local WAV file for duration, sample peak, RMS and possible silence.”
 
@@ -128,7 +148,11 @@ See [INSTALLATION.md](INSTALLATION.md) for platform paths, upgrade steps and tro
 
 For `build_arrangement`, use `action="preview"` with placements, inspect the result, then use `action="apply"` with its `plan_id` and `session_id`. `track_handle` identifies the source; optional `destination_track_handle` identifies the receiving track. MIDI thinning counts individual notes by default; `thin_by="onset"` counts groups sharing an exact start time after pitch removal. Transposition rejects pitches outside 0–127. Audio uses the units appropriate to the source's existing warp state. See [cross-track copying](docs/RELEASE-1.4.0.md), [chord thinning](docs/RELEASE-1.3.0.md) and [MIDI and audio placement examples](docs/RELEASE-1.2.0.md).
 
-Plans containing unwarped audio return `status="applying"` while Live settles the clip bounds. Poll `apply` with the same plan ID until `applied`, `error` or `partial`. Polling never creates another copy; new arrangement plans are blocked while this verification is pending.
+File plans use `file_path` and `destination_track_handle`, with optional seconds-based
+`source_range`. Keep file placements and Session-source placements in separate
+plans. See [direct WAV placement](docs/RELEASE-1.5.0.md) for its format and staging limits.
+
+Plans containing unwarped audio return `status="applying"` while Live settles the clip bounds. Poll `apply` with the same plan ID until `applied`, `error` or `partial`. Polling never creates another copy; new arrangement plans are blocked while this verification is pending. File plans also wait for temporary Session-clip cleanup.
 
 ## Optional components
 
@@ -155,6 +179,8 @@ Or use pip in the existing virtual environment:
 
 The default test command excludes tests marked `integration`. Automated tests simulate Live objects and scheduled ticks; they cannot establish that a recording is audible or that an edit survives saving a real Set.
 
+- [Release 1.5.0](docs/RELEASE-1.5.0.md)
+- [1.5.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.5.0-2026-09-08.md)
 - [Release 1.4.0](docs/RELEASE-1.4.0.md)
 - [1.4.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.4.0-2026-09-08.md)
 - [Release 1.3.0](docs/RELEASE-1.3.0.md)

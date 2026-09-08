@@ -2,6 +2,21 @@
 
 ## Current implementation handoff — 2026-09-08
 
+Build `2026-09-08.5` / package `1.3.0` adds whole-onset MIDI thinning through
+`variation.thin_by="onset"`. It keeps all notes sharing an exact start time,
+after pitch removal; offsets count surviving groups. Individual-note thinning
+remains the default. There is no timing tolerance or quantization. The full
+automated suite passed 829 tests. See [1.3.0 release notes](RELEASE-1.3.0.md).
+
+Both real Live 12.4.5 workflow and save/unload/reopen acceptance passed, verifying
+three copies with 18 notes in total and the unchanged 12-note source. See the
+[1.3.0 acceptance report](LIVE-ACCEPTANCE-1.3.0-2026-09-08.md). Live is running
+`.5`; the acceptance runner's fresh stdio servers matched build and hashes.
+The existing Codex connection still holds `.4` and needs a host refresh for this
+new build. Remote CI and publication remain outstanding.
+
+## Verified 1.2.0 baseline
+
 Build `2026-09-08.4` / package `1.2.0` extends `build_arrangement` with MIDI
 section variations and audio source-range placement. The tool count remains 152.
 The full automated suite passes 792 tests. The deployed build passed actual
@@ -41,19 +56,18 @@ records bounce, two distinct measured stems, cancellation followed by a new
 capture, MIDI transpose/probability, stable track targeting, guarded MIDI copying
 and save/reopen persistence in Live 12.4.5. Its 586 tests passed with MCP 1.28.1
 and 1.30.0. Remote CI and a published release remain outstanding; this local
-acceptance does not establish either. The active Codex MCP host needs a restart
-to load the current tool descriptions; the acceptance runner used a fresh server
-process with matching build and package fingerprints.
+acceptance does not establish either. Codex's subsequent restart verified all
+1.2.0 components matched build `.4` and their source hashes before 1.3.0 work.
 
 ## Next work, in order
 
 1. **Remote CI and publication.** Run the configured remote checks and publish
-   only when authorized. The local baseline, 1.2.0 implementation and real Live
+   only when authorized. The local baseline, 1.3.0 implementation and real Live
    acceptance are complete; no remote CI result or published release is claimed.
 2. **Extend arrangement coverage where needed.** Cross-track sources, direct
-   audio-file placement, chord-group thinning and note-density generation remain
-   outside the current planner. Existing same-track copies and pitch/thinning/
-   transpose variations are implemented; do not list them as proposed features.
+   audio-file placement, grouping staggered notes and note-density generation
+   remain outside the current planner. Same-track copies, pitch removal,
+   individual-note/whole-onset thinning and transposition are implemented.
 3. **Broader recording acceptance.** Exercise longer captures and the actual
    hardware routing. Test freeze-style source deactivation and scene capture
    independently; passing bounce tests does not establish these workflows.

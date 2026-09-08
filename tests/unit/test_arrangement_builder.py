@@ -665,6 +665,121 @@ def test_midi_variation_can_intentionally_place_an_empty_breakdown():
     assert len(song.tracks[0].clip_slots[0].clip.notes) == 1
 
 
+def chord_source(song):
+    source = song.tracks[0].clip_slots[0].clip = Clip("Four chords", length=8)
+    source.notes = [types.SimpleNamespace(
+        pitch=pitch, start_time=start, duration=1.0, velocity=90.125 + index,
+        mute=False, note_id=index + 1, probability=0.8125,
+        velocity_deviation=-3.125, release_velocity=61.875)
+        for index, (start, pitch) in enumerate([
+            (0.0, 60), (0.0, 64), (0.0, 67),
+            (2.0, 62), (2.0, 65), (2.0, 69),
+            (4.0, 64), (4.0, 67), (4.0, 71),
+            (6.0, 65), (6.0, 69), (6.0, 72)])]
+    source.notes.reverse()  # Live enumeration must not define group order.
+    return source
+
+
+def musical_rows(notes):
+    rows = [dict(vars(note)) for note in notes]
+    for row in rows:
+        row.pop("note_id")
+    return sorted(rows, key=lambda row: (row["start_time"], row["pitch"]))
+
+
+def test_onset_variations_keep_whole_chords_and_preserve_retained_plan_and_source():
+    instance, song = remote()
+    source = chord_source(song)
+    original = copy.deepcopy(vars(source))
+    source_rows = musical_rows(source.notes)
+    session, placements = request(instance, (32.5, 40.5, 48.5))
+    variations = [
+        {"thin_by": "onset", "keep_every": 2},
+        {"thin_by": "onset", "keep_every": 2, "keep_offset": 1, "transpose": 12},
+        {"keep_every": 2},
+    ]
+    expected = [
+        [row for row in source_rows if row["start_time"] in (0, 4)],
+        [dict(row, pitch=row["pitch"] + 12) for row in source_rows if row["start_time"] in (2, 6)],
+        source_rows[::2],
+    ]
+    for index, (placement, variation) in enumerate(zip(placements, variations)):
+        placement.update(name="Chord copy " + str(index + 1), variation=variation)
+    plan = builder.build_arrangement(instance, "preview", session, placements)
+    assert plan["note_count"] == 18 and plan["source_note_count"] == 36
+    for index, row in enumerate(plan["placements"]):
+        assert row["notes"] == expected[index]
+        assert row["note_count"] == 6 and row["source_note_count"] == 12
+        assert row["end_beat"] == row["destination_beat"] + 8
+    assert [row["variation"]["thin_by"] for row in plan["placements"]] == ["onset", "onset", "note"]
+    assert vars(source) == original and song.tracks[0].copy_calls == song.undo_started == 0
+
+    # Client-side edits must not alter the retained transform or preview notes.
+    plan["placements"][0]["variation"]["thin_by"] = "note"
+    plan["placements"][0]["notes"][0]["pitch"] = 1
+    placements[1]["variation"]["transpose"] = -12
+    result = apply(instance, plan)
+    assert result["status"] == "applied"
+    for index, (row, clip) in enumerate(zip(result["placements"], song.tracks[0].arrangement_clips)):
+        assert row["status"] == "verified" and row["notes"] == expected[index]
+        assert musical_rows(clip.notes) == expected[index]
+        assert (clip.start_time, clip.end_time) == (32.5 + index * 8, 40.5 + index * 8)
+        assert clip.name == "Chord copy " + str(index + 1)
+    replay = apply(instance, plan)
+    assert replay["status"] == "applied" and replay["replayed"] is True
+    assert vars(source) == original
+    assert song.tracks[0].copy_calls == 3 and song.undo_started == song.undo_finished == 1
+
+
+def test_onset_filtering_removes_empty_groups_before_counting_and_transposing():
+    instance, song = remote()
+    source = chord_source(song)
+    source.notes = [types.SimpleNamespace(**dict(vars(source.notes[0]),
+                    note_id=index + 1, start_time=start, pitch=pitch))
+                    for index, (start, pitch) in enumerate([
+                        (0.0, 36), (1.0, 60), (1.0, 64),
+                        (2.0, 62), (2.0, 65), (3.0, 67), (3.0, 71)])]
+    original = copy.deepcopy(vars(source))
+    session, placements = request(instance)
+    placements[0]["variation"] = {"thin_by": "onset", "remove_pitches": [36],
+                                   "keep_every": 2, "keep_offset": 1, "transpose": 7}
+    plan = builder.build_arrangement(instance, "preview", session, placements)
+    expected = [dict(row, pitch=row["pitch"] + 7) for row in musical_rows(source.notes)
+                if row["start_time"] == 2]
+    assert plan["placements"][0]["notes"] == expected
+    assert apply(instance, plan)["status"] == "applied"
+    assert musical_rows(song.tracks[0].arrangement_clips[0].notes) == expected
+    assert vars(source) == original
+
+
+@pytest.mark.parametrize("thin_by", [None, True, 0, [], {}, "chord", "Onset", " onset"])
+def test_invalid_later_thin_by_rejects_entire_plan_before_writes(thin_by):
+    instance, song = remote()
+    source = chord_source(song)
+    original = copy.deepcopy(vars(source))
+    session, placements = request(instance, (0, 8))
+    placements[0]["variation"] = {"thin_by": "onset", "keep_every": 2}
+    placements[1]["variation"] = {"thin_by": thin_by}
+    with pytest.raises(ValueError, match="thin_by"):
+        builder.build_arrangement(instance, "preview", session, placements)
+    assert vars(source) == original
+    assert song.tracks[0].copy_calls == song.undo_started == 0
+
+
+def test_onset_change_smaller_than_public_rounding_invalidates_retained_plan():
+    instance, song = remote()
+    source = chord_source(song)
+    session, placements = request(instance)
+    placements[0]["variation"] = {"thin_by": "onset", "keep_every": 2}
+    plan = builder.build_arrangement(instance, "preview", session, placements)
+    source.notes[0].start_time += 0.000000001
+    changed = copy.deepcopy(vars(source))
+    with pytest.raises(ValueError, match="Source clip changed"):
+        apply(instance, plan)
+    assert song.tracks[0].copy_calls == song.undo_started == 0
+    assert vars(source) == changed
+
+
 class AudioClip:
     """Simulate arrangement edge updates from marker edits without toggling warp."""
 

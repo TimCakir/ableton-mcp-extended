@@ -11,7 +11,7 @@ import math
 
 
 MAX_VARIATION_NOTES = 10000
-_SPEC_FIELDS = {"remove_pitches", "keep_every", "keep_offset", "transpose"}
+_SPEC_FIELDS = {"remove_pitches", "keep_every", "keep_offset", "thin_by", "transpose"}
 
 
 def _integer(value, name, minimum, maximum):
@@ -42,16 +42,19 @@ def _normalise_spec(spec):
     if spec is None:
         spec = {}
     if not isinstance(spec, dict) or set(spec) - _SPEC_FIELDS:
-        raise ValueError("variation accepts only remove_pitches, keep_every, keep_offset and transpose")
+        raise ValueError("variation accepts only remove_pitches, keep_every, keep_offset, thin_by and transpose")
     pitches = spec.get("remove_pitches", [])
     if not isinstance(pitches, list) or len(pitches) > 128:
         raise ValueError("remove_pitches must be a list of at most 128 MIDI pitches")
     pitches = sorted({_integer(pitch, "remove_pitches entry", 0, 127) for pitch in pitches})
     every = _integer(spec.get("keep_every", 1), "keep_every", 1, MAX_VARIATION_NOTES)
     offset = _integer(spec.get("keep_offset", 0), "keep_offset", 0, every - 1)
+    thin_by = spec.get("thin_by", "note")
+    if not isinstance(thin_by, str) or thin_by not in {"note", "onset"}:
+        raise ValueError("thin_by must be 'note' or 'onset'")
     transpose = _integer(spec.get("transpose", 0), "transpose", -127, 127)
     return {"remove_pitches": pitches, "keep_every": every,
-            "keep_offset": offset, "transpose": transpose}
+            "keep_offset": offset, "thin_by": thin_by, "transpose": transpose}
 
 
 def _values(row):
@@ -90,10 +93,13 @@ def _signature(rows):
 def prepare_variation(rows, spec):
     """Return exact note values and input indexes without changing either input.
 
-    Pitches are removed first. Remaining individual notes are ordered by onset,
-    pitch, duration and all other exposed values, then keep_every/keep_offset is
-    applied with a zero-based offset. Transposition follows filtering and fails
-    if a retained pitch would leave MIDI's range; pitches are never clamped.
+    Pitches are removed first. Remaining notes are ordered by onset, pitch,
+    duration and all other exposed values. keep_every/keep_offset counts either
+    individual notes (thin_by="note", the default) or groups sharing exactly the
+    same start_time (thin_by="onset"), with a zero-based offset. Onset thinning
+    keeps every note in a selected group, including duplicates; nearby onsets
+    remain separate without quantization. Transposition follows filtering and
+    fails if a retained pitch would leave MIDI's range; pitches are never clamped.
     """
     variation = _normalise_spec(spec)
     if not isinstance(rows, (list, tuple)) or len(rows) > MAX_VARIATION_NOTES:
@@ -104,8 +110,16 @@ def prepare_variation(rows, spec):
     candidates.sort(key=lambda index: (
         values[index]["start_time"], values[index]["pitch"], values[index]["duration"],
         json.dumps(values[index], sort_keys=True, allow_nan=False)))
-    kept = [index for rank, index in enumerate(candidates)
-            if rank % variation["keep_every"] == variation["keep_offset"]]
+    kept = []
+    rank = -1
+    previous_onset = None
+    for index in candidates:
+        onset = values[index]["start_time"]
+        if variation["thin_by"] == "note" or rank < 0 or onset != previous_onset:
+            rank += 1
+        previous_onset = onset
+        if rank % variation["keep_every"] == variation["keep_offset"]:
+            kept.append(index)
     notes = []
     for index in kept:
         row = values[index]

@@ -5,7 +5,23 @@ Control Ableton Live through an MCP-compatible assistant. The Python MCP server 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-## Version 1.2.0
+## Version 1.3.0
+
+Build `2026-09-08.5` adds whole-chord thinning to `build_arrangement`: set
+`variation.thin_by="onset"` to keep every Nth group of simultaneous notes.
+Notes must have exactly the same start time to form a group. Staggered notes
+remain separate; no timing is changed. The default `thin_by="note"` retains
+the existing individual-note behavior. See [1.3.0 examples](docs/RELEASE-1.3.0.md).
+
+This is logic in the MCP integration using Live's existing note APIs. It does
+not add a built-in Live command or a new top-level MCP tool; the count stays 152.
+
+The full suite passed **829 tests**. Actual Live 12.4.5 acceptance verified two
+whole-chord variants and the default individual-note control, then confirmed all
+three copies and the unchanged source after saving, unloading and reopening the
+Set. See the [1.3.0 acceptance report](docs/LIVE-ACCEPTANCE-1.3.0-2026-09-08.md).
+
+## Version 1.2.0 baseline
 
 Build `2026-09-08.4` extends `build_arrangement` with MIDI variations and trimmed audio placement. The server still exposes 152 tools. The [1.2.0 release examples](docs/RELEASE-1.2.0.md) show the exact preview/apply arguments and limits.
 
@@ -15,7 +31,7 @@ Build `2026-09-08.4` extends `build_arrangement` with MIDI variations and trimme
 
 Audio sources must have aligned start/end and loop markers. Unwarped audio requires zero pitch offset and fixed, unautomated tempo with Link and tempo follower off. Each audio preview reserves space for the full initial copy and intermediate trimming, so the required empty range can be longer than the final excerpt. Plans support up to 64 placements and 10,000 source MIDI notes; unapplied plans expire after five minutes. The builder does not start playback or save the Set.
 
-The current automated suite passes **792 tests**. Build `2026-09-08.4` passed actual Live 12.4.5 acceptance for three MIDI variations and two trimmed audio placements, including fractional positions, replay, rejected inputs and unchanged sources. All five copies passed verification after saving, unloading and reopening the disposable Set. See the [1.2.0 Live acceptance report](docs/LIVE-ACCEPTANCE-1.2.0-2026-09-08.md) for evidence and limits. The tested 1.1.0 baseline is committed as `d50b243` on `codex/arrangement-workflows`.
+The 1.2.0 automated suite passed **792 tests**. Build `2026-09-08.4` passed actual Live 12.4.5 acceptance for three MIDI variations and two trimmed audio placements, including fractional positions, replay, rejected inputs and unchanged sources. All five copies passed verification after saving, unloading and reopening the disposable Set. See the [1.2.0 Live acceptance report](docs/LIVE-ACCEPTANCE-1.2.0-2026-09-08.md) for evidence and limits. The tested 1.1.0 baseline is committed as `d50b243` on `codex/arrangement-workflows`.
 
 ## Reliability workflows
 
@@ -84,13 +100,14 @@ See [INSTALLATION.md](INSTALLATION.md) for platform paths, upgrade steps and tro
 - “Preview placing this session MIDI clip at beats 0 and 4, then apply that plan.”
 - “Preview a breakdown copy without pitch 36, and an alternate phrase transposed up seven semitones.”
 - “Preview thinning this clip by keeping every second note. Show the resulting notes before applying.”
+- “Preview a breakdown keeping every second chord, with all simultaneous notes intact.”
 - “Preview placing seconds 2–5 of this unwarped Session audio clip at beat 128.25.”
 - “Check the latest recording operation and measure every file in its output manifest.”
 - “Analyze this local WAV file for duration, sample peak, RMS and possible silence.”
 
 `edit_track` previews by default; applying requires `preview=false`. Use the actual `session_id` and `track_handle` returned by `get_edit_targets`. [The release examples](docs/RELEASE-1.1.0.md#stable-track-edit-preview-and-apply) show the exact arguments.
 
-For `build_arrangement`, use `action="preview"` with placements, inspect the result, then use `action="apply"` with its `plan_id` and `session_id`. MIDI thinning acts on individual notes rather than chord groups; transposition rejects pitches outside 0–127. Audio uses the units appropriate to the source's existing warp state. See [MIDI and audio placement examples](docs/RELEASE-1.2.0.md).
+For `build_arrangement`, use `action="preview"` with placements, inspect the result, then use `action="apply"` with its `plan_id` and `session_id`. MIDI thinning counts individual notes by default; `thin_by="onset"` counts groups sharing an exact start time after pitch removal. Transposition rejects pitches outside 0–127. Audio uses the units appropriate to the source's existing warp state. See [chord thinning](docs/RELEASE-1.3.0.md) and [MIDI and audio placement examples](docs/RELEASE-1.2.0.md).
 
 Plans containing unwarped audio return `status="applying"` while Live settles the clip bounds. Poll `apply` with the same plan ID until `applied`, `error` or `partial`. Polling never creates another copy; new arrangement plans are blocked while this verification is pending.
 
@@ -119,6 +136,8 @@ Or use pip in the existing virtual environment:
 
 The default test command excludes tests marked `integration`. Automated tests simulate Live objects and scheduled ticks; they cannot establish that a recording is audible or that an edit survives saving a real Set.
 
+- [Release 1.3.0](docs/RELEASE-1.3.0.md)
+- [1.3.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.3.0-2026-09-08.md)
 - [Release 1.2.0](docs/RELEASE-1.2.0.md)
 - [1.2.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.2.0-2026-09-08.md)
 - [Release 1.1.0 baseline](docs/RELEASE-1.1.0.md)

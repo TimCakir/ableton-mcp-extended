@@ -1,6 +1,7 @@
 """Exact MIDI variation previews and native-vector writes to owned copies."""
 
 import copy
+import math
 import sys
 import types
 
@@ -124,6 +125,120 @@ def test_exact_duplicate_notes_are_counted_independently():
     assert result["notes"][0] == result["notes"][1]
 
 
+def test_default_thinning_and_explicit_note_mode_keep_existing_individual_note_behavior():
+    rows = [note(67, 0, 1), note(60, 0, 2), note(64, 0, 3), note(72, 1, 4)]
+    spec = {"keep_every": 2, "keep_offset": 1}
+    implicit = prepare_variation(rows, spec)
+    assert implicit == prepare_variation(rows, dict(spec, thin_by="note"))
+    assert implicit["variation"]["thin_by"] == "note"
+    assert [(row["start_time"], row["pitch"]) for row in implicit["notes"]] == [(0, 64), (1, 72)]
+    assert prepare_variation(rows, None) == prepare_variation(rows, {"thin_by": "note"})
+
+
+@pytest.mark.parametrize("every,offset,expected", [
+    (1, 0, [(0, 60), (0, 64), (0, 67), (0.125, 62), (2.75, 60), (2.75, 65),
+            (7.125, 64), (7.125, 64), (7.125, 67)]),
+    (2, 0, [(0, 60), (0, 64), (0, 67), (2.75, 60), (2.75, 65)]),
+    (2, 1, [(0.125, 62), (7.125, 64), (7.125, 64), (7.125, 67)]),
+    (3, 2, [(2.75, 60), (2.75, 65)]),
+    (4, 3, [(7.125, 64), (7.125, 64), (7.125, 67)]),
+    (5, 4, []),
+])
+def test_onset_thinning_counts_irregular_variable_size_groups_and_preserves_duplicates(every, offset, expected):
+    rows = [note(67, 7.125, 1), note(60, 2.75, 2), note(64, 0, 3),
+            note(64, 7.125, 4), note(60, 0, 5), note(65, 2.75, 6),
+            note(62, 0.125, 7), note(67, 0, 8), note(64, 7.125, 9)]
+    original = copy.deepcopy(rows)
+    result = prepare_variation(rows, {"thin_by": "onset", "keep_every": every, "keep_offset": offset})
+    assert [(row["start_time"], row["pitch"]) for row in result["notes"]] == expected
+    assert result["note_count"] == len(expected)
+    assert result["removed_note_count"] == len(rows) - len(expected)
+    assert result["modified_note_count"] == 0
+    assert rows == original
+    assert set(result["kept_indexes"]).isdisjoint(result["removed_indexes"])
+    assert sorted(result["kept_indexes"] + result["removed_indexes"]) == list(range(len(rows)))
+
+
+def test_nearby_onsets_and_overlapping_notes_remain_separate_exact_groups():
+    nearby = math.nextafter(1.0, 2.0)
+    rows = [note(60, 1.0, 1, duration=4), note(64, 1.0, 2, duration=4),
+            note(62, nearby, 3), note(65, nearby, 4), note(67, 1.000001, 5)]
+    result = prepare_variation(rows, {"thin_by": "onset", "keep_every": 2, "keep_offset": 1})
+    assert result["kept_indexes"] == [2, 3]
+    assert [row["start_time"] for row in result["notes"]] == [nearby, nearby]
+
+
+def test_pitch_removal_eliminates_empty_groups_before_onset_counting_and_transposition():
+    rows = [note(36, 0, 1), note(60, 1, 2), note(36, 1, 3),
+            note(36, 2, 4), note(64, 3, 5), note(67, 3, 6)]
+    spec = {"thin_by": "onset", "remove_pitches": [36], "keep_every": 2,
+            "keep_offset": 1, "transpose": -12}
+    original_spec = copy.deepcopy(spec)
+    result = prepare_variation(rows, spec)
+    assert result["kept_indexes"] == [4, 5]
+    assert [(row["start_time"], row["pitch"]) for row in result["notes"]] == [(3, 52), (3, 55)]
+    assert result["modified_note_count"] == 2
+    assert spec == original_spec
+
+
+def test_onset_preview_and_native_apply_are_order_and_id_independent_preserving_all_other_values():
+    source = [note(60, 0.123456789123, 1), note(67, 1.234567891234, 2),
+              note(64, 0.123456789123, 3), note(65, 2.345678912345, 4),
+              note(72, 0.123456789123, 5), note(65, 2.345678912345, 6)]
+    source[0].update(duration=0.987654321987, mute=True, probability=0.123456789123,
+                     future_exposed_value={"amounts": [0.123456789123, -2]})
+    spec = {"thin_by": "onset", "remove_pitches": [72], "keep_every": 2, "transpose": 12}
+    source_original = copy.deepcopy(source)
+    expected = prepare_variation(source, spec)
+    for order in (source, list(reversed(source)), source[2:] + source[:2]):
+        copied_rows = [dict(row, note_id=100 + index) for index, row in enumerate(order)]
+        assert prepare_variation(copied_rows, spec)["notes"] == expected["notes"]
+        clip = Clip(copied_rows)
+        result = apply_variation(remote(), clip, spec, expected["notes"])
+        assert result["notes"] == expected["notes"]
+        assert prepare_variation(clip.rows, {})["notes"] == expected["notes"]
+        assert [event[0] for event in clip.events] == ["remove", "modify"]
+        assert clip.events[1][1] is clip.vectors[1]
+        assert clip.events[1][1] is not clip.vectors[0]
+        for row in clip.rows:
+            original = next(old for old in copied_rows if old["note_id"] == row["note_id"])
+            assert row == dict(original, pitch=original["pitch"] + 12)
+    assert source == source_original
+    assert expected["note_count"] == 4
+    assert expected["notes"][0]["future_exposed_value"] == {"amounts": [0.123456789123, -2]}
+
+
+@pytest.mark.parametrize("source,spec", [
+    ([], {"keep_every": 10000, "keep_offset": 9999, "transpose": -127}),
+    ([note(36), note(36, 1, 2)], {"remove_pitches": [36], "transpose": -127}),
+    ([note(127), note(60, 0, 2)], {"keep_every": 2, "keep_offset": 1, "transpose": 127}),
+])
+def test_empty_onset_results_are_valid_and_skip_unnecessary_native_mutations(source, spec):
+    spec = dict(spec, thin_by="onset")
+    clip = Clip(source)
+    expected = prepare_variation(source, spec)
+    assert expected["notes"] == []
+    assert expected["modified_note_count"] == 0
+    apply_variation(remote(), clip, spec, [])
+    assert clip.rows == []
+    assert [event[0] for event in clip.events] == (["remove"] if source else [])
+
+
+def test_onset_groups_obey_note_limit_and_transpose_bounds_for_every_retained_note():
+    source = [note(0, 0, 1), note(126, 0, 2), note(127, 1, 3)]
+    result = prepare_variation(source, {"thin_by": "onset", "keep_every": 2, "transpose": 1})
+    assert [row["pitch"] for row in result["notes"]] == [1, 127]
+    clip = Clip([note(60, 0, 1), note(127, 0, 2)])
+    with pytest.raises(ValueError, match="transposed pitch"):
+        apply_variation(remote(), clip, {"thin_by": "onset", "transpose": 1}, [])
+    assert clip.events == []
+    assert clip.rows == [note(60, 0, 1), note(127, 0, 2)]
+    source = [note()] * 10000
+    assert prepare_variation(source, {"thin_by": "onset", "keep_every": 10000})["note_count"] == 10000
+    with pytest.raises(ValueError, match="10000"):
+        prepare_variation(source + [note()], {"thin_by": "onset"})
+
+
 def test_all_removed_and_empty_sources_are_valid_explicit_variations():
     result = prepare_variation([note(36)], {"remove_pitches": [36], "transpose": -127})
     assert result["notes"] == []
@@ -139,6 +254,9 @@ def test_all_removed_and_empty_sources_are_valid_explicit_variations():
     {"keep_every": 2, "keep_offset": -1}, {"keep_every": 2, "keep_offset": True},
     {"keep_every": 2, "keep_offset": 2}, {"transpose": -128}, {"transpose": 128},
     {"transpose": True}, {"transpose": 1.0}, {"transpose": float("nan")},
+    {"thin_by": None}, {"thin_by": True}, {"thin_by": False}, {"thin_by": 0},
+    {"thin_by": 1.0}, {"thin_by": []}, {"thin_by": {}}, {"thin_by": ("onset",)},
+    {"thin_by": ""}, {"thin_by": "chord"}, {"thin_by": "Onset"}, {"thin_by": " onset"},
 ])
 def test_bad_variations_fail_before_mutation(spec):
     clip = Clip([note()])

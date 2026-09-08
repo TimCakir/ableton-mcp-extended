@@ -45,7 +45,7 @@ logger = logging.getLogger("AbletonMCPServer")
 # do that" that later proved false was traced to one of those copies being
 # older than the others — the capability existed, the process answering the
 # question just didn't have it. `get_build_info` makes that visible.
-SERVER_BUILD_ID = "2026-09-08.4"
+SERVER_BUILD_ID = "2026-09-08.5"
 
 
 def _source_sha256(path):

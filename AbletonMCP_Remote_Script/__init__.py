@@ -35,7 +35,7 @@ _REQUEST_INIT_LOCK = threading.RLock()
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-09-08.4"
+BUILD_ID = "2026-09-08.5"
 try:
     with open(__file__, "rb") as _source_file:
         LOADED_SOURCE_SHA256 = hashlib.sha256(_source_file.read()).hexdigest()

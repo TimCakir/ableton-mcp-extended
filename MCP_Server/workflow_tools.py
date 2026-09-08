@@ -72,9 +72,12 @@ def register_workflow_tools(mcp, get_connection):
         destination_beat (absolute zero-based quarter-note beats, fractions allowed).
         Optional name labels the new copy. MIDI copies use full source length;
         optional variation accepts remove_pitches (0..127), keep_every (1..10000),
-        keep_offset (zero-based, below keep_every) and transpose (-127..127).
-        Pitches are removed first, surviving individual notes are sorted by onset
-        then pitch/values, thinning keeps every Nth note, and transpose follows.
+        keep_offset (zero-based, below keep_every), transpose (-127..127), and
+        thin_by ("note" by default, or "onset" for whole simultaneous groups).
+        Pitches are removed first, surviving notes are sorted by onset then
+        pitch/values, thinning keeps every Nth note or onset group, and transpose
+        follows. Onset groups share exactly the same start_time after pitch removal;
+        no timing tolerance or quantization is applied. Offset counts those groups.
         Preview includes exact resulting MIDI note values. Original notes are untouched.
 
         Audio optionally takes source_range={start, end, units}, using beats for

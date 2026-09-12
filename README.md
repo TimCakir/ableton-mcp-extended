@@ -1,284 +1,232 @@
 # Ableton MCP Extended
-**Control Ableton Live using natural language via AI assistants like Claude or Cursor. This project provides a robust Model Context Protocol (MCP) server that translates natural language commands into precise actions within your Ableton Live session.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Control Ableton Live through an MCP-compatible assistant. The Python MCP server communicates with a Remote Script running inside Live, exposing tools for tracks, clips, notes, devices, routing, arrangement work and recording.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Ableton Live 11+](https://img.shields.io/badge/Ableton%20Live-11+-orange.svg)](https://www.ableton.com/)
 
----
+## Version 1.6.0
 
-Video demonstration: https://www.youtube.com/watch?v=7ZKPIrJuuKk
+Build `2026-09-08.8` adds three tools for latency diagnosis and recording setup:
 
-This tool is designed for producers, developers, and AI enthusiasts who want to streamline their music production workflow, experiment with generative music, and build custom integrations with Ableton Live.
+- `get_latency_report`: device-reported delays across tracks, nested racks, returns
+  and Main, with monitoring state, routing, explicit unknowns and scan limits.
+- `configure_monitoring`: preview, apply and restore Monitor Auto for Live monitoring
+  or Off for an external monitoring path. Stable identities, recording guards,
+  context checks and deferred readback protect the change.
+- `analyze_recording_timing`: measure isolated PCM WAV test hits against supplied
+  reference times, reporting offset, jitter and missing or ambiguous detections.
 
-**You can transform this conversation:**
-```
-👤 "Create a brief minimalist/neo-classical composition in a style similar to Ólafur Arnalds'. (Ableton MCP) / I've loaded four MIDI tracks called "Noire" and "Noire (2) ["Emotional Felt" presets], "Noire (2) ["Reversed Felt" preset, for ambient background], and "Noire (3) ["Ethereal Felt" preset, also for ambient background]. All loaded with nice piano instruments. You have also a MIDI track called "Strings" with a nice string ensemble instrument loaded. Feel free to add new instruments and effects, if pertinent."
-🤖 "Creating MIDI clips... Adding effects... Done!"
-👤 "Then, use ElevenLabs MCP to create a spoken-word audio clip (default voice and settings) with a relevant poem in the style of “Jim Morrison” to accompany the composition."  
-🤖 "Generating poem... Transforming it into speech... Importing it into your session... Done!"
-```
+There are now 155 top-level tools. These features distinguish recorded alignment
+from heard monitoring delay. They do not control Live's buffer preferences or
+Apollo/TR hardware settings, and device-chain sums are not total round-trip measurements.
+See [1.6.0 examples](docs/RELEASE-1.6.0.md) and the practical
+[TR-1000, vocal and guitar latency guide](docs/LATENCY-GUIDE.md).
 
-**Into this music production session**:
+All **1,196 automated tests** passed. Real Live 12.4.5 tests verified monitoring
+apply/restore, unchanged routing and Set metadata, and the restored state after
+save/unload/reopen. See [1.6.0 acceptance](docs/LIVE-ACCEPTANCE-1.6.0-2026-09-08.md).
 
-https://github.com/user-attachments/assets/d6ef2de5-bdeb-4097-acc0-67d70f7f85b3
+## Version 1.5.0 baseline
 
----
+Build `2026-09-08.7` adds direct PCM WAV placement to `build_arrangement`.
+Supply an absolute file path, an audio-track handle and a destination beat.
+Use the whole file or choose an excerpt in seconds. Preview checks the file and
+available space; apply imports, verifies the arrangement copy and removes its
+temporary Session clips before reporting success. See [1.5.0 examples](docs/RELEASE-1.5.0.md).
 
-## Key Features
+This version accepts mono/stereo integer PCM WAV and places unwarped audio at
+fixed tempo. Each placement needs an empty Session slot and arrangement space
+for the full file, even for an excerpt. Existing Session-copy workflows remain
+available. The top-level tool count stays 152.
 
-This project provides comprehensive, programmatic control over the Ableton Live environment.
+The full automated suite passed **1,031 tests**. Actual Live 12.4.5 acceptance
+verified a three-second excerpt and a full 12-second WAV, replay without
+duplicates, empty staging slots and unchanged original material. Both imports
+passed again after saving, unloading and reopening the Set. See the
+[1.5.0 acceptance report](docs/LIVE-ACCEPTANCE-1.5.0-2026-09-08.md).
 
-* **Session and Transport Control:**
-    * Start and stop playback.
-    * Get session info, including tempo, time signature, and track count.
-    * Manage scenes: create, delete, rename, and fire.
+## Version 1.4.0 baseline
 
-* **Track Management:**
-    * Create, rename, and get detailed information for MIDI and audio tracks.
-    * Control track properties: volume, panning, mute, solo, and arm.
-    * Manage track grouping and folding states.
+Build `2026-09-08.6` adds cross-track placement to `build_arrangement`. Supply
+`destination_track_handle` to copy a Session clip onto another compatible
+arrangement track. MIDI variations and warped/unwarped audio ranges carry over;
+omitting the field keeps same-track behavior. See [1.4.0 examples](docs/RELEASE-1.4.0.md).
 
-* **MIDI Clip and Note Manipulation:**
-    * Create and name MIDI clips with specified lengths.
-    * Add, delete, transpose, and quantize notes within clips.
-    * Perform batch edits on multiple notes in a single operation.
-    * Adjust clip loop parameters and follow actions.
+Both track identities are checked again on apply. Overlap checks use the
+destination, and unexpected copies on either track are detected for rollback.
+Devices and routing stay with their existing tracks. The tool count remains 152.
 
-* **Device and Parameter Control:**
-    * Load instruments and effects from Ableton's browser by URI.
-    * Get a full list of parameters for any device on a track.
-    * Set and batch-set device parameters using normalized values (0.0 to 1.0).
+The full suite passed **896 tests**. Actual Live 12.4.5 acceptance verified a
+six-note chord variation and two audio excerpts on separate destination tracks,
+with the original Session clips and arrangement material unchanged. See the
+[1.4.0 acceptance report](docs/LIVE-ACCEPTANCE-1.4.0-2026-09-08.md). All three
+copies and the unchanged sources passed again after saving, unloading and
+reopening the Set.
 
-* **Automation and Envelopes:**
-    * Add and clear automation points for any device parameter within a clip. [This feature isn't working perfectly yet.]
-    * Get information about existing clip envelopes.
+## Version 1.3.0 baseline
 
-* **Browser Integration:**
-    * Navigate and list items from Ableton's browser.
-    * Load instruments, effects, and samples directly from a browser path or URI.
-    * Import audio files directly into audio tracks or clip slots.
+Build `2026-09-08.5` adds whole-chord thinning to `build_arrangement`: set
+`variation.thin_by="onset"` to keep every Nth group of simultaneous notes.
+Notes must have exactly the same start time to form a group. Staggered notes
+remain separate; no timing is changed. The default `thin_by="note"` retains
+the existing individual-note behavior. See [1.3.0 examples](docs/RELEASE-1.3.0.md).
 
-* **Voice & Audio Generation** 
-    * Text-to-Speech Integration: Generate narration, vocal samples, or spoken elements through ElevenLabs MCP [included].
-    * Custom Voice Creation: Clone voices for unique character in your tracks  
-    * Sound Effects: Create custom SFX with AI
-    * Direct Import: Generated audio appears instantly in your Ableton session
+This is logic in the MCP integration using Live's existing note APIs. It does
+not add a built-in Live command or a new top-level MCP tool; the count stays 152.
 
-* **Extensible Framework for Custom Tools**
-    * Example: XY Mouse Controller: Demonstrates creating custom Ableton controllers with the MCP framework
-    * Ultra-Low Latency: High-performance UDP protocol enables responsive real-time control
-    * Unlimited Possibilities: Build your own custom tools and controllers for Ableton Live
+The full suite passed **829 tests**. Actual Live 12.4.5 acceptance verified two
+whole-chord variants and the default individual-note control, then confirmed all
+three copies and the unchanged source after saving, unloading and reopening the
+Set. See the [1.3.0 acceptance report](docs/LIVE-ACCEPTANCE-1.3.0-2026-09-08.md).
 
----
+## Version 1.2.0 baseline
 
-##  Quick Start (5 Minutes)
+Build `2026-09-08.4` extends `build_arrangement` with MIDI variations and trimmed audio placement. The server still exposes 152 tools. The [1.2.0 release examples](docs/RELEASE-1.2.0.md) show the exact preview/apply arguments and limits.
 
-### Prerequisites
-- Ableton Live 11+ (any edition)
-- Python 3.10 or higher
-- Claude Desktop or Cursor IDE
+- **Make MIDI section variations:** remove selected pitches, thin individual notes deterministically, then transpose the survivors. Preview every resulting note before placing a new copy; the source stays unchanged.
+- **Place audio excerpts:** copy a Session audio clip onto its own arrangement track at an absolute beat, including fractional positions. Choose source ranges in beats for warped audio or seconds for unwarped audio.
+- **Check the whole placement:** reject overlaps, changed sources and active recording; verify the new clip's bounds and content. Retained completed plans replay without creating more copies, and failed operations attempt to remove only their own copies.
 
-### 1. **Get the Code**
+Audio sources must have aligned start/end and loop markers. Unwarped audio requires zero pitch offset and fixed, unautomated tempo with Link and tempo follower off. Each audio preview reserves space for the full initial copy and intermediate trimming, so the required empty range can be longer than the final excerpt. Plans support up to 64 placements and 10,000 source MIDI notes; unapplied plans expire after five minutes. The builder does not start playback or save the Set.
+
+The 1.2.0 automated suite passed **792 tests**. Build `2026-09-08.4` passed actual Live 12.4.5 acceptance for three MIDI variations and two trimmed audio placements, including fractional positions, replay, rejected inputs and unchanged sources. All five copies passed verification after saving, unloading and reopening the disposable Set. See the [1.2.0 Live acceptance report](docs/LIVE-ACCEPTANCE-1.2.0-2026-09-08.md) for evidence and limits. The tested 1.1.0 baseline is committed as `d50b243` on `codex/arrangement-workflows`.
+
+## Reliability workflows
+
+The 1.1.0 baseline added eight workflow tools and addressed recording, MIDI-edit and connection failures found in the [September review](docs/MCP-REVIEW-2026-09-03.md) and subsequent real Live testing.
+
+- **Keep targeting the same track:** discover stable track handles, preview an edit, and resolve the handle again when Live executes it. Deleted tracks and changed Sets are rejected.
+- **See what changed:** capture session metadata and compare track, mixer, routing, device and clip changes by handle.
+- **Build an arrangement from MIDI clips:** preview placements, reject overlaps and changed sources, then apply a retained plan without duplicate copies on retry.
+- **Inspect recorded files:** recording jobs return operation IDs and output manifests. Optional FFmpeg analysis measures duration, channels, sample rate, sample peak and RMS, with silence and possible-clipping flags.
+- **Recover from uncertain commands:** requests have IDs, bounded deadlines and status lookup. Expired queued writes do not run later, and uncertain writes are not automatically replayed.
+- **Read and edit MIDI more safely:** paginated structured note results expose the read scope; edit inputs are validated before mutation, with compensation when a note edit partially fails.
+- **Diagnose the code actually loaded:** `get_build_info` compares build labels, protocol and source hashes. Copying a Remote Script does not reload it in Live.
+
+Verified for the 1.1.0 baseline in Live 12.4.5: short bounce and stem captures, cancellation followed by a new job, stable track edits, MIDI edits, arrangement placement safeguards, and saved-Set persistence. See the [baseline Live acceptance report](docs/LIVE-ACCEPTANCE-2026-09-08.md) for evidence and limits, and [1.1.0 release examples](docs/RELEASE-1.1.0.md) for those tool arguments.
+
+## Existing capabilities
+
+| Area | Tools cover |
+| --- | --- |
+| Session and transport | Session inspection, tempo, playback, scenes and cue points |
+| Tracks and routing | Audio/MIDI/return tracks, names, mixer state, sends and routing |
+| Clips and MIDI | Session and arrangement clips, notes, loop settings and supported transformations |
+| Devices | Browser loading, device parameters, racks, chains, drum pads and supported instrument controls |
+| Automation | Clip envelopes and real-time arrangement automation recording, subject to Live API constraints |
+| Recording | Input recording, scene capture, real-time mix bounce and stem capture |
+| Diagnostics | Session overview, meters, performance information, build agreement and command status |
+| Latency and tracking | Device latency report, reversible monitoring setup, recorded test-hit timing analysis |
+
+The existing `freeze_track` tool performs a real-time bounce and can switch off the original track after output verification. It does not invoke Live's native Freeze/Flatten or promise CPU savings. Features depend on the Live version, edition, device and available API; consult [Live API facts](docs/LIVE-API-FACTS.md) and [Live 11 notes](LIVE_11_NOTES.md).
+
+## Quick start
+
+Use Python 3.10 or newer, Ableton Live 11 or 12, and an assistant that supports local stdio MCP servers. The current release work targets Live 12; Live 11 behavior has not been revalidated for this build.
+
 ```bash
-git clone https://github.com/uisato/ableton-mcp-extended.git
+git clone https://github.com/TimCakir/ableton-mcp-extended.git
 cd ableton-mcp-extended
-pip install -e .
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
 ```
 
-### 2. **Install Ableton Script**
-1. Find your Ableton User Library Remote Scripts folder:
-   - **Windows**: `C:\Users\[You]\Documents\Ableton\User Library\Remote Scripts\`
-   - **Mac**: `~/Music/Ableton/User Library/Remote Scripts/`
-2. Create folder: `AbletonMCP`
-3. Copy `AbletonMCP_Remote_Script/__init__.py` into this folder
+On Windows, use `py -3 -m venv .venv` and `.venv\Scripts\python.exe` in place of the macOS commands. Existing checkouts should install from their current repository directory. If you use uv, `uv sync --locked` installs the versions recorded in `uv.lock` instead of resolving fresh dependencies.
 
-### 3. **Configure Ableton**
-1. Open Ableton Live
-2. Go to **Preferences** → **Link, Tempo & MIDI**
-3. Set **Control Surface** to "AbletonMCP"
-4. Set Input/Output to "None"
+1. Copy all `.py` files from `AbletonMCP_Remote_Script/` into `<your Ableton User Library>/Remote Scripts/AbletonMCP/`. On macOS, `./deploy.sh` handles the default User Library location and verifies the copied files.
+2. In Live's MIDI preferences, select **AbletonMCP** as a Control Surface with **Input** and **Output** set to **None**. Restart Live after updating its script.
+3. Add the entry below to your assistant's existing MCP configuration, preserving its other servers and settings. Replace the Python path with your virtual environment's absolute path.
 
-### 4. **Connect AI Assistant**
-
-**For Claude Desktop:**
 ```json
 {
   "mcpServers": {
     "AbletonMCP": {
-      "command": "python",
-      "args": ["C:/path/to/ableton-mcp-extended/MCP_Server/server.py"]
+      "command": "/absolute/path/to/ableton-mcp-extended/.venv/bin/python",
+      "args": ["-m", "MCP_Server.server"]
     }
   }
 }
 ```
 
-**For Cursor:**
-Add MCP server in Settings → MCP with the same path.
+Restart the MCP server in the assistant. Ask it to run `get_build_info`, then `get_session_overview`, and confirm the expected Set. Use a disposable copy of a Set for the first edit or recording test.
 
-### 5. **Start Creating!** 
-Open your AI assistant and try:
-- *"Create a new MIDI track with a piano"*
-- *"Add a simple drum beat"*
-- *"What tracks do I currently have?"*
+See [INSTALLATION.md](INSTALLATION.md) for platform paths, upgrade steps and troubleshooting.
 
----
+## Try the new workflows
 
-## How It Works
+- “Check Becky’s vocal and guitar tracks for device latency and monitoring routing.”
+- “Preview a direct-monitoring setup for these inputs, apply it, then restore the previous settings.”
+- “Measure this finished TR test recording against the supplied beat times; exclude startup hits.”
 
-```mermaid
-graph TB
-    A[You: Natural Language] --> B[AI Assistant]
-    B --> C[MCP Server]
-    C --> D[Ableton Remote Script]
-    D --> E[Ableton Live API]
-    E --> F[🎵 Your Music]
-    
-    G[ElevenLabs AI] --> H[Generated Audio]
-    H --> C
-```
+- “List stable edit targets. Preview changing the Bass track's volume to 0.7.”
+- “Take a session snapshot before this edit, then compare it with a new snapshot.”
+- “Preview placing this session MIDI clip at beats 0 and 4, then apply that plan.”
+- “Preview a breakdown copy without pitch 36, and an alternate phrase transposed up seven semitones.”
+- “Preview thinning this clip by keeping every second note. Show the resulting notes before applying.”
+- “Preview a breakdown keeping every second chord, with all simultaneous notes intact.”
+- “Preview copying this chord variation to the PAD arrangement track at beat 64.5.”
+- “Preview placing seconds 2–5 of this unwarped Session audio clip at beat 128.25.”
+- “Preview placing seconds 2–5 of this local PCM WAV file on the FX track at beat 128.5.”
+- “Check the latest recording operation and measure every file in its output manifest.”
+- “Analyze this local WAV file for duration, sample peak, RMS and possible silence.”
 
-1. You issue a command in plain English to your AI assistant (e.g., "Create a new MIDI track and name it 'Bass'").
-2. The AI Assistant understands the intent and calls the appropriate tool from the MCP server.
-3. The MCP Server (server.py) receives the tool call and constructs a specific JSON command.
-4. The Ableton Remote Script (__init__.py), running inside Live, receives the JSON command via a socket connection.
-5. The Remote Script executes the command using the official Ableton Live API, making the change in your session instantly.
+`edit_track` previews by default; applying requires `preview=false`. Use the actual `session_id` and `track_handle` returned by `get_edit_targets`. [The release examples](docs/RELEASE-1.1.0.md#stable-track-edit-preview-and-apply) show the exact arguments.
 
----
+For `build_arrangement`, use `action="preview"` with placements, inspect the result, then use `action="apply"` with its `plan_id` and `session_id`. `track_handle` identifies the source; optional `destination_track_handle` identifies the receiving track. MIDI thinning counts individual notes by default; `thin_by="onset"` counts groups sharing an exact start time after pitch removal. Transposition rejects pitches outside 0–127. Audio uses the units appropriate to the source's existing warp state. See [cross-track copying](docs/RELEASE-1.4.0.md), [chord thinning](docs/RELEASE-1.3.0.md) and [MIDI and audio placement examples](docs/RELEASE-1.2.0.md).
 
-## Advanced Features
+File plans use `file_path` and `destination_track_handle`, with optional seconds-based
+`source_range`. Keep file placements and Session-source placements in separate
+plans. See [direct WAV placement](docs/RELEASE-1.5.0.md) for its format and staging limits.
 
-<details>
-<summary><strong>🚀 High-Performance Mode (UDP Server)</strong></summary>
+Plans containing unwarped audio return `status="applying"` while Live settles the clip bounds. Poll `apply` with the same plan ID until `applied`, `error` or `partial`. Polling never creates another copy; new arrangement plans are blocked while this verification is pending. File plans also wait for temporary Session-clip cleanup.
 
+## Optional components
 
-For real-time parameter control with ultra-low latency:
+- **Audio analysis:** install `ffmpeg` and `ffprobe` on the MCP process's `PATH`. Analysis reads the first 60 seconds by default, with a maximum of 600 seconds, and reports whether that covers the full file. It measures sample peak and RMS, not true peak or LUFS.
+- **UDP companion:** `Ableton-MCP_hybrid-server/AbletonMCP_UDP/` is an experimental UDP-only companion on port 9878 for parameter controllers. The primary Remote Script owns TCP port 9877. Unsupported companion commands fail explicitly.
+- **ElevenLabs:** the repository includes a separate MCP server for supported voice/audio generation workflows. It requires its own API key and configuration. Generated audio can then be imported using the Ableton tools.
+- **XY controller:** see [the experimental controller example](experimental_tools/xy_mouse_controller/README.md).
+
+## Development and documentation
+
+With uv, use the recorded dependency versions:
 
 ```bash
-# Install the hybrid server
-cp -r Ableton-MCP_hybrid-server/AbletonMCP_UDP/ ~/Remote\ Scripts/AbletonMCP_UDP/
-
-# Try the XY Mouse Controller example
-cd experimental_tools/xy_mouse_controller
-python mouse_parameter_controller_udp.py
+uv sync --locked --extra dev
+uv run --locked --extra dev pytest -q
 ```
 
-This demonstrates how to build:
-- Custom real-time controllers for Ableton
-- Expressive performance tools
-- Interactive music applications
-</details>
+Or use pip in the existing virtual environment:
 
-<details>
-<summary><strong>🎤 ElevenLabs Voice Integration</strong></summary>
-
-
-This repository can be integrated with other MCP servers, such as one for ElevenLabs, to generate and import audio directly into your project.
-
-Set up the ElevenLabs MCP server according to its instructions.
-
-Update your AI assistant's config to include both servers.
-
-Example mcp-config.json:
-
-```json
-{
-  "mcpServers": {
-    "AbletonMCP": {
-      "command": "python",
-      "args": ["/path/to/ableton-mcp-extended/server.py"]
-    },
-    "ElevenLabs": {
-      "command": "python",
-      "args": ["/path/to/elevenlabs_mcp/server.py"],
-      "env": {
-        "ELEVENLABS_API_KEY": "your-api-key-here"
-      }
-    }
-  }
-}
+```bash
+.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -m pytest -q
 ```
 
-</details>
+The default test command excludes tests marked `integration`. Automated tests simulate Live objects and scheduled ticks; they cannot establish that a recording is audible or that an edit survives saving a real Set.
 
----
+- [Release 1.6.0](docs/RELEASE-1.6.0.md)
+- [1.6.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.6.0-2026-09-08.md)
+- [Latency guide](docs/LATENCY-GUIDE.md)
+- [Release 1.5.0](docs/RELEASE-1.5.0.md)
+- [1.5.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.5.0-2026-09-08.md)
+- [Release 1.4.0](docs/RELEASE-1.4.0.md)
+- [1.4.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.4.0-2026-09-08.md)
+- [Release 1.3.0](docs/RELEASE-1.3.0.md)
+- [1.3.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.3.0-2026-09-08.md)
+- [Release 1.2.0](docs/RELEASE-1.2.0.md)
+- [1.2.0 Live acceptance](docs/LIVE-ACCEPTANCE-1.2.0-2026-09-08.md)
+- [Release 1.1.0 baseline](docs/RELEASE-1.1.0.md)
+- [Installation and upgrades](INSTALLATION.md)
+- [Code and MCP review](docs/MCP-REVIEW-2026-09-03.md)
+- [Live API observations](docs/LIVE-API-FACTS.md)
+- [Tooling backlog](docs/TOOLING-BACKLOG.md)
 
-## Components Overview
+## License and credits
 
-This project includes several specialized components:
+Licensed under the [MIT License](LICENSE). This fork builds on [uisato's Ableton MCP Extended](https://github.com/uisato/ableton-mcp-extended), inspired by [ahujasid's ableton-mcp](https://github.com/ahujasid/ableton-mcp).
 
-### **Core MCP Server**
-- Standard TCP communication for reliable AI control
-- Extensive Ableton Live API integration
-- Compatible with Claude Desktop, Cursor, and Gemini CLI.
+Built with the [Model Context Protocol](https://github.com/modelcontextprotocol), [Ableton Live](https://www.ableton.com) and the optional [ElevenLabs API](https://elevenlabs.io).
 
-### **Hybrid TCP/UDP Server** 
-- High-performance real-time parameter control
-- Ultra-low latency for live performance
-- Perfect for controllers and interactive tools
-
-### **ElevenLabs Integration**
-- Professional text-to-speech generation
-- Custom voice creation and cloning
-- Direct import into Ableton sessions
-- Real-time SFX generation
-
-### **Experimental Tools & Examples**
-- **XY Mouse Controller**: Example demonstrating how to build custom Ableton controllers
-- **Extensible Framework**: Foundation for creating your own control interfaces
-- **Proof of Concept**: Shows the power and flexibility of the MCP approach
-
----
-
-## Documentation
-
-- **[Installation Guide](INSTALLATION.md)** - Detailed setup instructions
-- **[User Guide](README.md)** - What, which, and how  
-
----
-
-## Community & Support
-
-- **GitHub Issues**: Bug reports and feature requests
-- **Discussions**: Share your creations and get help
-
-### **Share Your Creations**
-Tag me with your AI-generated experiments! I love seeing what the community creates:
-
-[YouTube](https://www.youtube.com/@uisato_) |
-[Instagram](https://www.instagram.com/uisato_) |
-[Patreon](https://www.patreon.com/c/uisato) |
-[Website](https://www.uisato.art/) 
-
----
-
-## What's Next
-
-- **Fixing Automation Point Placement Bugs**
-- ~**VST Plugin Support** - Control third-party plugins [Though it can be achieved throught the "Configure" parameter function]~ → Done!
-- **Arrangement View** - Full timeline control
-- **Hardware Integration** - Bridge MIDI controllers through AI
-- **Advanced AI** - Smarter and better music understanding and generation
-
----
-
-## License & Credits
-
-This project is licensed under the MIT License - see [LICENSE](LICENSE) for details.
-
-**Built with:**
-- [Model Context Protocol](https://github.com/modelcontextprotocol) - AI integration framework
-- [ElevenLabs API](https://elevenlabs.io) - Professional voice generation
-- [Ableton Live](https://www.ableton.com) - Digital audio workstation
-
-**Inspired by:** The original [ableton-mcp](https://github.com/ahujasid/ableton-mcp) project
-
----
-
-<div align="center">
-
-**Made with ❤️ for the music production community**
-
-*If this project helps your creativity, consider giving it a ⭐ star!*
-
-</div> 
+Original demonstration: [YouTube](https://www.youtube.com/watch?v=7ZKPIrJuuKk). More from uisato: [YouTube](https://www.youtube.com/@uisato_) · [Instagram](https://www.instagram.com/uisato_) · [Patreon](https://www.patreon.com/c/uisato) · [Website](https://www.uisato.art/).

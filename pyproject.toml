@@ -1,6 +1,6 @@
 [project]
 name = "ableton-mcp-extended"
-version = "1.0.0"
+version = "1.6.0"
 description = "Ableton Live integration through the Model Context Protocol with ElevenLabs and extended features"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,9 +13,10 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "mcp[cli]>=1.3.0",
+    "mcp[cli]>=1.28.1,<2",
     "elevenlabs>=0.2.26",
     "python-dotenv>=1.0.0",
+    "fuzzywuzzy>=0.18,<1",
 ]
 
 [project.scripts]
@@ -26,7 +27,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["MCP_Server", "elevenlabs_mcp", "Ableton-MCP_hybrid-server.AbletonMCP_UDP"]
+packages = ["MCP_Server", "elevenlabs_mcp", "AbletonMCP_UDP"]
 
 [tool.setuptools.package-dir]
 AbletonMCP_UDP = "Ableton-MCP_hybrid-server/AbletonMCP_UDP"
@@ -36,6 +37,7 @@ AbletonMCP_UDP = "Ableton-MCP_hybrid-server/AbletonMCP_UDP"
 "Bug Tracker" = "https://github.com/uisato/ableton-mcp-extended/issues"
 
 [project.optional-dependencies]
+dev = ["pytest>=8,<10"]
 xy_controller = [
     "pynput>=1.7.6",
     "screeninfo>=0.8.1",

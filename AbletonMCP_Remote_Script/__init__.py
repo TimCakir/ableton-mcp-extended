@@ -7,7 +7,14 @@ import json
 import threading
 import time
 import traceback
-from collections import Counter
+import hashlib
+import os
+import uuid
+import math
+from collections import Counter, OrderedDict
+from .arrangement_builder import build_arrangement as _build_arrangement_plan
+from .latency_report import get_report as _get_latency_report
+from .monitoring_setup import configure as _configure_monitoring
 
 # Change queue import for Python 2
 try:
@@ -18,6 +25,9 @@ except ImportError:
 # Constants for socket communication
 DEFAULT_PORT = 9877
 HOST = "localhost"
+PROTOCOL_VERSION = "2.1"
+MAX_FRAME_BYTES = 8 * 1024 * 1024
+_REQUEST_INIT_LOCK = threading.RLock()
 
 # Bumped by hand whenever a command is added, removed or changes signature.
 # Three copies of this integration exist at once — the repo, the script Live
@@ -27,7 +37,42 @@ HOST = "localhost"
 # do that" that later turned out to be false was traced to one of those copies
 # being older than the others. `get_build_info` reports this back so the skew
 # is visible instead of being rediscovered as a phantom API limit.
-BUILD_ID = "2026-07-26.20"
+BUILD_ID = "2026-09-08.8"
+try:
+    with open(__file__, "rb") as _source_file:
+        LOADED_SOURCE_SHA256 = hashlib.sha256(_source_file.read()).hexdigest()
+except OSError:
+    LOADED_SOURCE_SHA256 = None
+
+
+def _package_sha256(directory):
+    """Hash every Python source with its relative name, independent of location."""
+    def fail_walk(error):
+        raise error
+
+    try:
+        if not os.path.isfile(os.path.join(directory, "__init__.py")):
+            return None
+        paths = []
+        for parent, directories, files in os.walk(directory, onerror=fail_walk):
+            directories[:] = [name for name in directories if name != "__pycache__"]
+            paths.extend(os.path.join(parent, name) for name in files if name.endswith(".py"))
+        digest = hashlib.sha256(b"ableton-mcp-python-package-v1\0")
+        for path in sorted(paths, key=lambda item: os.path.relpath(item, directory)):
+            name = os.path.relpath(path, directory).replace(os.sep, "/").encode("utf-8")
+            with open(path, "rb") as source:
+                content = source.read()
+            for value in (name, content):
+                digest.update(str(len(value)).encode("ascii") + b"\0")
+                digest.update(value)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+# Include imported helpers; changing only arrangement_builder.py still requires a reload.
+LOADED_PACKAGE_SHA256 = _package_sha256(os.path.dirname(os.path.abspath(__file__)))
+
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -74,8 +119,11 @@ class AbletonMCP(ControlSurface):
         # Socket server for communication
         self.server = None
         self.client_threads = []
+        self._clients = set()
+        self._clients_lock = threading.RLock()
         self.server_thread = None
         self.running = False
+        self._closing = False
         
         # In-flight arrangement-automation record pass, if any
         self._auto_rec = self._auto_rec_state_default()
@@ -110,6 +158,16 @@ class AbletonMCP(ControlSurface):
         """Called when Ableton closes or the control surface is removed"""
         self.log_message("AbletonMCP disconnecting...")
         self.running = False
+        self._closing = True
+        for client in list(getattr(self, "_clients", ())):
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
 
         # Never leave Live armed for arrangement record because a pass was
         # still in flight when the script went away.
@@ -168,6 +226,11 @@ class AbletonMCP(ControlSurface):
                 try:
                     # Accept connections with timeout
                     client, address = self.server.accept()
+                    if not self.running:
+                        client.close()
+                        break
+                    with self._clients_lock:
+                        self._clients.add(client)
                     self.log_message("Connection accepted from " + str(address))
                     self.show_message("AbletonMCP: Client connected")
                     
@@ -198,86 +261,187 @@ class AbletonMCP(ControlSurface):
             self.log_message("Server thread error: " + str(e))
     
     def _handle_client(self, client):
-        """Handle communication with a connected client"""
+        """Accept bounded NDJSON frames and legacy single JSON requests."""
         self.log_message("Client handler started")
-        client.settimeout(None)  # No timeout for client socket
-        buffer = ''  # Changed from b'' to '' for Python 2
-        
+        client.settimeout(1.0)
+        buffer = b""
         try:
             while self.running:
                 try:
-                    # Receive data
                     data = client.recv(8192)
-                    
-                    if not data:
-                        # Client disconnected
-                        self.log_message("Client disconnected")
+                    if not self.running or not data:
                         break
-                    
-                    # Accumulate data in buffer with explicit encoding/decoding
-                    try:
-                        # Python 3: data is bytes, decode to string
-                        buffer += data.decode('utf-8')
-                    except AttributeError:
-                        # Python 2: data is already string
-                        buffer += data
-                    
-                    try:
-                        # Try to parse command from buffer
-                        command = json.loads(buffer)  # Removed decode('utf-8')
-                        buffer = ''  # Clear buffer after successful parse
-                        
-                        self.log_message("Received command: " + str(command.get("type", "unknown")))
-                        
-                        # Process the command and get response
+                    buffer += data
+                    if len(buffer) > MAX_FRAME_BYTES:
+                        raise ValueError("Request exceeds 8 MiB frame limit")
+                    while buffer.strip() and self.running:
+                        framed = b"\n" in buffer
+                        if framed:
+                            frame, buffer = buffer.split(b"\n", 1)
+                            if not frame.strip():
+                                continue
+                            command = json.loads(frame.decode("utf-8"))
+                        else:
+                            try:
+                                command = json.loads(buffer.decode("utf-8"))
+                            except (ValueError, UnicodeDecodeError):
+                                break  # A legacy message may be fragmented.
+                            buffer = b""
+                        if not self.running:
+                            break
                         response = self._process_command(command)
-                        
-                        # Send the response with explicit encoding
-                        try:
-                            # Python 3: encode string to bytes
-                            client.sendall(json.dumps(response).encode('utf-8'))
-                        except AttributeError:
-                            # Python 2: string is already bytes
-                            client.sendall(json.dumps(response))
-                    except ValueError:
-                        # Incomplete data, wait for more
-                        continue
-                        
-                except Exception as e:
-                    self.log_message("Error handling client data: " + str(e))
-                    self.log_message(traceback.format_exc())
-                    
-                    # Send error response if possible
-                    error_response = {
-                        "status": "error",
-                        "message": str(e)
-                    }
-                    try:
-                        # Python 3: encode string to bytes
-                        client.sendall(json.dumps(error_response).encode('utf-8'))
-                    except AttributeError:
-                        # Python 2: string is already bytes
-                        client.sendall(json.dumps(error_response))
-                    except:
-                        # If we can't send the error, the connection is probably dead
-                        break
-                    
-                    # For serious errors, break the loop
-                    if not isinstance(e, ValueError):
-                        break
-        except Exception as e:
-            self.log_message("Error in client handler: " + str(e))
+                        payload = json.dumps(response, allow_nan=False).encode("utf-8")
+                        if len(payload) > MAX_FRAME_BYTES:
+                            payload = json.dumps({"id": command.get("id"), "status": "error",
+                                                  "message": "Response exceeds 8 MiB; request a smaller page"}).encode("utf-8")
+                        client.sendall(payload + (b"\n" if framed else b""))
+                except socket.timeout:
+                    continue
+        except Exception as exc:
+            self.log_message("Error in client handler: " + str(exc))
+            try:
+                client.sendall((json.dumps({"status": "error", "message": str(exc)}) + "\n").encode("utf-8"))
+            except Exception:
+                pass
         finally:
+            with getattr(self, "_clients_lock", _REQUEST_INIT_LOCK):
+                getattr(self, "_clients", set()).discard(client)
             try:
                 client.close()
-            except:
+            except Exception:
                 pass
             self.log_message("Client handler stopped")
-    
-    def _process_command(self, command):
+
+    def _request_registry(self):
+        with _REQUEST_INIT_LOCK:
+            if not hasattr(self, "_requests"):
+                self._requests = OrderedDict()
+                self._requests_lock = threading.RLock()
+        return self._requests
+
+    def _get_command_status(self, request_id):
+        registry = self._request_registry()
+        with self._requests_lock:
+            state = registry.get(request_id)
+            if not state:
+                return {"request_id": request_id, "status": "unknown",
+                        "message": "Not retained by this script process; do not assume it was not applied."}
+            out = {"request_id": request_id, "status": state["status"]}
+            if state.get("response") is not None:
+                out["response"] = state["response"]
+            return out
+
+    def _complete_request(self, state, response):
+        if state is None:
+            return response
+        with self._requests_lock:
+            response["id"] = state["request_id"]
+            if response.get("status") != "pending":
+                state["status"] = "expired" if state["status"] == "expired" else "completed"
+                state["response"] = response
+                parent = state.get("batch_parent")
+                if parent and parent.get("pending_batch") is not None:
+                    self._reconcile_pending_batch(parent, state)
+            elif state.get("response") is not None:
+                # The last running child can finish between batch assembly and
+                # returning the pending response. Never replace its final result.
+                return state["response"]
+        return response
+
+    def _reconcile_pending_batch(self, parent, child):
+        """Finish a stopped batch once its already-running child reports back.
+
+        Called with the request RLock held; no more commands are scheduled.
+        """
+        result = parent.get("pending_batch")
+        reply = child.get("response")
+        if result is None or reply is None or result.get("pending_request_id") != child["request_id"]:
+            return
+        record = result["results"][child["batch_index"]]
+        record["status"] = "error" if reply.get("status") == "error" else "success"
+        record["result"] = reply.get("result")
+        record.pop("message", None)
+        if record["status"] == "error":
+            record["message"] = reply.get("message", "Unknown error")
+        result["pending"] = 0
+        result["succeeded"] = sum(row["status"] == "success" for row in result["results"])
+        result["failed"] = sum(row["status"] == "error" for row in result["results"])
+        result["status"] = ("success" if result["succeeded"] == result["total"] else
+                            "partial" if result["succeeded"] else "error")
+        result.pop("pending_request_id", None)
+        parent.pop("pending_batch", None)
+        self._complete_request(parent, {"status": "success", "result": result})
+
+    def _claim_request(self, state):
+        if state is None:
+            return not getattr(self, "_closing", False)
+        with self._requests_lock:
+            if state["status"] != "queued":
+                return False
+            if getattr(self, "_closing", False) or time.monotonic() >= state["deadline"]:
+                state["status"] = "expired"
+                return False
+            state["status"] = "running"
+            return True
+
+    def _process_command(self, command, parent_state=None):
+        """Correlate requests and retain outcomes without replaying writes."""
+        if not isinstance(command, dict) or not isinstance(command.get("params", {}), dict):
+            return {"status": "error", "message": "Command and params must be objects"}
+        request_id = command.get("id") or str(uuid.uuid4())
+        if not isinstance(request_id, str) or len(request_id) > 128:
+            return {"status": "error", "message": "id must be a string of at most 128 characters"}
+        try:
+            timeout = float(command.get("timeout_seconds", 10.0))
+            if not math.isfinite(timeout) or not 0 < timeout <= 60:
+                raise ValueError("timeout_seconds must be finite and in (0, 60]")
+            fingerprint = json.dumps([command.get("type"), command.get("params", {})],
+                                     sort_keys=True, allow_nan=False)
+        except (ValueError, TypeError) as exc:
+            return {"id": request_id, "status": "error", "message": str(exc)}
+        registry = self._request_registry()
+        with self._requests_lock:
+            old = registry.get(request_id)
+            if old:
+                if old["fingerprint"] != fingerprint:
+                    return {"id": request_id, "status": "error", "message": "Request ID reused with different arguments"}
+                return old.get("response") or {"id": request_id, "status": "pending", "result": {
+                    "request_id": request_id, "status": old["status"], "message": "Poll get_command_status; do not retry."}}
+            # Retain the last 1024 outcomes; in-flight requests are never evicted.
+            while len(registry) >= 1024:
+                victim = next((key for key, value in registry.items()
+                               if value["status"] in ("completed", "expired")), None)
+                if victim is None:
+                    return {"id": request_id, "status": "error", "message": "Too many active requests"}
+                del registry[victim]
+            state = {"request_id": request_id, "fingerprint": fingerprint,
+                     "status": "queued", "deadline": (parent_state["deadline"] if parent_state is not None
+                         else time.monotonic() + timeout),
+                     "response": None}
+            registry[request_id] = state
+            if parent_state is not None:
+                # Keep the current child reachable even if its completed entry
+                # is evicted before the batch assembles its final manifest.
+                parent_state["batch_child_state"] = state
+                state["batch_parent"] = parent_state
+        if getattr(self, "_closing", False) or time.monotonic() >= state["deadline"]:
+            with self._requests_lock:
+                state["status"] = "expired"
+            response = {"status": "error", "message": "Request expired or Remote Script is shutting down",
+                        "result": {"request_id": request_id, "status": "expired"}}
+        else:
+            inner = dict(command)
+            inner["params"] = dict(command.get("params", {}))
+            inner["_request_state"] = state
+            response = self._dispatch_command(inner)
+        response["id"] = request_id
+        return self._complete_request(state, response)
+
+    def _dispatch_command(self, command):
         """Process a command from the client and return a response"""
         command_type = command.get("type", "")
         params = command.get("params", {})
+        request_state = command.get("_request_state")
         
         # Initialize response
         response = {
@@ -287,7 +451,13 @@ class AbletonMCP(ControlSurface):
         
         try:
             # Route the command to the appropriate handler
-            if command_type == "get_session_info":
+            if command_type == "get_command_status":
+                response["result"] = self._get_command_status(params.get("request_id", ""))
+            elif command_type == "get_edit_targets":
+                response["result"] = self._get_edit_targets()
+            elif command_type == "get_session_snapshot":
+                response["result"] = self._get_session_snapshot()
+            elif command_type == "get_session_info":
                 response["result"] = self._get_session_info()
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
@@ -300,9 +470,22 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_grooves":
                 response["result"] = self._get_grooves()
             elif command_type == "batch":
+                if not self._claim_request(request_state):
+                    return {"status": "error", "message": "Batch expired before execution",
+                            "result": {"request_id": request_state["request_id"] if request_state else None,
+                                       "status": "expired"}}
                 response["result"] = self._batch(
                     params.get("commands", []),
-                    params.get("stop_on_error", True))
+                    params.get("stop_on_error", True), request_state)
+                with self._requests_lock:
+                    if response["result"].get("pending_request_id") and request_state:
+                        response["status"] = "pending"
+                        # The final manifest is shared with child completion.
+                        # Pending-only guidance belongs to a separate envelope.
+                        response["result"] = dict(response["result"])
+                        response["result"].update(
+                            request_id=request_state["request_id"],
+                            message="A child command is still running; poll get_command_status for this batch; do not retry.")
             elif command_type == "get_performance_report":
                 response["result"] = self._get_performance_report()
             elif command_type == "get_build_info":
@@ -439,6 +622,7 @@ class AbletonMCP(ControlSurface):
                                  "create_cue_point", "delete_cue_point",
                                  "create_arrangement_clip", "create_arrangement_audio_clip",
                                  "duplicate_to_arrangement", "delete_arrangement_clip",
+                                 "build_arrangement", "get_latency_report", "configure_monitoring",
                                  "set_arrangement_clip_property",
                                  "set_view", "control_arrangement_view",
                                  "manage_clip_automation",
@@ -453,6 +637,17 @@ class AbletonMCP(ControlSurface):
                 # Define a function to execute on the main thread
                 def main_thread_task():
                     try:
+                        if not self._claim_request(request_state):
+                            response_queue.put({"status": "error", "message": "Request expired before execution"})
+                            return
+                        self._guard_command_target(params)
+                        active = getattr(self, "_auto_rec", None) or {}
+                        structural = {"create_midi_track", "create_audio_track", "create_return_track",
+                                      "duplicate_track", "delete_track", "delete_return_track",
+                                      "load_browser_item", "insert_device", "move_device", "delete_device",
+                                      "duplicate_device", "undo_redo", "call_lom"}
+                        if active.get("active") and command_type in structural:
+                            raise RuntimeError("A recording job owns the Set structure; finish or cancel it before this command")
                         result = None
                         if command_type == "create_midi_track":
                             index = params.get("index", -1)
@@ -754,7 +949,7 @@ class AbletonMCP(ControlSurface):
                                 params.get("member", ""),
                                 params.get("args", []),
                                 params.get("set_value", None),
-                                params.get("has_set_value", False),
+                                params.get("has_set_value", "set_value" in params),
                                 params.get("set_from", None))
                         elif command_type == "set_device_sidechain":
                             result = self._set_device_sidechain(
@@ -1038,6 +1233,18 @@ class AbletonMCP(ControlSurface):
                             ci = params.get("clip_index", 0)
                             dt = params.get("destination_time", 0.0)
                             result = self._duplicate_to_arrangement(ti, ci, dt)
+                        elif command_type == "build_arrangement":
+                            result = _build_arrangement_plan(
+                                self, params.get("action"), params.get("session_id"),
+                                params.get("placements"), params.get("plan_id", ""))
+                        elif command_type == "get_latency_report":
+                            result = _get_latency_report(
+                                self, params.get("session_id"), params.get("track_handles"))
+                        elif command_type == "configure_monitoring":
+                            result = _configure_monitoring(
+                                self, params.get("action"), params.get("session_id"),
+                                params.get("track_handles"), params.get("monitoring_path"),
+                                params.get("plan_id", ""))
                         elif command_type == "delete_arrangement_clip":
                             ti = params.get("track_index", 0)
                             ci = params.get("clip_index", None)
@@ -1092,8 +1299,9 @@ class AbletonMCP(ControlSurface):
                             di = params.get("device_index", 0)
                             result = self._delete_device(ti, di)
                         elif command_type == "delete_track":
-                            ti = params.get("track_index", 0)
-                            result = self._delete_track(ti)
+                            if "track_index" not in params:
+                                raise ValueError("delete_track requires an explicit track_index or a resolved track_handle")
+                            result = self._delete_track(params["track_index"])
                         elif command_type == "set_track_volume":
                             ti = params.get("track_index", 0)
                             volume = params.get("volume", 0.85)
@@ -1110,30 +1318,40 @@ class AbletonMCP(ControlSurface):
                             result = self._navigate_preset(ti, di, ci, direction)
 
                         # Put the result in the queue
-                        response_queue.put({"status": "success", "result": result})
+                        task_result = {"status": "success", "result": result}
+                        self._complete_request(request_state, task_result)
+                        response_queue.put(task_result)
                     except Exception as e:
                         self.log_message("Error in main thread task: " + str(e))
                         self.log_message(traceback.format_exc())
-                        response_queue.put({"status": "error", "message": str(e)})
+                        task_result = {"status": "error", "message": str(e)}
+                        self._complete_request(request_state, task_result)
+                        response_queue.put(task_result)
                 
                 # Schedule the task to run on the main thread
-                try:
-                    self.schedule_message(0, main_thread_task)
-                except AssertionError:
-                    # If we're already on the main thread, execute directly
-                    main_thread_task()
+                self.schedule_message(1, main_thread_task)
                 
                 # Wait for the response with a timeout
                 try:
-                    task_response = response_queue.get(timeout=10.0)
+                    remaining = max(0.001, request_state["deadline"] - time.monotonic()) if request_state else 10.0
+                    task_response = response_queue.get(timeout=remaining)
                     if task_response.get("status") == "error":
                         response["status"] = "error"
                         response["message"] = task_response.get("message", "Unknown error")
                     else:
                         response["result"] = task_response.get("result", {})
                 except queue.Empty:
-                    response["status"] = "error"
-                    response["message"] = "Timeout waiting for operation to complete"
+                    with self._requests_lock:
+                        if request_state["status"] == "queued":
+                            request_state["status"] = "expired"
+                            response = {"status": "error", "message": "Request expired before execution",
+                                        "result": {"request_id": request_state["request_id"], "status": "expired"}}
+                        elif request_state.get("response") is not None:
+                            response = request_state["response"]
+                        else:
+                            response = {"status": "pending", "result": {
+                                "request_id": request_state["request_id"], "status": "running",
+                                "message": "Outcome pending; poll get_command_status; do not retry."}}
             elif command_type == "get_track_volume":
                 ti = params.get("track_index", 0)
                 response["result"] = self._get_track_volume(ti)
@@ -1371,11 +1589,7 @@ class AbletonMCP(ControlSurface):
     def _set_track_name(self, track_index, name):
         """Set the name of a track"""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            
-            # Set the name
-            track = self._song.tracks[track_index]
+            track = self._track_at(track_index)
             track.name = name
             
             result = {
@@ -1865,15 +2079,23 @@ class AbletonMCP(ControlSurface):
             
             # Check if this is a browser with root categories
             if hasattr(browser_or_item, 'instruments'):
-                # Check all main categories
-                categories = [
-                    browser_or_item.instruments,
-                    browser_or_item.sounds,
-                    browser_or_item.drums,
-                    browser_or_item.audio_effects,
-                    browser_or_item.midi_effects,
-                    browser_or_item.plugins,
-                ]
+                # Search every root that can contain loadable devices.  The
+                # User Library is intentionally included here: browser-path
+                # listing has always exposed it, so excluding it made the URI
+                # returned by get_browser_items_at_path impossible to load.
+                categories = []
+                for attr in (
+                    'instruments',
+                    'sounds',
+                    'drums',
+                    'audio_effects',
+                    'midi_effects',
+                    'plugins',
+                    'user_library',
+                ):
+                    category = getattr(browser_or_item, attr, None)
+                    if category is not None:
+                        categories.append(category)
                 
                 for category in categories:
                     item = self._find_browser_item_by_uri(category, uri, max_depth, current_depth + 1)
@@ -2815,6 +3037,126 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error building session overview: " + str(e))
             raise
 
+    def _target_registry_lock(self):
+        with _REQUEST_INIT_LOCK:
+            if not hasattr(self, "_targets_lock"):
+                self._targets_lock = threading.RLock()
+        return self._targets_lock
+
+    def _get_edit_targets(self):
+        """Return process-local track handles, invalidated when the Set changes."""
+        with self._target_registry_lock():
+            return self._get_edit_targets_locked(self._song)
+
+    def _get_edit_targets_locked(self, song):
+        """Publish a complete handle map for one captured Song under its lock."""
+        previous = getattr(self, "_target_song", None)
+        if previous is not song and previous != song:
+            self._target_song = song
+            self._target_session_id = str(uuid.uuid4())
+            self._target_refs = {}
+        refs = getattr(self, "_target_refs", {})
+        regular = list(song.tracks)
+        current = regular + list(song.return_tracks)
+        alive = {}
+        rows = []
+        for index, track in enumerate(current):
+            handle = next((key for key, obj in refs.items() if obj is track or obj == track), None) or str(uuid.uuid4())
+            alive[handle] = track
+            rows.append({"track_handle": handle, "track_index": index + 1,
+                         "name": track.name,
+                         "kind": "return" if index >= len(regular) else "track"})
+        self._target_refs = alive
+        revision = hashlib.sha256(json.dumps([(r["track_handle"], r["name"]) for r in rows]).encode("utf-8")).hexdigest()
+        return {"session_id": self._target_session_id, "revision": revision,
+                "set_name": getattr(song, "name", ""), "set_file_path": getattr(song, "file_path", ""),
+                "tracks": rows}
+
+    def _guard_command_target(self, params):
+        """Resolve handles again at execution time, after any deferred scheduling."""
+        if not params.get("session_id") and not params.get("track_handle"):
+            return
+        with self._target_registry_lock():
+            targets = self._get_edit_targets_locked(self._song)
+            if params.get("session_id") != targets["session_id"]:
+                raise ValueError("Stale Set identity; call get_edit_targets again")
+            expected_revision = params.get("expected_revision")
+            if expected_revision and expected_revision != targets["revision"]:
+                raise ValueError("Track structure changed since preview; refresh the plan")
+            handle = params.get("track_handle")
+            if handle:
+                matches = [row for row in targets["tracks"] if row["track_handle"] == handle]
+                if not matches:
+                    raise ValueError("Track was deleted or handle is stale")
+                params["track_index"] = matches[0]["track_index"] - 1
+
+    def _get_session_snapshot(self):
+        """Read mixer, device and clip metadata with explicit bounded truncation."""
+        with self._target_registry_lock():
+            return self._get_session_snapshot_locked()
+
+    def _get_session_snapshot_locked(self):
+        song = self._song
+        targets = self._get_edit_targets_locked(song)
+        out = dict(targets)
+        out.update({"schema_version": 1, "captured_at": time.time(),
+                    "tempo": song.tempo, "signature_numerator": song.signature_numerator,
+                    "signature_denominator": song.signature_denominator})
+        rows = []
+        for target in targets["tracks"][:256]:
+            track = self._target_refs[target["track_handle"]]
+            row = dict(target)
+            errors = []
+            for attr in ("mute", "solo", "arm", "is_frozen"):
+                try:
+                    row[attr] = getattr(track, attr)
+                except Exception:
+                    row[attr] = None
+            try:
+                mixer = track.mixer_device
+                row["volume"] = mixer.volume.value
+                row["panning"] = mixer.panning.value
+                row["sends"] = [s.value for s in mixer.sends]
+                row["devices"] = [{"name": device.name, "class_name": device.class_name}
+                                  for device in track.devices]
+            except Exception as exc:
+                errors.append("mixer/devices: " + str(exc))
+            for attr in ("input_routing_type", "input_routing_channel", "output_routing_type", "output_routing_channel"):
+                try:
+                    row[attr] = getattr(track, attr).display_name
+                except Exception:
+                    row[attr] = None
+            clips = []
+            try:
+                # Live raises when reading arrangement_clips on groups/returns.
+                # These track kinds cannot hold clips; their empty list is complete.
+                clip_capable = target["kind"] != "return" and not getattr(track, "is_foldable", False)
+                sources = []
+                if clip_capable:
+                    sources = [("arrangement", i, c) for i, c in enumerate(track.arrangement_clips)]
+                    sources += [("session", i, s.clip) for i, s in enumerate(track.clip_slots) if s.has_clip]
+                row["clip_count"] = len(sources)
+                row["clips_truncated"] = len(sources) > 256
+                for where, index, clip in sources[:256]:
+                    item = {"view": where, "index": index + 1, "name": clip.name}
+                    for attr in ("length", "start_time", "end_time", "loop_start", "loop_end", "start_marker", "end_marker", "file_path"):
+                        try:
+                            item[attr] = getattr(clip, attr)
+                        except Exception:
+                            pass
+                    clips.append(item)
+            except Exception as exc:
+                errors.append("clips: " + str(exc))
+            row["clips"] = clips
+            row["read_errors"] = errors
+            rows.append(row)
+        out["tracks"] = rows
+        out["tracks_truncated"] = len(targets["tracks"]) > 256
+        current_song = self._song
+        if current_song is not song and current_song != song:
+            raise RuntimeError("Set changed while reading snapshot; refresh the snapshot")
+        return out
+
     def _create_audio_track(self, index):
         """Create a new audio track at index (-1 = end)."""
         try:
@@ -3017,7 +3359,7 @@ class AbletonMCP(ControlSurface):
                 track_index, clip_index, clip_name)
         return self._clip_at(track_index, clip_index)
 
-    def _serialise_notes(self, note_objects):
+    def _serialise_notes(self, note_objects, rounded=True):
         out = []
         for n in note_objects:
             entry = {}
@@ -3026,11 +3368,174 @@ class AbletonMCP(ControlSurface):
                          "note_id"):
                 try:
                     val = getattr(n, attr)
-                    entry[attr] = round(val, 5) if isinstance(val, float) else val
+                    entry[attr] = (round(val, 5)
+                                   if rounded and isinstance(val, float) else val)
+                except AttributeError:
+                    if not rounded and attr in ("pitch", "start_time", "duration",
+                                                 "velocity", "mute"):
+                        raise
                 except Exception:
-                    pass
+                    if not rounded:
+                        raise
             out.append(entry)
         return out
+
+    def _note_number(self, value, name, minimum=None, maximum=None,
+                     integer=False):
+        """Validate before handing values to Live or changing any notes."""
+        import math
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("{0} must be a finite number".format(name))
+        if math.isnan(number) or math.isinf(number):
+            raise ValueError("{0} must be a finite number".format(name))
+        if integer and number != int(number):
+            raise ValueError("{0} must be an integer".format(name))
+        if minimum is not None and number < minimum:
+            raise ValueError("{0} must be at least {1}".format(name, minimum))
+        if maximum is not None and number > maximum:
+            raise ValueError("{0} must be at most {1}".format(name, maximum))
+        return int(number) if integer else number
+
+    def _note_specifications(self, notes):
+        """Build every specification first; unsupported fields fail safely."""
+        import Live
+        if not isinstance(notes, (list, tuple)):
+            raise ValueError("notes must be a list of note objects")
+        specs = []
+        for index, note in enumerate(notes):
+            if not isinstance(note, dict):
+                raise ValueError("notes[{0}] must be a note object".format(index))
+            label = "notes[{0}].".format(index)
+            pitch = self._note_number(note.get("pitch", 60), label + "pitch",
+                                      0, 127, integer=True)
+            start = self._note_number(note.get("start_time", 0.0),
+                                      label + "start_time")
+            duration = self._note_number(note.get("duration", 0.25),
+                                         label + "duration", 0)
+            if duration <= 0:
+                raise ValueError(label + "duration must be greater than zero")
+            self._note_number(start + duration, label + "end_time")
+            velocity = self._note_number(note.get("velocity", 100),
+                                         label + "velocity", 0, 127)
+            mute = note.get("mute", False)
+            if not isinstance(mute, (bool, int)) or mute not in (False, True):
+                raise ValueError(label + "mute must be a boolean")
+            spec = Live.Clip.MidiNoteSpecification(
+                pitch=pitch, start_time=start, duration=duration,
+                velocity=velocity, mute=bool(mute))
+            for extra, minimum, maximum in (("probability", 0, 1),
+                                             ("velocity_deviation", -127, 127),
+                                             ("release_velocity", 0, 127)):
+                if extra in note:
+                    value = self._note_number(note[extra], label + extra,
+                                              minimum, maximum)
+                    # Do not silently discard performance information when a
+                    # Live build cannot express a requested property.
+                    try:
+                        setattr(spec, extra, value)
+                    except Exception as exc:
+                        raise ValueError("{0}{1} is unsupported: {2}".format(
+                            label, extra, exc))
+            specs.append(spec)
+        return tuple(specs)
+
+    def _clip_note_scope(self, clip, from_time=0.0, time_span=None,
+                         from_pitch=0, pitch_span=128):
+        """Return a native MidiNoteVector and its honest query boundaries.
+
+        Omitted time_span means all stored notes, including notes outside the
+        loop. A nonzero from_time still supplies an explicit lower bound.
+        Older builds without get_all_notes_extended use the marker bounds and
+        report that this cannot guarantee coverage beyond those markers.
+        """
+        start = self._note_number(from_time, "from_time")
+        pitch = self._note_number(from_pitch, "from_pitch", 0, 127, integer=True)
+        pitches = self._note_number(pitch_span, "pitch_span", 1, 128, integer=True)
+        if pitch + pitches > 128:
+            raise ValueError("from_pitch + pitch_span must not exceed 128")
+        markers = {}
+        for attr in ("start_marker", "end_marker", "loop_start", "loop_end"):
+            value = getattr(clip, attr, None)
+            markers[attr] = (self._note_number(value, attr)
+                             if value is not None else None)
+        minimum = min([0.0] + [markers[k] for k in ("start_marker", "loop_start")
+                              if markers[k] is not None])
+        maximum = max([self._note_number(clip.length, "clip.length", 0)] +
+                      [markers[k] for k in ("end_marker", "loop_end")
+                       if markers[k] is not None])
+        all_reader = getattr(clip, "get_all_notes_extended", None)
+        all_supported = callable(all_reader)
+        all_notes = None
+        if time_span is not None:
+            span = self._note_number(time_span, "time_span", 0)
+            if span <= 0:
+                raise ValueError("time_span must be greater than zero")
+            self._note_number(start + span, "query end")
+            scope = "explicit_window"
+        else:
+            if all_supported:
+                all_notes = all_reader()
+                for note in all_notes:
+                    note_start = self._note_number(note.start_time, "stored start_time")
+                    note_end = self._note_number(
+                        note_start + float(note.duration), "stored end_time")
+                    minimum = min(minimum, note_start)
+                    maximum = max(maximum, note_end)
+                scope = "all_stored" if start == 0 else "stored_from_time"
+            else:
+                scope = "marker_bounds_fallback"
+            if start == 0:
+                start = minimum
+            span = self._note_number(max(0.00001, maximum - start), "query time_span")
+        if all_notes is not None and from_time == 0 and pitch == 0 and pitches == 128:
+            notes = all_notes
+        else:
+            notes = clip.get_notes_extended(pitch, pitches, start, span)
+        info = {"read_scope": scope,
+                "query_bounds": {"from_time": start, "time_span": span,
+                                 "from_pitch": pitch, "pitch_span": pitches},
+                "all_notes_supported": all_supported}
+        info.update(markers)
+        if scope == "marker_bounds_fallback":
+            info["scope_warning"] = (
+                "This Live build has no get_all_notes_extended; notes outside "
+                "the marker bounds may be excluded. Supply an explicit window "
+                "to address those notes.")
+        return notes, info
+
+    def _note_value_signature(self, notes):
+        """Compare stored musical values without depending on regenerated IDs."""
+        fields = ("pitch", "start_time", "duration", "velocity", "mute",
+                  "probability", "velocity_deviation", "release_velocity")
+        return sorted(tuple((key, round(note[key], 8)
+                             if isinstance(note[key], float) else note[key])
+                            for key in fields if key in note) for note in notes)
+
+    def _restore_note_window(self, clip, original, original_specs, bounds):
+        """Compensate a partial write; never replay an insertion blindly."""
+        args = (bounds["from_pitch"], bounds["pitch_span"],
+                bounds["from_time"], bounds["time_span"])
+        current = self._serialise_notes(clip.get_notes_extended(*args), rounded=False)
+        expected = self._note_value_signature(original)
+        if self._note_value_signature(current) == expected:
+            return "original notes unchanged"
+        clip.remove_notes_extended(*args)
+        if original_specs:
+            clip.add_new_notes(original_specs)
+        restored = self._serialise_notes(clip.get_notes_extended(*args), rounded=False)
+        if self._note_value_signature(restored) != expected:
+            raise RuntimeError("readback does not match the original note values")
+        return "original note values restored; restored note IDs may have changed"
+
+    def _begin_note_undo(self):
+        song = self._song
+        if callable(getattr(song, "begin_undo_step", None)) and \
+                callable(getattr(song, "end_undo_step", None)):
+            song.begin_undo_step()
+            return song
+        return None
 
     def _get_clip_notes(self, track_index, clip_index, from_time=0.0,
                         time_span=None, from_pitch=0, pitch_span=128,
@@ -3046,16 +3551,17 @@ class AbletonMCP(ControlSurface):
                 track_index, clip_index, arrangement, clip_name)
             if not clip.is_midi_clip:
                 raise ValueError("'{0}' is an audio clip".format(clip.name))
-            span = float(time_span) if time_span is not None else float(clip.length)
-            notes = clip.get_notes_extended(
-                int(from_pitch), int(pitch_span), float(from_time), span)
+            notes, scope = self._clip_note_scope(
+                clip, from_time, time_span, from_pitch, pitch_span)
             serialised = self._serialise_notes(notes)
             pitches = [n["pitch"] for n in serialised if "pitch" in n]
-            return {"clip_name": clip.name, "track_name": track.name,
+            result = {"clip_name": clip.name, "track_name": track.name,
                     "length": clip.length, "note_count": len(serialised),
                     "arrangement": bool(arrangement),
                     "pitch_range": [min(pitches), max(pitches)] if pitches else None,
                     "notes": serialised}
+            result.update(scope)
+            return result
         except Exception as e:
             self.log_message("Error reading clip notes: " + str(e))
             raise
@@ -3070,8 +3576,8 @@ class AbletonMCP(ControlSurface):
 
         Reads the selected notes, applies the requested changes, and writes
         them back by note id so nothing else in the clip is disturbed.
-        Humanisation is deterministic (a fixed pattern of small offsets)
-        rather than random, so repeated calls do not drift.
+        Humanisation uses a fixed pattern of offsets and is cumulative:
+        repeating a call shifts the current note times again.
 
         This cannot delete notes — use `remove_clip_notes` for that.
         """
@@ -3080,7 +3586,15 @@ class AbletonMCP(ControlSurface):
                 track_index, clip_index, arrangement, clip_name)
             if not clip.is_midi_clip:
                 raise ValueError("'{0}' is an audio clip".format(clip.name))
-            span = float(time_span) if time_span is not None else float(clip.length)
+            transpose = self._note_number(transpose, "transpose", integer=True)
+            if velocity_scale is not None:
+                velocity_scale = self._note_number(velocity_scale, "velocity_scale", 0)
+            if velocity_set is not None:
+                velocity_set = self._note_number(velocity_set, "velocity_set", 0, 127)
+            if humanize_ms is not None:
+                humanize_ms = self._note_number(humanize_ms, "humanize_ms", 0)
+            if probability is not None:
+                probability = self._note_number(probability, "probability", 0, 1)
             # Keep Live's own vector. get_notes_extended returns a
             # MidiNoteVector, and apply_note_modifications wants THAT type
             # back — its C++ signature is std::vector<NClipApi::TNoteInfo>.
@@ -3089,15 +3603,20 @@ class AbletonMCP(ControlSurface):
             # signature", which left this tool unable to do anything at all.
             # The documented pattern is: fetch the vector, mutate the notes
             # in place, hand the same vector back.
-            notes = clip.get_notes_extended(
-                int(from_pitch), int(pitch_span), float(from_time), span)
+            notes, scope = self._clip_note_scope(
+                clip, from_time, time_span, from_pitch, pitch_span)
             if not len(notes):
-                return {"clip_name": clip.name, "modified": 0}
+                result = {"clip_name": clip.name, "modified": 0}
+                result.update(scope)
+                return result
 
-            probability_error = None
+            original = self._serialise_notes(notes, rounded=False)
+
             # Deterministic offsets in beats, derived from tempo.
-            beats_per_ms = self._song.tempo / 60000.0
+            beats_per_ms = self._note_number(self._song.tempo, "tempo", 0) / 60000.0
             offsets = [0.0, 0.6, -0.4, 0.9, -0.7, 0.3, -0.2, 0.8]
+            humanize_beats = self._note_number(
+                float(humanize_ms or 0) * beats_per_ms, "humanize offset")
 
             for i, n in enumerate(notes):
                 if transpose:
@@ -3108,21 +3627,38 @@ class AbletonMCP(ControlSurface):
                     n.velocity = max(1.0, min(
                         127.0, float(n.velocity) * float(velocity_scale)))
                 if humanize_ms:
-                    shift = offsets[i % len(offsets)] * float(humanize_ms) * beats_per_ms
-                    n.start_time = max(0.0, float(n.start_time) + shift)
+                    shift = offsets[i % len(offsets)] * humanize_beats
+                    n.start_time = self._note_number(
+                        float(n.start_time) + shift, "humanized start_time")
                 if probability is not None:
-                    # Was swallowed by a bare `except: pass`, so a build where
-                    # MidiNote has no probability looked identical to one that
-                    # wrote it — which is why "notes come back with no
-                    # probability" could not be diagnosed. Record the outcome
-                    # instead of hiding it.
-                    try:
-                        n.probability = max(0.0, min(1.0, float(probability)))
-                        probability_error = None
-                    except Exception as exc:
-                        probability_error = str(exc)
+                    n.probability = probability
 
-            clip.apply_note_modifications(notes)
+            undo_song = self._begin_note_undo()
+            try:
+                clip.apply_note_modifications(notes)
+            except Exception as exc:
+                try:
+                    for note, baseline in zip(notes, original):
+                        for attr, value in baseline.items():
+                            if attr != "note_id":
+                                setattr(note, attr, value)
+                    clip.apply_note_modifications(notes)
+                    bounds = scope["query_bounds"]
+                    check = clip.get_notes_extended(
+                        bounds["from_pitch"], bounds["pitch_span"],
+                        bounds["from_time"], bounds["time_span"])
+                    ids = set(note["note_id"] for note in original)
+                    restored = self._serialise_notes(
+                        [note for note in check if note.note_id in ids], rounded=False)
+                    if self._note_value_signature(restored) != self._note_value_signature(original):
+                        raise RuntimeError("readback does not match the original note values")
+                except Exception as recovery_error:
+                    raise RuntimeError("MIDI modification failed: {0}; rollback failed: {1}".format(
+                        exc, recovery_error))
+                raise RuntimeError("MIDI modification failed: {0}; original note values restored".format(exc))
+            finally:
+                if undo_song is not None:
+                    undo_song.end_undo_step()
             result = {"clip_name": clip.name, "track_name": track.name,
                       "modified": len(notes),
                       "applied": {"transpose": transpose,
@@ -3130,17 +3666,21 @@ class AbletonMCP(ControlSurface):
                                   "velocity_set": velocity_set,
                                   "humanize_ms": humanize_ms,
                                   "probability": probability}}
+            result.update(scope)
+            if humanize_ms:
+                result["humanize_behavior"] = "cumulative; repeated calls shift current times again"
             if probability is not None:
-                result["probability_written"] = probability_error is None
-                if probability_error:
-                    result["probability_error"] = probability_error
+                result["probability_written"] = True
             # Read one note back so the caller can see whether the write
             # actually landed, rather than trusting the absence of an error.
             try:
-                check = clip.get_notes_extended(
-                    int(from_pitch), int(pitch_span), float(from_time), span)
-                if len(check):
-                    first = check[0]
+                check_start = min(note.start_time for note in notes)
+                check_end = max(note.start_time + note.duration for note in notes)
+                check = clip.get_notes_extended(0, 128, check_start, check_end - check_start)
+                selected_id = getattr(notes[0], "note_id", None)
+                first = next((note for note in check
+                              if getattr(note, "note_id", None) == selected_id), None)
+                if first is not None:
                     result["verify_first_note"] = {
                         "pitch": first.pitch, "velocity": round(first.velocity, 2),
                         "start_time": round(first.start_time, 4),
@@ -3171,16 +3711,34 @@ class AbletonMCP(ControlSurface):
                 track_index, clip_index, arrangement, clip_name)
             if not clip.is_midi_clip:
                 raise ValueError("'{0}' is an audio clip".format(clip.name))
-            span = float(time_span) if time_span is not None else float(clip.length)
-            doomed = self._serialise_notes(clip.get_notes_extended(
-                int(from_pitch), int(pitch_span), float(from_time), span))
-            clip.remove_notes_extended(
-                int(from_pitch), int(pitch_span), float(from_time), span)
-            return {"clip_name": clip.name, "track_name": track.name,
+            notes, scope = self._clip_note_scope(
+                clip, from_time, time_span, from_pitch, pitch_span)
+            doomed = self._serialise_notes(notes, rounded=False)
+            original_specs = self._note_specifications(doomed)
+            bounds = scope["query_bounds"]
+            undo_song = self._begin_note_undo()
+            try:
+                clip.remove_notes_extended(
+                    bounds["from_pitch"], bounds["pitch_span"],
+                    bounds["from_time"], bounds["time_span"])
+            except Exception as exc:
+                try:
+                    recovered = self._restore_note_window(
+                        clip, doomed, original_specs, bounds)
+                except Exception as recovery_error:
+                    raise RuntimeError("MIDI removal failed: {0}; rollback failed: {1}".format(
+                        exc, recovery_error))
+                raise RuntimeError("MIDI removal failed: {0}; {1}".format(exc, recovered))
+            finally:
+                if undo_song is not None:
+                    undo_song.end_undo_step()
+            remaining, _ = self._clip_note_scope(clip)
+            result = {"clip_name": clip.name, "track_name": track.name,
                     "arrangement": bool(arrangement),
                     "removed": len(doomed), "removed_notes": doomed,
-                    "remaining": len(clip.get_notes_extended(
-                        0, 128, 0.0, float(clip.length)))}
+                    "remaining": len(remaining)}
+            result.update(scope)
+            return result
         except Exception as e:
             self.log_message("Error removing clip notes: " + str(e))
             raise
@@ -3194,6 +3752,34 @@ class AbletonMCP(ControlSurface):
             track, clip = self._clip_at(track_index, clip_index)
             result = {"clip_name": clip.name, "action": action}
 
+            if action not in ("info", "duplicate_loop", "duplicate_region", "crop"):
+                raise ValueError(
+                    "action must be info, duplicate_loop, duplicate_region or crop")
+            if action == "duplicate_region":
+                if region_start is None or region_end is None or \
+                        destination_time is None:
+                    raise ValueError(
+                        "duplicate_region needs region_start, region_end "
+                        "and destination_time")
+                region_start = self._note_number(region_start, "region_start")
+                region_end = self._note_number(region_end, "region_end")
+                destination_time = self._note_number(destination_time, "destination_time")
+                if region_end <= region_start:
+                    raise ValueError("region_end must be greater than region_start")
+                self._note_number(region_end - region_start, "region_length")
+            if start_marker is not None:
+                start_marker = self._note_number(start_marker, "start_marker")
+            if end_marker is not None:
+                end_marker = self._note_number(end_marker, "end_marker")
+            proposed_start = start_marker if start_marker is not None else clip.start_marker
+            proposed_end = end_marker if end_marker is not None else clip.end_marker
+            if proposed_end <= proposed_start:
+                raise ValueError("end_marker must be greater than start_marker")
+
+            # Move the end first when moving both markers beyond the old end.
+            if start_marker is not None and end_marker is not None and \
+                    start_marker >= clip.end_marker:
+                clip.end_marker = end_marker
             if start_marker is not None:
                 clip.start_marker = float(start_marker)
                 result["start_marker"] = clip.start_marker
@@ -3207,15 +3793,10 @@ class AbletonMCP(ControlSurface):
                 clip.duplicate_loop()
                 result["new_loop_end"] = clip.loop_end
             elif action == "duplicate_region":
-                if region_start is None or region_end is None or \
-                        destination_time is None:
-                    raise ValueError(
-                        "duplicate_region needs region_start, region_end "
-                        "and destination_time")
-                clip.duplicate_region(float(region_start), float(region_end),
-                                      float(destination_time))
-                result["duplicated"] = [float(region_start), float(region_end),
-                                        float(destination_time)]
+                clip.duplicate_region(region_start, region_end - region_start,
+                                      destination_time)
+                result["duplicated"] = [region_start, region_end, destination_time]
+                result["region_length"] = region_end - region_start
             elif action == "crop":
                 clip.crop()
                 result["cropped_length"] = clip.length
@@ -6844,41 +7425,56 @@ class AbletonMCP(ControlSurface):
         makes programmed patterns breathe — hats that land 80% of the time
         rather than every single loop.
 
-        `add_new_notes` is additive: existing notes survive. Pass
-        replace=True to clear the clip first.
+        `add_new_notes` is additive: existing notes survive. Replacement
+        validates every specification before removal and restores original
+        note values if Live partially applies the change and then fails.
+        Recovery may assign new note IDs; it is not an atomic transaction.
         """
         try:
-            import Live
             track, clip = self._resolve_clip(
                 track_index, clip_index, arrangement, clip_name)
-
-            if replace:
+            if not clip.is_midi_clip:
+                raise ValueError("'{0}' is an audio clip".format(clip.name))
+            specs = self._note_specifications(notes)
+            original_notes, scope = self._clip_note_scope(clip)
+            bounds = dict(scope["query_bounds"])
+            # Partial insertion may place new notes beyond the old marker
+            # bounds. Snapshot and recover the entire affected window.
+            start = bounds["from_time"]
+            end = start + bounds["time_span"]
+            for spec in specs:
+                start = min(start, spec.start_time)
+                end = max(end, spec.start_time + spec.duration)
+            if start != bounds["from_time"] or end != bounds["from_time"] + bounds["time_span"]:
+                bounds["from_time"] = start
+                bounds["time_span"] = max(0.00001, end - start)
+                original_notes = clip.get_notes_extended(0, 128, start, bounds["time_span"])
+            original = self._serialise_notes(original_notes, rounded=False)
+            original_specs = self._note_specifications(original)
+            undo_song = self._begin_note_undo()
+            try:
+                if replace:
+                    clip.remove_notes_extended(0, 128, bounds["from_time"],
+                                               bounds["time_span"])
+                if specs:
+                    clip.add_new_notes(specs)
+            except Exception as exc:
                 try:
-                    clip.remove_notes_extended(0, 128, 0.0, clip.length)
-                except Exception:
-                    pass
-
-            specs = []
-            for n in notes:
-                spec = Live.Clip.MidiNoteSpecification(
-                    pitch=int(n.get("pitch", 60)),
-                    start_time=float(n.get("start_time", 0.0)),
-                    duration=float(n.get("duration", 0.25)),
-                    velocity=float(n.get("velocity", 100)),
-                    mute=bool(n.get("mute", False)))
-                for extra in ("probability", "velocity_deviation",
-                              "release_velocity"):
-                    if extra in n:
-                        try:
-                            setattr(spec, extra, float(n[extra]))
-                        except Exception:
-                            pass
-                specs.append(spec)
-
-            clip.add_new_notes(tuple(specs))
-            return {"clip_name": clip.name, "notes_added": len(specs),
+                    recovered = self._restore_note_window(
+                        clip, original, original_specs, bounds)
+                except Exception as recovery_error:
+                    raise RuntimeError("MIDI insertion failed: {0}; rollback failed: {1}".format(
+                        exc, recovery_error))
+                raise RuntimeError("MIDI insertion failed: {0}; {1}".format(exc, recovered))
+            finally:
+                if undo_song is not None:
+                    undo_song.end_undo_step()
+            result = {"clip_name": clip.name, "notes_added": len(specs),
                     "replaced": bool(replace),
                     "arrangement": bool(arrangement)}
+            result.update(scope)
+            result["query_bounds"] = bounds
+            return result
         except Exception as e:
             self.log_message("Error adding extended notes: " + str(e))
             raise
@@ -7056,64 +7652,85 @@ class AbletonMCP(ControlSurface):
 
     # --- Many commands over one connection --------------------------------
 
-    def _batch(self, commands, stop_on_error=True):
-        """Run a list of commands in order over a single connection.
+    def _batch(self, commands, stop_on_error=True, request_state=None):
+        """Run validated commands in order under one absolute request deadline.
 
-        Every command is otherwise a full round trip: a socket exchange, and
-        above that a separate tool call with model latency attached. Building
-        one arrangement took roughly 260 of them, and that latency — not
-        Live — is what made large edits impractical.
-
-        Each entry is replayed through the normal `_process_command` path, so
-        threading, validation and error handling are identical to sending it
-        on its own. Only the round trips disappear. That is deliberate: a
-        second dispatch path would be a second place for the three-way
-        registration to rot.
+        Once the deadline passes, only a child that already claimed execution
+        may finish. Its outcome remains queryable through both request IDs;
+        skipped commands are never resumed implicitly.
         """
         if not isinstance(commands, (list, tuple)):
             raise ValueError("'commands' must be a list")
+        if not 1 <= len(commands) <= 256:
+            raise ValueError("batch must contain 1 to 256 commands")
+        for index, entry in enumerate(commands):
+            if not isinstance(entry, dict) or not isinstance(entry.get("params", {}), dict):
+                raise ValueError("command {0} and its params must be objects".format(index))
+            name = entry.get("command") or entry.get("type")
+            if not isinstance(name, str) or not name or name == "batch":
+                raise ValueError("command {0} has an invalid or nested batch name".format(index))
 
         results = []
-        succeeded = 0
-        failed = 0
+        stop_reason = None
+        pending_child = None
         for index, entry in enumerate(commands):
-            if not isinstance(entry, dict):
-                raise ValueError(
-                    "command {0} is not an object".format(index))
+            if getattr(self, "_closing", False):
+                stop_reason = "Remote Script is shutting down"
+                break
+            if request_state and time.monotonic() >= request_state["deadline"]:
+                stop_reason = "Batch deadline expired"
+                break
             name = entry.get("command") or entry.get("type")
-            if not name:
-                raise ValueError(
-                    "command {0} has no 'command' name".format(index))
-            if name == "batch":
-                # Nesting would make a failure index meaningless and invites
-                # unbounded recursion from a single malformed payload.
-                raise ValueError("batch cannot contain another batch")
-
             record = {"index": index, "command": name}
+            child_id = str(uuid.uuid4())
+            child_command = {"id": child_id, "type": name, "params": entry.get("params") or {}}
             try:
-                reply = self._process_command(
-                    {"type": name, "params": entry.get("params") or {}})
+                if request_state:
+                    reply = self._process_command(child_command, parent_state=request_state)
+                else:
+                    reply = self._process_command(child_command)
             except Exception as exc:
                 reply = {"status": "error", "message": str(exc)}
-
+            record["request_id"] = reply.get("id", child_id)
+            if reply.get("status") == "pending":
+                record.update(status="error", message="Command outcome is pending; poll its request ID",
+                              result=reply.get("result"))
+                pending_child = child_id
+                stop_reason = "The batch deadline expired while a command was running"
+                results.append(record)
+                break
             if reply.get("status") == "error":
-                failed += 1
-                record["status"] = "error"
-                record["message"] = reply.get("message", "unknown error")
+                record.update(status="error", message=reply.get("message", "Unknown error"),
+                              result=reply.get("result"))
                 results.append(record)
                 if stop_on_error:
-                    return {"ran": index + 1, "total": len(commands),
-                            "succeeded": succeeded, "failed": failed,
-                            "stopped_early": True, "results": results}
+                    stop_reason = "Stopped after a command error"
+                    break
             else:
-                succeeded += 1
-                record["status"] = "success"
-                record["result"] = reply.get("result")
+                record.update(status="success", result=reply.get("result"))
                 results.append(record)
 
-        return {"ran": len(commands), "total": len(commands),
-                "succeeded": succeeded, "failed": failed,
-                "stopped_early": False, "results": results}
+        ran = len(results)
+        for index in range(ran, len(commands)):
+            entry = commands[index]
+            results.append({"index": index, "command": entry.get("command") or entry.get("type"),
+                            "status": "skipped", "message": stop_reason or "Not run"})
+        succeeded = sum(row["status"] == "success" for row in results)
+        failed = sum(row["status"] == "error" for row in results) - bool(pending_child)
+        result = {"status": "success" if succeeded == len(commands) else "partial" if succeeded else "error",
+                  "ran": ran, "total": len(commands), "succeeded": succeeded, "failed": failed,
+                  "skipped": len(commands) - ran, "pending": int(bool(pending_child)),
+                  "stopped_early": ran < len(commands), "stop_reason": stop_reason, "results": results}
+        if pending_child:
+            result["pending_request_id"] = pending_child
+            if request_state:
+                with self._requests_lock:
+                    child = request_state["batch_child_state"]
+                    child["batch_index"] = ran - 1
+                    request_state["pending_batch"] = result
+                    # It may have completed while the remaining rows were built.
+                    self._reconcile_pending_batch(request_state, child)
+        return result
 
     # --- Build identity --------------------------------------------------
 
@@ -7125,7 +7742,11 @@ class AbletonMCP(ControlSurface):
         do that" that later turned out to be false was traced to asking a
         stale copy of this file, not to a real limit.
         """
-        info = {"remote_script_build": BUILD_ID, "script_file": __file__}
+        info = {"remote_script_build": BUILD_ID, "script_file": __file__,
+                "protocol_version": PROTOCOL_VERSION, "source_sha256": LOADED_SOURCE_SHA256,
+                "package_sha256": LOADED_PACKAGE_SHA256,
+                "disk_package_sha256": _package_sha256(os.path.dirname(os.path.abspath(__file__))),
+                "capabilities": ["request_ids", "command_status", "stable_track_handles", "recording_manifests"]}
         # Which Set is open. Live swaps documents without telling anyone, and
         # an afternoon went into "the arrangement is empty" that was really
         # "you are looking at the template". song.file_path answers it in one
@@ -7165,297 +7786,426 @@ class AbletonMCP(ControlSurface):
     # parameter then reproducing the recorded shape untouched.
 
     def _auto_rec_state_default(self):
-        return {"active": False, "status": "idle", "track": None,
-                "parameter": None, "device": None, "from_beat": None,
-                "to_beat": None, "position": None, "samples": 0,
-                "ticks": 0, "rolling": False, "waiting": 0, "stalled": 0}
+        return {"active": False, "operation_id": None, "status": "idle",
+                "track": None, "parameter": None, "device": None,
+                "from_beat": None, "to_beat": None, "position": None,
+                "requested": None, "captured": None, "progress": 0.0,
+                "outputs": [], "samples": 0, "ticks": 0,
+                "rolling": False, "waiting": 0, "stalled": 0}
+
+    def _recording_preflight(self, from_beat, to_beat):
+        """Validate a whole pass before creating, arming or changing anything."""
+        import math
+        state = getattr(self, "_auto_rec", None)
+        if state and state.get("active"):
+            # A Set change invalidates the old operation without touching either Set.
+            self._recording_owner(state["operation_id"], state.get("_song"))
+            if state.get("active"):
+                raise RuntimeError("A transport pass is already running ({0}). "
+                                   "Wait or call cancel_automation_record.".format(
+                                       state.get("operation_id")))
+        start, end = float(from_beat), float(to_beat)
+        if not math.isfinite(start) or not math.isfinite(end):
+            raise ValueError("Recording bounds must be finite numbers")
+        if start < 0 or end <= start:
+            raise ValueError("from_beat must be nonnegative and to_beat greater")
+        song = self._song
+        if bool(song.record_mode):
+            raise RuntimeError("Arrangement recording is already enabled in Live")
+        return song, start, end
+
+    def _recording_begin(self, song, start, end, track, parameter,
+                         return_to_start=True):
+        """Reserve one operation and snapshot objects before any structural edit."""
+        import uuid
+        state = self._auto_rec_state_default()
+        arm_map = []
+        for other in tuple(song.tracks):
+            try:
+                arm_map.append((other, bool(other.arm)))
+            except Exception:
+                pass  # Groups have no arm property.
+        state.update({"active": True, "operation_id": uuid.uuid4().hex,
+                      "status": "preparing", "track": track,
+                      "parameter": parameter, "from_beat": start,
+                      "to_beat": end, "position": start,
+                      "requested": {"from_beat": start, "to_beat": end},
+                      "_song": song, "_owned_tracks": [],
+                      "_required_tracks": [], "_output_refs": [],
+                      "_transport_touched": False, "_cleaned": False,
+                      "restore": {"start_time": song.start_time,
+                                  "loop": song.loop,
+                                  "return_to_start": bool(return_to_start),
+                                  "arm_map": arm_map}})
+        self._auto_rec = state
+        return state
 
     @staticmethod
-    def _interpolate_points(pts, t):
-        """Linear value at beat t across sorted (time, value) pairs."""
-        if t <= pts[0][0]:
-            return pts[0][1]
-        if t >= pts[-1][0]:
-            return pts[-1][1]
-        for i in range(1, len(pts)):
-            t0, v0 = pts[i - 1]
-            t1, v1 = pts[i]
-            if t <= t1:
-                if t1 <= t0:
-                    return v1
-                return v0 + (v1 - v0) * ((t - t0) / (t1 - t0))
-        return pts[-1][1]
+    def _recording_same_object(left, right):
+        """Compare Live entities across fresh Python proxy wrappers.
 
-    def _finish_auto_rec(self, status="done"):
-        """Stop the pass and put the transport back how it was found."""
+        Live returns distinct Python objects for the same Song, Track or Clip.
+        Its equality operator compares the underlying entity; names and indices
+        do not. A deleted or invalid proxy may raise instead of comparing.
+        """
+        if left is right:
+            return True
+        if left is None or right is None:
+            return False
+        try:
+            return bool(left == right)
+        except Exception:
+            return False
+
+    def _recording_owner(self, operation_id, song):
+        """Every callback/finalizer must own both the operation and original Set."""
+        state = getattr(self, "_auto_rec", None)
+        if not state or state.get("operation_id") != operation_id:
+            return None
+        if not state.get("active"):
+            return None
+        if (not self._recording_same_object(state.get("_song"), song) or
+                not self._recording_same_object(self._song, song)):
+            state.update({"active": False, "status": "set_changed",
+                          "error": "The original Live Set is no longer current"})
+            for output in state.get("outputs", []):
+                if output["status"] == "pending":
+                    output.update({"status": "missing", "reason": "set_changed"})
+            return None
+        return state
+
+    @classmethod
+    def _recording_track_present(cls, song, track):
+        return any(cls._recording_same_object(other, track)
+                   for other in tuple(song.tracks))
+
+    @classmethod
+    def _recording_track_identity(cls, song, track):
+        if track is None:
+            return {"identity": "song-{0}:mix".format(id(song)),
+                    "name": "Resampling", "index_at_start": None}
+        index = next((i for i, item in enumerate(tuple(song.tracks))
+                      if cls._recording_same_object(item, track)), None)
+        return {"identity": "song-{0}:track-{1}".format(id(song), id(track)),
+                "name": track.name, "index_at_start": index}
+
+    def _recording_output(self, state, track, source=None, source_name=None):
+        song = state["_song"]
+        try:
+            before = tuple(track.arrangement_clips)
+        except Exception:
+            before = ()
+        row = {"source": source_name or (source.name if source else "Resampling"),
+               "source_identity": self._recording_track_identity(song, source),
+               "track": self._recording_track_identity(song, track) if track else
+                        {"identity": None, "name": None, "index_at_start": None},
+               "status": "pending", "requested": dict(state["requested"]),
+               "captured": None, "file_path": None, "file_exists": False}
+        state["outputs"].append(row)
+        state["_output_refs"].append((row, track, before))
+        if track is not None:
+            state["_required_tracks"].append(track)
+        if source is not None:
+            state["_required_tracks"].append(source)
+        return row
+
+    def _recording_read_outputs(self, state, terminal=False):
+        """Inspect only the captured track objects, never a stale track index."""
+        import os
+        song = state["_song"]
+        for row, track, before in state["_output_refs"]:
+            candidates = []
+            if self._recording_track_present(song, track):
+                try:
+                    candidates = [clip for clip in tuple(track.arrangement_clips)
+                                  if not any(self._recording_same_object(clip, old) for old in before)]
+                except Exception:
+                    pass
+            best = None
+            best_overlap = -1.0
+            for clip in candidates:
+                try:
+                    start, end = float(clip.start_time), float(clip.end_time)
+                    overlap = min(end, state["to_beat"]) - max(start, state["from_beat"])
+                    if overlap <= 0:
+                        continue
+                    midi = bool(getattr(clip, "is_midi_clip", False))
+                    path = "" if midi else str(getattr(clip, "file_path", "") or "")
+                    exists = bool(path and os.path.isfile(path))
+                    size = os.path.getsize(path) if exists else None
+                    full = (start <= state["from_beat"] + 0.01 and
+                            end >= state["to_beat"] - 0.01)
+                    complete = full and (midi or (exists and size > 0))
+                    rank = overlap + (state["to_beat"] - state["from_beat"]
+                                      if complete else 0)
+                    if rank > best_overlap:
+                        best_overlap = rank
+                        best = {"captured": {"from_beat": start, "to_beat": end},
+                                "file_path": path or None, "file_exists": exists,
+                                "file_size_bytes": size,
+                                "media_type": "midi" if midi else "audio",
+                                "status": "complete" if complete else
+                                          ("partial" if terminal else "pending")}
+                except Exception:
+                    continue
+            if best is not None:
+                row.update(best)
+                if terminal and row["status"] == "partial":
+                    row["reason"] = "Incomplete bounds or missing recorded file"
+            else:
+                row.update({"status": "missing" if terminal else "pending",
+                            "captured": None, "file_path": None, "file_exists": False})
+                if terminal:
+                    row["reason"] = "No new recorded clip"
+
+    def _recording_cleanup(self, state):
+        if state.get("_cleaned"):
+            return
+        song = state["_song"]
+        errors = []
+        if state.get("_transport_touched"):
+            for label, action in (
+                    ("stop", lambda: song.stop_playing()),
+                    ("record_mode", lambda: setattr(song, "record_mode", False)),
+                    ("loop", lambda: setattr(song, "loop", state["restore"]["loop"]))):
+                try:
+                    action()
+                except Exception as exc:
+                    errors.append(label + ": " + str(exc))
+            if state["restore"]["return_to_start"]:
+                try:
+                    song.start_time = state["restore"]["start_time"]
+                except Exception as exc:
+                    errors.append("start_time: " + str(exc))
+        # New output tracks must be disarmed before original object states return.
+        original = state["restore"]["arm_map"]
+        for track in list(state["_owned_tracks"]) + [t for t, _ in original]:
+            if self._recording_track_present(song, track):
+                try:
+                    track.arm = False
+                except Exception as exc:
+                    errors.append("disarm: " + str(exc))
+        for track, armed in original:
+            if armed and self._recording_track_present(song, track):
+                try:
+                    track.arm = True
+                except Exception as exc:
+                    errors.append("restore arm: " + str(exc))
+        state["_cleaned"] = True
+        if errors:
+            state["cleanup_errors"] = errors
+
+    def _recording_remove_owned(self, state):
+        song = state["_song"]
+        for track in reversed(state["_owned_tracks"]):
+            index = next((i for i, other in enumerate(tuple(song.tracks))
+                          if self._recording_same_object(other, track)), None)
+            if index is not None:
+                try:
+                    song.delete_track(index)
+                except Exception as exc:
+                    state.setdefault("cleanup_errors", []).append(str(exc))
+
+    def _finish_auto_rec(self, status="done", operation_id=None, song=None):
         state = getattr(self, "_auto_rec", None)
         if not state:
-            self._auto_rec = self._auto_rec_state_default()
-            return self._auto_rec
-        song = self._song
-        restore = state.get("restore") or {}
-        try:
-            song.stop_playing()
-        except Exception:
-            pass
-        try:
-            song.record_mode = False
-        except Exception:
-            pass
-        try:
-            if "loop" in restore:
-                song.loop = restore["loop"]
-        except Exception:
-            pass
-        if restore.get("return_to_start", True):
+            return self._auto_rec_state_default()
+        operation_id = operation_id or state.get("operation_id")
+        song = song if song is not None else state.get("_song")
+        current = self._recording_owner(operation_id, song)
+        if current is None:
+            return self._get_automation_record_status()
+        preparing = state["status"] == "preparing"
+        if state.get("_transport_touched"):
             try:
-                song.start_time = restore.get("start_time", 0.0)
+                state["position"] = float(song.current_song_time)
             except Exception:
                 pass
-        # Arming a track makes Live's exclusive arm disarm the others, and
-        # nothing reports it — so the whole arm map is captured and put back,
-        # disarming everything first so exclusive arm cannot fight the restore.
-        # freeze_track: deactivate the source only once its bounce is on disk.
-        deactivate = restore.get("deactivate_track_index")
-        if deactivate is not None:
+        if status == "done" and (not state["rolling"] or
+                                  state["position"] < state["to_beat"]):
+            status = "interrupted"
+        self._recording_cleanup(state)
+        if status == "done" and state.get("cleanup_errors"):
+            status = "failed"
+            state["error"] = "Recording cleanup did not complete"
+        if preparing and status != "done":
+            self._recording_remove_owned(state)
+        if status == "done" and state["outputs"]:
+            state["status"] = "finalizing"
+            state["_verification_ticks"] = 0
+
+            def verify():
+                owned = self._recording_owner(operation_id, song)
+                if owned is None or owned["status"] != "finalizing":
+                    return
+                owned["_verification_ticks"] += 1
+                expired = owned["_verification_ticks"] >= 20
+                try:
+                    self._recording_read_outputs(owned, terminal=expired)
+                except Exception as exc:
+                    owned["error"] = str(exc)
+                    self._finish_auto_rec("failed", operation_id, song)
+                    return
+                complete = all(row["status"] == "complete" for row in owned["outputs"])
+                if complete or expired:
+                    owned["active"] = False
+                    owned["status"] = "done" if complete else "failed"
+                    if not complete:
+                        owned["error"] = "Recording ended without all requested outputs"
+                    elif owned.get("_deactivate_source") is not None:
+                        source = owned["_deactivate_source"]
+                        if self._recording_track_present(song, source):
+                            try:
+                                source.mixer_device.track_activator.value = 0
+                                if source.mixer_device.track_activator.value != 0:
+                                    raise RuntimeError("Live did not deactivate the source")
+                                owned["deactivated"] = source.name
+                            except Exception as exc:
+                                owned["status"] = "failed"
+                                owned["deactivate_error"] = str(exc)
+                                try:
+                                    source.mixer_device.track_activator.value = owned["_source_activator"]
+                                except Exception as restore_exc:
+                                    owned.setdefault("cleanup_errors", []).append(str(restore_exc))
+                        else:
+                            owned["status"] = "failed"
+                            owned["error"] = "Original source track was removed"
+                    return
+                try:
+                    self.schedule_message(1, verify)
+                except Exception as exc:
+                    owned["error"] = str(exc)
+                    self._finish_auto_rec("failed", operation_id, song)
+
             try:
-                song.tracks[deactivate].mixer_device.track_activator.value = 0
-                state["deactivated"] = song.tracks[deactivate].name
+                self.schedule_message(1, verify)
             except Exception as exc:
-                state["deactivate_error"] = str(exc)
-        arm_map = restore.get("arm_map")
-        if arm_map:
-            tracks = tuple(song.tracks)
-            for index, armed in arm_map:
-                if index < len(tracks):
-                    try:
-                        tracks[index].arm = False
-                    except Exception:
-                        pass
-            for index, armed in arm_map:
-                if armed and index < len(tracks):
-                    try:
-                        tracks[index].arm = True
-                    except Exception:
-                        pass
-        state["active"] = False
-        state["status"] = status
-        return state
+                state.update({"active": False, "status": "failed", "error": str(exc)})
+                self._recording_read_outputs(state, terminal=True)
+        else:
+            self._recording_read_outputs(state, terminal=True)
+            state.update({"active": False, "status": status})
+        return self._get_automation_record_status()
 
     def _get_automation_record_status(self):
         state = getattr(self, "_auto_rec", None)
         if not state:
             return self._auto_rec_state_default()
-        out = dict((k, v) for k, v in state.items() if k != "restore")
         if state.get("active"):
-            try:
-                out["position"] = self._song.current_song_time
-            except Exception:
-                pass
-        # A finished bounce is only useful if the caller can find the file.
-        # Resolved lazily rather than at stop time: Live finalises the
-        # recording a moment after the transport stops, so reading it in
-        # _finish_auto_rec would race and often come back empty.
-        index = state.get("bounce_track_index")
-        if index is not None and not state.get("active"):
-            try:
-                clips = tuple(self._song.tracks[index].arrangement_clips)
-                if clips:
-                    out["file_path"] = clips[-1].file_path
-            except Exception:
-                pass
-        return out
+            self._recording_owner(state["operation_id"], state.get("_song"))
+        # Never serialize Live objects or leak mutable nested state to callers.
+        out = dict((key, value) for key, value in state.items()
+                   if not key.startswith("_") and key != "restore")
+        if len(out.get("outputs", [])) == 1:
+            out["file_path"] = out["outputs"][0]["file_path"]
+        return json.loads(json.dumps(out))
 
     def _cancel_automation_record(self):
         state = getattr(self, "_auto_rec", None)
         if not state or not state.get("active"):
-            return {"cancelled": False, "reason": "no recording in progress"}
-        result = self._finish_auto_rec("cancelled")
-        return {"cancelled": True,
-                "track": result.get("track"),
-                "parameter": result.get("parameter"),
-                "stopped_at_beat": result.get("position")}
+            result = self._get_automation_record_status()
+            result.update({"cancelled": False, "reason": "no recording in progress"})
+            return result
+        result = self._finish_auto_rec("cancelled", state["operation_id"], state["_song"])
+        result["cancelled"] = result["status"] == "cancelled"
+        result["stopped_at_beat"] = result.get("position")
+        return result
+
+    @staticmethod
+    def _interpolate_points(pts, t):
+        if t <= pts[0][0]:
+            return pts[0][1]
+        for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
+            if t <= t1:
+                return v1 if t1 <= t0 else v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+        return pts[-1][1]
+
+    def _recording_start(self, state, record_tracks=(), scene=None, writer=None):
+        song, operation_id = state["_song"], state["operation_id"]
+        if self._recording_owner(operation_id, song) is None:
+            return
+        for track in state["_required_tracks"]:
+            if not self._recording_track_present(song, track):
+                raise RuntimeError("A recording source or target track was removed")
+        originals = state["restore"]["arm_map"]
+        for other in tuple(song.tracks):
+            try:
+                armed = bool(other.arm)
+            except Exception:
+                continue
+            if (not any(self._recording_same_object(other, original)
+                        for original, _ in originals) and
+                    not any(self._recording_same_object(other, owned)
+                            for owned in state["_owned_tracks"])):
+                originals.append((other, armed))
+            other.arm = False
+        for track in state["_owned_tracks"]:
+            track.arm = False
+        for track in record_tracks:
+            track.arm = True
+            if not bool(track.arm):
+                raise RuntimeError("Live refused to arm '{0}'".format(track.name))
+        state["_transport_touched"] = True
+        song.loop = False
+        song.start_time = state["from_beat"]
+        song.record_mode = True
+        if writer:
+            writer(state["from_beat"])
+        if scene is not None:
+            scene.fire()
+        song.start_playing()
+        state["status"] = "recording"
+        self._schedule_pass(song, state["from_beat"], state["to_beat"],
+                            state["parameter"], writer=writer,
+                            operation_id=operation_id)
+
+    def _recording_start_result(self, **extra):
+        result = self._get_automation_record_status()
+        try:
+            seconds = (result["to_beat"] - result["from_beat"]) * 60.0 / self._song.tempo
+        except Exception:
+            seconds = None
+        result.update({"started": result["active"],
+                       "beats": result["to_beat"] - result["from_beat"],
+                       "estimated_seconds": seconds,
+                       "note": "Poll get_automation_record_status; done confirms completion."})
+        result.update(extra)
+        return result
 
     def _record_arrangement_automation(self, track_index, parameter_name,
                                        points, device_index=None,
                                        return_to_start=True):
-        """Write real arrangement automation by recording it in real time.
-
-        points: [{"time": <absolute beat>, "value": 0.0-1.0}, ...] — at least
-        two, because recording captures movement and a single value has no
-        movement to capture. Values are interpolated against the TRUE
-        playhead on every tick, so ramps come out smooth and a slow tick
-        cannot make the shape drift out of time.
-
-        Returns immediately: the pass runs on Live's own tick via
-        schedule_message, so the UI thread is never blocked and the socket
-        does not sit past its timeout. Poll get_automation_record_status.
-
-        This overwrites existing automation for that parameter across the
-        recorded range, exactly as a real record pass would.
-        """
-        state = getattr(self, "_auto_rec", None)
-        if state and state.get("active"):
-            raise RuntimeError(
-                "Already recording automation for '{0}' on '{1}'. Wait for it "
-                "or call cancel_automation_record.".format(
-                    state.get("parameter"), state.get("track")))
-
-        track = self._track_at(track_index)
-        param, owner = self._resolve_parameter(
-            track, parameter_name, device_index)
-
+        """Record parameter movement with the same owned lifecycle as audio passes."""
+        import math
         pts = []
         for point in points:
-            pts.append((float(point.get("time", 0.0)),
-                        max(0.0, min(1.0, float(point.get("value", 0.0))))))
+            when, value = float(point["time"]), float(point["value"])
+            if not math.isfinite(when) or not math.isfinite(value):
+                raise ValueError("Automation points must contain finite numbers")
+            pts.append((when, max(0.0, min(1.0, value))))
         if len(pts) < 2:
-            raise ValueError(
-                "Need at least 2 points — automation recording captures "
-                "movement over time, so one value has nothing to record. "
-                "For a static value just set the parameter.")
+            raise ValueError("Need at least 2 automation points")
         pts.sort(key=lambda pair: pair[0])
-
-        song = self._song
-        start_beat, end_beat = pts[0][0], pts[-1][0]
-        if end_beat <= start_beat:
-            raise ValueError("All points share the same time; nothing to record")
-
+        song, start, end = self._recording_preflight(pts[0][0], pts[-1][0])
+        track = self._track_at(track_index)
+        param, owner = self._resolve_parameter(track, parameter_name, device_index)
         pmin, pmax = param.min, param.max
-        restore = {"start_time": song.start_time,
-                   "loop": song.loop,
-                   "return_to_start": bool(return_to_start)}
+        state = self._recording_begin(song, start, end, track.name, param.name,
+                                      return_to_start)
+        state["device"] = owner
+        state["_required_tracks"] = [track]
 
-        # Arrangement record captures ARMED TRACKS as well as parameter moves,
-        # and recording across a range REPLACES whatever is arranged there.
-        # An automation pass needs no armed track at all, so disarm everything
-        # for the duration. Without this, writing a filter sweep over bars
-        # 33-49 would silently punch out the clips on whichever track happened
-        # to be armed — destroying arranged material as a side effect of
-        # writing automation to an unrelated track.
-        arm_map = []
-        for index, other in enumerate(tuple(song.tracks)):
-            try:
-                arm_map.append((index, bool(other.arm)))
-                if other.arm:
-                    other.arm = False
-            except Exception:
-                pass
-        restore["arm_map"] = arm_map
+        def writer(when):
+            param.value = pmin + (pmax - pmin) * self._interpolate_points(pts, when)
 
-        # A loop would send the playhead back and re-record over the pass.
-        song.loop = False
-        song.start_time = start_beat
-        song.record_mode = True
-        song.start_playing()
-
-        self._auto_rec = {
-            "active": True, "status": "recording",
-            "track": track.name, "parameter": param.name, "device": owner,
-            "from_beat": start_beat, "to_beat": end_beat,
-            "position": start_beat, "samples": 0, "ticks": 0,
-            "rolling": False, "waiting": 0, "stalled": 0,
-            "restore": restore,
-        }
-
-        # Ticks are ~100 ms. If the playhead somehow never reaches end_beat —
-        # a loop brace switched on by hand mid-pass would do it — the chain
-        # would reschedule itself forever, holding Live in record. Cap it at
-        # a generous multiple of the expected duration.
         try:
-            expected_ticks = (end_beat - start_beat) * 60.0 / song.tempo * 10.0
-        except Exception:
-            expected_ticks = 600.0
-        max_ticks = int(expected_ticks * 3) + 100
+            self._recording_start(state, writer=writer)
+        except Exception as exc:
+            state["error"] = str(exc)
+            self._finish_auto_rec("failed", state["operation_id"], song)
+            raise
+        return self._recording_start_result()
 
-        def step():
-            current = getattr(self, "_auto_rec", None)
-            if not current or not current.get("active"):
-                return
-            try:
-                now = song.current_song_time
-                previous = current["position"]
-                current["position"] = now
-
-                # Liveness is judged on the PLAYHEAD, never on is_playing.
-                # is_playing keeps reading False for several ticks after
-                # start_playing() while the change settles — not one tick, as
-                # an earlier version assumed. That version read "not playing",
-                # concluded the user had stopped, and ended the pass after two
-                # ticks having written nothing, while reporting "done" with an
-                # empty envelope. A silent no-op that looks like success is
-                # the worst possible failure here, so the transport's own
-                # position is the only signal trusted.
-                if now > start_beat + 1e-6:
-                    current["rolling"] = True
-                if not current["rolling"]:
-                    # A count-in delays the roll by up to 4 bars and Live
-                    # reports it, so don't spend the patience budget waiting
-                    # for something that is working as configured. This Set
-                    # has count_in_duration set, which would otherwise have
-                    # aborted a pass as "never_started" before the count
-                    # finished.
-                    counting_in = False
-                    try:
-                        counting_in = bool(song.is_counting_in)
-                    except Exception:
-                        pass
-                    if not counting_in:
-                        current["waiting"] += 1
-                    if current["waiting"] > 40:          # ~4 s of ticks
-                        self.log_message(
-                            "automation record: transport never rolled")
-                        self._finish_auto_rec("never_started")
-                        return
-                    self.schedule_message(1, step)
-                    return
-
-                # Once rolling, a playhead that stops advancing IS the stop.
-                if now <= previous:
-                    current["stalled"] += 1
-                else:
-                    current["stalled"] = 0
-                stopped = current["stalled"] >= 3
-                if now >= end_beat or stopped:
-                    # Land exactly on the target. Without this the envelope
-                    # ends at whatever the last tick interpolated, up to one
-                    # tick short of the value that was asked for.
-                    if not stopped:
-                        try:
-                            param.value = pmin + (pmax - pmin) * pts[-1][1]
-                        except Exception:
-                            pass
-                    self._finish_auto_rec("done")
-                    return
-                current["ticks"] += 1
-                if current["ticks"] > max_ticks:
-                    self.log_message(
-                        "automation record ran past its tick budget; stopping")
-                    self._finish_auto_rec("timeout")
-                    return
-                param.value = pmin + (pmax - pmin) * self._interpolate_points(
-                    pts, now)
-                current["samples"] += 1
-            except Exception as exc:
-                self.log_message(
-                    "automation record step failed: " + str(exc))
-                self._finish_auto_rec("failed")
-                return
-            self.schedule_message(1, step)
-
-        self.schedule_message(1, step)
-
-        beats = end_beat - start_beat
-        try:
-            seconds = beats * 60.0 / song.tempo
-        except Exception:
-            seconds = None
-        return {"started": True, "track": track.name,
-                "parameter": param.name, "device": owner,
-                "from_beat": start_beat, "to_beat": end_beat,
-                "beats": beats, "estimated_seconds": seconds,
-                "note": "Recording in real time. Poll "
-                        "get_automation_record_status until status is 'done'."}
 
     def _insert_device(self, track_index, device_name, position=None):
         """Insert a Live device at a position, instead of append-then-move.
@@ -7578,317 +8328,210 @@ class AbletonMCP(ControlSurface):
         song.delete_return_track(return_index)
         return {"deleted": name, "remaining": len(song.return_tracks)}
 
-    def _bounce_to_audio(self, from_beat, to_beat, source="Resampling",
-                         name=None):
-        """Render a range to an audio file, by resampling it in real time.
-
-        Live exposes no render/export call, which was written up here as
-        "rendering audio: not in the API". True of *export*, false of the
-        goal: an audio track accepts `Resampling` (the main bus) or any
-        individual track as its INPUT, so arming it and rolling the transport
-        captures a real audio file on disk. Verified: bars 33-35 produced a
-        843 KB 48 kHz stereo AIFF peaking at -8.5 dBFS.
-
-        source="Resampling" bounces the full mix; source="<track name>"
-        bounces that track alone, which is stem export, and doubles as a
-        stand-in for freeze/flatten (resample the track, then disable the
-        original).
-
-        Real time: bouncing 32 bars takes 32 bars. Monitoring is forced Off,
-        because monitoring a resampling track feeds the main bus back into
-        itself.
-        """
-        state = getattr(self, "_auto_rec", None)
-        if state and state.get("active"):
-            raise RuntimeError(
-                "A transport pass is already running ({0} on {1}).".format(
-                    state.get("parameter") or "recording", state.get("track")))
-
-        index, track, resolved = self._new_resampling_track(source, name)
-        track_index = index
-        result = self._record_over_range(track_index, from_beat, to_beat)
-        self._auto_rec["bounce_track_index"] = track_index
-        result["bounce_track"] = track.name
-        result["bounce_track_index"] = track_index
-        result["source"] = resolved
-        return result
-
-    def _route_track_input(self, track, source_name):
-        """Point a track's input at `source_name`, resolved against Live.
-
-        The available list depends on the audio interface and on which other
-        tracks exist, so it is matched rather than assumed. It also reads
-        EMPTY on a track created in the current tick — call this on a later
-        tick than create_audio_track.
-        """
+    def _recording_resolve_source(self, song, source_name):
         wanted = str(source_name).strip().lower()
-        options = tuple(track.available_input_routing_types)
-        chosen = None
-        for routing in options:
-            if routing.display_name.strip().lower() == wanted:
-                chosen = routing
-                break
-        if chosen is None:
-            for routing in options:
-                if wanted in routing.display_name.strip().lower():
-                    chosen = routing
-                    break
-        if chosen is None:
-            raise ValueError(
-                "No input routing matching '{0}'. Available: {1}".format(
-                    source_name,
-                    ", ".join(r.display_name for r in options) or
-                    "(empty — the track was probably created this same tick)"))
-        # Routing must be set BEFORE arming: an audio track on a dead input
-        # silently refuses to arm, with can_be_armed still reporting True.
-        track.input_routing_type = chosen
+        if wanted == "resampling":
+            return None
+        matches = [track for track in tuple(song.tracks)
+                   if track.name.strip().lower() == wanted]
+        if not matches:
+            raise ValueError("No track named '{0}'".format(source_name))
+        if len(matches) != 1:
+            raise ValueError("Ambiguous source name '{0}'; rename duplicate tracks first".format(source_name))
+        if getattr(matches[0], "has_audio_output", None) is False:
+            raise ValueError("Source '{0}' has no audio output to record".format(source_name))
+        return matches[0]
+
+    def _recording_create_track(self, state, source, label):
+        song = state["_song"]
+        before = tuple(song.tracks)
         try:
-            track.current_monitoring_state = 2      # Off
-        except Exception:
-            pass
-        return chosen.display_name
-
-    def _new_resampling_track(self, source_name, label=None):
-        """Add an audio track fed from `source_name`, ready to record.
-
-        Single-track path (bounce_to_audio, freeze_track). Creating and
-        routing in one tick is fine for ONE track; see _export_stems for why
-        it is not fine for several.
-        """
-        song = self._song
-        song.create_audio_track(-1)
-        index = len(song.tracks) - 1
-        track = song.tracks[index]
-        if label:
-            try:
-                track.name = label
-            except Exception:
-                pass
-        try:
-            resolved = self._route_track_input(track, source_name)
-        except Exception:
-            song.delete_track(index)
-            raise
-        return index, track, resolved
-
-    def _export_stems(self, from_beat, to_beat, track_names=None):
-        """Bounce every track to its own audio file in ONE transport pass.
-
-        The obvious implementation bounces each track separately, costing N
-        real-time passes. But an audio track can take ANY track as its input,
-        so N resampling tracks can be armed together and captured in a single
-        playthrough — 11 stems for the price of one. Arming several at once
-        works: exclusive arm applies when a track is CREATED, not to arm
-        writes through the API.
-
-        Creation and configuration are split across ticks on purpose. A track
-        created in this tick does not yet have its
-        `available_input_routing_types` populated — the list reads EMPTY —
-        so routing them in the same tick worked for the first track and
-        failed on the second with "No input routing matching 'X'. Available:"
-        and nothing after it. Same deferral rule as everywhere else in this
-        API: a thing written (or created) now is not necessarily readable
-        until Live's next tick.
-        """
-        state = getattr(self, "_auto_rec", None)
-        if state and state.get("active"):
-            raise RuntimeError("A transport pass is already running")
-
-        song = self._song
-        wanted = None
-        if track_names:
-            wanted = set(n.strip().lower() for n in track_names)
-
-        sources = []
-        for track in tuple(song.tracks):
-            name = track.name
-            if wanted is not None and name.strip().lower() not in wanted:
-                continue
-            sources.append(name)
-        if not sources:
-            raise ValueError("No matching source tracks")
-        if wanted is not None:
-            missing = wanted - set(n.strip().lower() for n in sources)
-            if missing:
-                raise ValueError(
-                    "No track named: {0}".format(", ".join(sorted(missing))))
-
-        pre_arm = []
-        for i, track in enumerate(tuple(song.tracks)):
-            try:
-                pre_arm.append((i, bool(track.arm)))
-            except Exception:
-                pass
-
-        # Tick 1: create the tracks and nothing else.
-        created = []
-        for name in sources:
             song.create_audio_track(-1)
-            created.append((len(song.tracks) - 1, name))
+        finally:
+            # Also register a partially successful create that raised after insertion.
+            made = [track for track in tuple(song.tracks)
+                    if not any(self._recording_same_object(track, old) for old in before)]
+            state["_owned_tracks"].extend(made)
+        if len(made) != 1:
+            raise RuntimeError("Live did not create exactly one recording track")
+        track = made[0]
+        self._recording_output(state, track, source)
+        track.name = label
+        state["outputs"][-1]["track"]["name"] = track.name
+        return track
 
-        self._auto_rec = {
-            "active": True, "status": "preparing",
-            "track": "{0} stems".format(len(created)),
-            "parameter": "stem export", "device": None,
-            "from_beat": from_beat, "to_beat": to_beat,
-            "position": from_beat, "samples": 0, "ticks": 0,
-            "rolling": False, "waiting": 0, "stalled": 0,
-            "restore": {},
-        }
+    def _recording_prepare_outputs(self, state, sources, labels):
+        """Create now, configure next tick, preserving the same operation ID."""
+        song, operation_id = state["_song"], state["operation_id"]
+        try:
+            targets = [self._recording_create_track(state, source, label)
+                       for source, label in zip(sources, labels)]
+        except Exception as exc:
+            for source, label in zip(sources[len(state["outputs"]):],
+                                     labels[len(state["outputs"]):]):
+                row = self._recording_output(state, None, source)
+                row["track"]["name"] = label
+            state["error"] = str(exc)
+            self._finish_auto_rec("failed", operation_id, song)
+            raise
 
         def configure():
-            # Tick 2: the tracks now exist properly, so route and arm them.
-            made = []
+            owned = self._recording_owner(operation_id, song)
+            if owned is None or owned["status"] != "preparing":
+                return
             try:
-                stem_indices = set(i for i, _ in created)
-                # Disarm everything that is NOT a stem track. The pass runs
-                # with solo_arm=False so the stem tracks can be armed
-                # together — which also means it will not disarm anything
-                # else, and any track the user left armed would record too,
-                # punching an empty clip over its arrangement. Observed: FX /
-                # RISER was armed during a stems test and came back with a
-                # stray clip across the exact export range.
-                for i, other in enumerate(tuple(song.tracks)):
-                    if i in stem_indices:
-                        continue
-                    try:
-                        if other.arm:
-                            other.arm = False
-                    except Exception:
-                        pass
-                for index, name in created:
-                    track = song.tracks[index]
-                    try:
-                        track.name = "STEM " + name
-                    except Exception:
-                        pass
-                    resolved = self._route_track_input(track, name)
-                    track.arm = True
-                    made.append({"index": index, "name": track.name,
-                                 "source": resolved})
-                # Clear the placeholder so the pass's own guard lets it start.
-                self._auto_rec = self._auto_rec_state_default()
-                self._record_over_range(
-                    made[0]["index"], from_beat, to_beat,
-                    arm_track=False, solo_arm=False)
-                # The pass captured arm state AFTER the stem tracks were
-                # armed, which would restore them armed. Use the map from
-                # before they existed.
-                self._auto_rec["restore"]["arm_map"] = pre_arm
-                self._auto_rec["parameter"] = "stem export"
-                self._auto_rec["track"] = "{0} stems".format(len(made))
-                self._auto_rec["stems"] = [m["source"] for m in made]
+                for source, target, row in zip(sources, targets, owned["outputs"]):
+                    if not self._recording_track_present(song, target):
+                        raise RuntimeError("A recording target was removed")
+                    if source is not None and not self._recording_track_present(song, source):
+                        raise RuntimeError("A recording source was removed")
+                    source_name = source.name if source is not None else "Resampling"
+                    # A rename is safe only while it still resolves uniquely to our object.
+                    if not self._recording_same_object(
+                            self._recording_resolve_source(song, source_name), source):
+                        raise RuntimeError("Recording source identity changed")
+                    row["source"] = self._route_track_input(target, source_name)
+                self._recording_start(owned, targets)
             except Exception as exc:
-                self.log_message("stem export setup failed: " + str(exc))
-                for index, _ in reversed(created):
-                    try:
-                        song.delete_track(index)
-                    except Exception:
-                        pass
-                self._auto_rec = self._auto_rec_state_default()
-                self._auto_rec["status"] = "failed"
-                self._auto_rec["error"] = str(exc)
+                owned["error"] = str(exc)
+                self.log_message("recording setup failed: " + str(exc))
+                self._finish_auto_rec("failed", operation_id, song)
 
-        self.schedule_message(1, configure)
-
-        beats = float(to_beat) - float(from_beat)
         try:
-            seconds = beats * 60.0 / song.tempo
-        except Exception:
-            seconds = None
-        return {"started": True, "stem_count": len(created),
-                "stems": [{"source": n} for _, n in created],
-                "from_beat": from_beat, "to_beat": to_beat,
-                "beats": beats, "estimated_seconds": seconds,
-                "note": "Tracks created; routing and recording start on the "
-                        "next tick. Poll get_automation_record_status."}
+            self.schedule_message(1, configure)
+        except Exception as exc:
+            state["error"] = str(exc)
+            self._finish_auto_rec("failed", operation_id, song)
+            raise
+        return targets
 
-    def _freeze_track(self, track_index, from_beat, to_beat,
-                      deactivate=True):
-        """Bounce a track to audio, then switch the original off.
+    def _bounce_to_audio(self, from_beat, to_beat, source="Resampling", name=None):
+        """Capture a source in real time and return an operation with a file manifest."""
+        song, start, end = self._recording_preflight(from_beat, to_beat)
+        source_track = self._recording_resolve_source(song, source)
+        label = str(name) if name else "BOUNCE " + str(source)
+        state = self._recording_begin(song, start, end, label, "bounce")
+        target = self._recording_prepare_outputs(state, [source_track], [label])[0]
+        index = next(i for i, item in enumerate(tuple(song.tracks))
+                     if self._recording_same_object(item, target))
+        state.update({"bounce_track": target.name, "bounce_track_index": index,
+                      "source": source_track.name if source_track else "Resampling"})
+        return self._recording_start_result()
 
-        Live's own freeze is not in the API — `is_frozen` has no setter. This
-        is the same end reached differently: resample the track, then drop its
-        `track_activator` so its devices stop costing CPU. Reversible by
-        turning the original back on and deleting the bounce.
+    def _route_track_input(self, track, source_name):
+        """Choose an exact, unique route on a later tick than track creation."""
+        wanted = str(source_name).strip().lower()
+        options = tuple(track.available_input_routing_types)
+        matches = [route for route in options
+                   if route.display_name.strip().lower() == wanted]
+        if len(matches) != 1:
+            raise ValueError("Expected one exact input routing matching '{0}'; found {1}. "
+                             "Available: {2}".format(source_name, len(matches),
+                                 ", ".join(route.display_name for route in options)))
+        track.input_routing_type = matches[0]
+        # Monitoring Off is essential: a resampling monitor can feed back.
+        track.current_monitoring_state = 2
+        return matches[0].display_name
+
+    def _export_stems(self, from_beat, to_beat, track_names=None):
+        """Record all selected sources in one pass; report every output separately."""
+        song, start, end = self._recording_preflight(from_beat, to_beat)
+        names = list(track_names) if track_names else [track.name for track in tuple(song.tracks)]
+        if not names:
+            raise ValueError("No matching source tracks")
+        if len(set(str(name).strip().lower() for name in names)) != len(names):
+            raise ValueError("Duplicate stem source names are ambiguous")
+        sources = [self._recording_resolve_source(song, name) for name in names]
+        if any(source is None for source in sources):
+            raise ValueError("Use bounce_to_audio for the Resampling mix source")
+        state = self._recording_begin(song, start, end,
+                                      "{0} stems".format(len(sources)), "stem export")
+        state["stems"] = [source.name for source in sources]
+        state["stem_count"] = len(sources)
+        self._recording_prepare_outputs(state, sources,
+                                        ["STEM " + source.name for source in sources])
+        return self._recording_start_result()
+
+    def _freeze_track(self, track_index, from_beat, to_beat, deactivate=True):
+        """Bounce, then deactivate only after a full-range recorded file is verified.
+
+        This is a reversible bounce-and-deactivate operation, not native Freeze.
+        Device CPU savings are not guaranteed by track_activator.
         """
-        track = self._track_at(track_index)
-        source_name = track.name
-        index, _, resolved = self._new_resampling_track(
-            source_name, "FROZEN " + source_name)
-        result = self._record_over_range(index, from_beat, to_beat)
+        song, start, end = self._recording_preflight(from_beat, to_beat)
+        source = self._track_at(track_index)
+        if not self._recording_same_object(
+                self._recording_resolve_source(song, source.name), source):
+            raise ValueError("The source must have a unique track name")
+        original_activator = source.mixer_device.track_activator.value if deactivate else None
+        state = self._recording_begin(song, start, end, source.name, "bounce and deactivate")
         if deactivate:
-            self._auto_rec["restore"]["deactivate_track_index"] = track_index
-        result["frozen_source"] = source_name
-        result["bounce_track_index"] = index
-        self._auto_rec["bounce_track_index"] = index
-        result["source"] = resolved
-        return result
+            state["_deactivate_source"] = source
+            state["_source_activator"] = original_activator
+        target = self._recording_prepare_outputs(state, [source], ["FROZEN " + source.name])[0]
+        index = next(i for i, item in enumerate(tuple(song.tracks))
+                     if self._recording_same_object(item, target))
+        state.update({"frozen_source": source.name, "source": source.name,
+                      "bounce_track": target.name, "bounce_track_index": index})
+        return self._recording_start_result()
 
     def _capture_session_to_arrangement(self, scene_index, from_beat, to_beat):
-        """Record a firing scene into the arrangement.
-
-        Live's oldest songwriting move: play session clips, hit arrangement
-        record, and what you played lands on the timeline. Every part of it
-        is reachable — fire the scene, arm record_mode, roll the transport.
-
-        This WRITES OVER the arrangement across the range on every track that
-        has a clip in the scene, which is the intended behaviour and is not
-        undoable through this API. Check the range first.
-        """
-        state = getattr(self, "_auto_rec", None)
-        if state and state.get("active"):
-            raise RuntimeError("A transport pass is already running")
-
-        song = self._song
+        """Capture scene clips while protecting all unrelated armed tracks."""
+        song, start, end = self._recording_preflight(from_beat, to_beat)
         scenes = tuple(song.scenes)
         if scene_index < 0 or scene_index >= len(scenes):
-            raise IndexError(
-                "Scene {0} out of range (0-{1})".format(
-                    scene_index, len(scenes) - 1))
+            raise IndexError("Scene index out of range")
         scene = scenes[scene_index]
         if getattr(scene, "is_empty", False):
-            raise ValueError(
-                "Scene '{0}' is empty — nothing would be captured".format(
-                    scene.name))
+            raise ValueError("Scene is empty; nothing would be captured")
+        targets, overlaps = [], []
+        for index, track in enumerate(tuple(song.tracks)):
+            slots = tuple(getattr(track, "clip_slots", ()))
+            if scene_index >= len(slots) or not bool(slots[scene_index].has_clip):
+                continue
+            targets.append(track)
+            for clip in tuple(track.arrangement_clips):
+                if float(clip.start_time) < end and float(clip.end_time) > start:
+                    overlaps.append({"track": track.name, "track_index": index,
+                                     "clip": clip.name, "from_beat": clip.start_time,
+                                     "to_beat": clip.end_time})
+        if not targets:
+            raise ValueError("Scene has no recordable clips")
+        state = self._recording_begin(song, start, end,
+                                      "scene '{0}'".format(scene.name), "session capture")
+        state["scene"] = scene.name
+        state["overlap_plan"] = {"replaces_arrangement": True,
+                                 "affected_tracks": [track.name for track in targets],
+                                 "overlaps": overlaps}
+        for track in targets:
+            self._recording_output(state, track, track)
+        operation_id = state["operation_id"]
 
-        from_beat = float(from_beat)
-        to_beat = float(to_beat)
-        if to_beat <= from_beat:
-            raise ValueError("to_beat must be greater than from_beat")
+        def capture():
+            owned = self._recording_owner(operation_id, song)
+            if owned is None or owned["status"] != "preparing":
+                return
+            try:
+                if not any(self._recording_same_object(item, scene)
+                           for item in tuple(song.scenes)):
+                    raise RuntimeError("The capture scene was removed")
+                self._recording_start(owned, scene=scene)
+            except Exception as exc:
+                owned["error"] = str(exc)
+                self._finish_auto_rec("failed", operation_id, song)
 
-        restore = {"start_time": song.start_time, "loop": song.loop,
-                   "return_to_start": True}
-        song.loop = False
-        song.start_time = from_beat
-        song.record_mode = True
-        scene.fire()
-        song.start_playing()
-
-        self._auto_rec = {
-            "active": True, "status": "recording",
-            "track": "scene '{0}'".format(scene.name),
-            "parameter": "session capture", "device": None,
-            "from_beat": from_beat, "to_beat": to_beat,
-            "position": from_beat, "samples": 0, "ticks": 0,
-            "rolling": False, "waiting": 0, "stalled": 0,
-            "restore": restore,
-        }
-        self._schedule_pass(song, from_beat, to_beat, "session capture")
-
-        beats = to_beat - from_beat
         try:
-            seconds = beats * 60.0 / song.tempo
-        except Exception:
-            seconds = None
-        return {"started": True, "scene": scene.name,
-                "from_beat": from_beat, "to_beat": to_beat,
-                "beats": beats, "estimated_seconds": seconds,
-                "note": "Capturing the scene into the arrangement. Poll "
-                        "get_automation_record_status until status is 'done'."}
+            self.schedule_message(1, capture)
+        except Exception as exc:
+            state["error"] = str(exc)
+            self._finish_auto_rec("failed", operation_id, song)
+            raise
+        return self._recording_start_result()
 
-    def _schedule_pass(self, song, from_beat, to_beat, label):
-        """Generic playhead-driven tick loop for a plain transport pass."""
+    def _schedule_pass(self, song, from_beat, to_beat, label, writer=None,
+                       operation_id=None):
+        """One playhead-driven lifecycle for input, automation and scene capture."""
+        operation_id = operation_id or self._auto_rec["operation_id"]
         try:
             expected = (to_beat - from_beat) * 60.0 / song.tempo * 10.0
         except Exception:
@@ -7896,201 +8539,86 @@ class AbletonMCP(ControlSurface):
         max_ticks = int(expected * 3) + 100
 
         def step():
-            current = getattr(self, "_auto_rec", None)
-            if not current or not current.get("active"):
+            state = self._recording_owner(operation_id, song)
+            if state is None or state["status"] != "recording":
                 return
             try:
-                now = song.current_song_time
-                previous = current["position"]
-                current["position"] = now
+                for track in state["_required_tracks"]:
+                    if not self._recording_track_present(song, track):
+                        raise RuntimeError("A recording source or target track was removed")
+                now = float(song.current_song_time)
+                previous = state["position"]
+                state["position"] = now
+                state["ticks"] += 1
+                if state["ticks"] > max_ticks:
+                    self._finish_auto_rec("timeout", operation_id, song)
+                    return
                 if now > from_beat + 1e-6:
-                    current["rolling"] = True
-                if not current["rolling"]:
-                    counting_in = False
-                    try:
-                        counting_in = bool(song.is_counting_in)
-                    except Exception:
-                        pass
-                    if not counting_in:
-                        current["waiting"] += 1
-                    if current["waiting"] > 40:
-                        self.log_message(label + ": transport never rolled")
-                        self._finish_auto_rec("never_started")
+                    state["rolling"] = True
+                    state["captured"] = {"from_beat": from_beat, "to_beat": now}
+                    state["progress"] = max(0.0, min(1.0, (now - from_beat) / (to_beat - from_beat)))
+                if not state["rolling"]:
+                    if not bool(getattr(song, "is_counting_in", False)):
+                        state["waiting"] += 1
+                    if state["waiting"] > 40:
+                        self._finish_auto_rec("never_started", operation_id, song)
                         return
-                    self.schedule_message(1, step)
-                    return
-                if now <= previous:
-                    current["stalled"] += 1
                 else:
-                    current["stalled"] = 0
-                if now >= to_beat or current["stalled"] >= 3:
-                    self._finish_auto_rec("done")
-                    return
-                current["ticks"] += 1
-                if current["ticks"] > max_ticks:
-                    self.log_message(label + ": tick budget exceeded")
-                    self._finish_auto_rec("timeout")
-                    return
-                current["samples"] += 1
+                    state["stalled"] = state["stalled"] + 1 if now <= previous else 0
+                    if now < previous - 1e-6 or state["stalled"] >= 3:
+                        self._finish_auto_rec("interrupted", operation_id, song)
+                        return
+                    if writer:
+                        writer(min(now, to_beat))
+                    state["samples"] += 1
+                    if now >= to_beat:
+                        self._finish_auto_rec("done", operation_id, song)
+                        return
             except Exception as exc:
+                state["error"] = str(exc)
                 self.log_message(label + " step failed: " + str(exc))
-                self._finish_auto_rec("failed")
+                self._finish_auto_rec("failed", operation_id, song)
                 return
-            self.schedule_message(1, step)
+            try:
+                self.schedule_message(1, step)
+            except Exception as exc:
+                state["error"] = str(exc)
+                self._finish_auto_rec("failed", operation_id, song)
 
         self.schedule_message(1, step)
 
     def _record_over_range(self, track_index, from_beat, to_beat,
-                           arm_track=True, return_to_start=True,
-                           solo_arm=True):
-        """Record a track's live input into the arrangement over a bar range.
-
-        Same transport pass as record_arrangement_automation, capturing audio
-        or MIDI from the track's input instead of writing a parameter: arm the
-        track, arm arrangement record, roll from `from_beat`, stop at
-        `to_beat`. Punching a take over bars 33-49 becomes one call rather
-        than a hand-timed record button.
-
-        Whatever the track is set to monitor is what gets recorded — check
-        input routing first if the result is silent.
-        """
-        state = getattr(self, "_auto_rec", None)
-        if state and state.get("active"):
-            raise RuntimeError(
-                "A transport pass is already running ({0} on {1}). Wait for "
-                "it or call cancel_automation_record.".format(
-                    state.get("parameter") or "recording",
-                    state.get("track")))
-
+                           arm_track=True, return_to_start=True, solo_arm=True):
+        """Record input through an operation that preserves original arm objects."""
+        song, start, end = self._recording_preflight(from_beat, to_beat)
         track = self._track_at(track_index)
-        from_beat = float(from_beat)
-        to_beat = float(to_beat)
-        if to_beat <= from_beat:
-            raise ValueError("to_beat must be greater than from_beat")
         if arm_track and not getattr(track, "can_be_armed", False):
-            raise ValueError(
-                "'{0}' cannot be armed — group and return tracks have no "
-                "input to record".format(track.name))
-
-        song = self._song
-        arm_map = []
-        for index, other in enumerate(tuple(song.tracks)):
-            try:
-                arm_map.append((index, bool(other.arm)))
-            except Exception:
-                pass
-
-        restore = {"start_time": song.start_time, "loop": song.loop,
-                   "return_to_start": bool(return_to_start),
-                   "arm_map": arm_map}
-
-        # Disarm every other track first. Any track left armed also records,
-        # replacing whatever is arranged on it across the same range — so
-        # punching a vocal take over bars 33-49 would quietly destroy bars
-        # 33-49 of an unrelated armed track. Exclusive arm usually does this,
-        # but it is a preference and cannot be relied on.
-        # solo_arm=False is for stem export, which deliberately arms many
-        # tracks at once and must not have them disarmed here.
-        if solo_arm:
+            raise ValueError("'{0}' cannot be armed".format(track.name))
+        record_tracks = [track] if arm_track else []
+        if not solo_arm:
             for other in tuple(song.tracks):
                 try:
-                    if other.arm and other != track:
-                        other.arm = False
+                    if other.arm and not any(self._recording_same_object(other, target)
+                                             for target in record_tracks):
+                        record_tracks.append(other)
                 except Exception:
                     pass
-        if arm_track:
-            track.arm = True
-        song.loop = False
-        song.start_time = from_beat
-        song.record_mode = True
-        song.start_playing()
-
-        self._auto_rec = {
-            "active": True, "status": "recording",
-            "track": track.name, "parameter": "input (take)", "device": None,
-            "from_beat": from_beat, "to_beat": to_beat,
-            "position": from_beat, "samples": 0, "ticks": 0,
-            "rolling": False, "waiting": 0, "stalled": 0,
-            "restore": restore,
-        }
-
+        elif not arm_track and bool(getattr(track, "arm", False)):
+            record_tracks = [track]
+        if not record_tracks:
+            raise ValueError("No armed input track would be recorded")
+        state = self._recording_begin(song, start, end, track.name, "input (take)",
+                                      return_to_start)
+        for target in record_tracks:
+            self._recording_output(state, target, target)
         try:
-            expected_ticks = (to_beat - from_beat) * 60.0 / song.tempo * 10.0
-        except Exception:
-            expected_ticks = 600.0
-        max_ticks = int(expected_ticks * 3) + 100
+            self._recording_start(state, record_tracks)
+        except Exception as exc:
+            state["error"] = str(exc)
+            self._finish_auto_rec("failed", state["operation_id"], song)
+            raise
+        return self._recording_start_result(armed=bool(arm_track))
 
-        def step():
-            current = getattr(self, "_auto_rec", None)
-            if not current or not current.get("active"):
-                return
-            try:
-                now = song.current_song_time
-                previous = current["position"]
-                current["position"] = now
-
-                # Playhead-based liveness, same reasoning as the automation
-                # recorder: is_playing lags start_playing() by several ticks,
-                # and trusting it ended the pass instantly with nothing
-                # recorded. A take that silently captures nothing is worse
-                # than one that errors.
-                if now > from_beat + 1e-6:
-                    current["rolling"] = True
-                if not current["rolling"]:
-                    # A count-in delays the roll by up to 4 bars and Live
-                    # reports it, so don't spend the patience budget waiting
-                    # for something that is working as configured. This Set
-                    # has count_in_duration set, which would otherwise have
-                    # aborted a pass as "never_started" before the count
-                    # finished.
-                    counting_in = False
-                    try:
-                        counting_in = bool(song.is_counting_in)
-                    except Exception:
-                        pass
-                    if not counting_in:
-                        current["waiting"] += 1
-                    if current["waiting"] > 40:          # ~4 s of ticks
-                        self.log_message(
-                            "take recording: transport never rolled")
-                        self._finish_auto_rec("never_started")
-                        return
-                    self.schedule_message(1, step)
-                    return
-
-                if now <= previous:
-                    current["stalled"] += 1
-                else:
-                    current["stalled"] = 0
-                if now >= to_beat or current["stalled"] >= 3:
-                    self._finish_auto_rec("done")
-                    return
-                current["ticks"] += 1
-                if current["ticks"] > max_ticks:
-                    self.log_message(
-                        "take recording ran past its tick budget; stopping")
-                    self._finish_auto_rec("timeout")
-                    return
-                current["samples"] += 1
-            except Exception as exc:
-                self.log_message("take recording step failed: " + str(exc))
-                self._finish_auto_rec("failed")
-                return
-            self.schedule_message(1, step)
-
-        self.schedule_message(1, step)
-
-        beats = to_beat - from_beat
-        try:
-            seconds = beats * 60.0 / song.tempo
-        except Exception:
-            seconds = None
-        return {"started": True, "track": track.name,
-                "from_beat": from_beat, "to_beat": to_beat,
-                "beats": beats, "estimated_seconds": seconds,
-                "armed": bool(arm_track),
-                "note": "Recording input in real time. Poll "
-                        "get_automation_record_status until status is 'done'."}
 
     def _play_section(self, from_beat=0.0, to_beat=None, loop=False, play=True):
         """Start arrangement playback at an arbitrary point.

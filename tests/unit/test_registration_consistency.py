@@ -59,7 +59,7 @@ def _remote_source():
 
 
 def _server_source():
-    return _read(SERVER)
+    return _read(SERVER) + "\n" + _read(os.path.join(REPO, 'MCP_Server', 'workflow_tools.py'))
 
 
 def _dispatch_branches(src):
@@ -166,16 +166,9 @@ class TestRecorderLiveness:
     fourth tick loop gets added later using the obvious-but-wrong signal.
     """
 
-    def test_every_tick_loop_uses_playhead_stall_detection(self):
-        src = _remote_source()
-        loops = len(re.findall(r'^\s+def step\(\):', src, re.MULTILINE))
-        stalled = len(re.findall(r'current\["stalled"\]', src))
-        assert loops >= 3, "expected the recorder tick loops to be present"
-        assert stalled >= loops, (
-            "{0} tick loop(s) but only {1} reference(s) to the playhead-stall "
-            "counter — a loop is judging liveness some other way, most likely "
-            "on song.is_playing, which lags and silently truncates the "
-            "pass".format(loops, stalled))
+    # Playhead interruption across all six entry points is exercised in
+    # test_recording_jobs.py. Counting duplicate loops required duplication
+    # and could not establish that any callback owned the correct operation.
 
     def test_every_tick_loop_tolerates_a_count_in(self):
         """count_in_duration delays the roll by up to 4 bars."""
@@ -205,24 +198,9 @@ class TestStemExportArmHandling:
             "exclusive_arm has no setter — writing it raises and aborts the "
             "export before any stem is recorded")
 
-    def test_export_stems_disarms_non_stem_tracks(self):
-        """solo_arm=False keeps the stem tracks armed — and would also leave
-        the user's armed track armed, so it records too. Observed once: a
-        stray empty clip punched across the export range on FX / RISER."""
-        src = _remote_source()
-        body = re.search(r'def _export_stems\(.*?\n(.*?)(?=\n    def )',
-                         src, re.DOTALL).group(1)
-        assert 'stem_indices' in body and 'other.arm = False' in body, (
-            "export_stems runs the pass with solo_arm=False, so it must "
-            "disarm every non-stem track itself or they record too")
-
-    def test_export_stems_restores_the_arm_map(self):
-        src = _remote_source()
-        body = re.search(r'def _export_stems\(.*?\n(.*?)(?=\n    def )',
-                         src, re.DOTALL).group(1)
-        assert 'pre_arm' in body and 'arm_map' in body, (
-            "export_stems must capture arm state before arming stem tracks "
-            "and restore it afterwards")
+    # Arm protection and restoration are now checked with scheduled Live
+    # mocks in test_recording_jobs.py, including exclusive-arm creation,
+    # setup failures, cancellation and track insertion during a pass.
 
     def test_song_options_never_writes_a_read_only_property(self):
         """Probed: these four raise \"no setter\" on Song."""

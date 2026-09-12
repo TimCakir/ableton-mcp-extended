@@ -13,6 +13,7 @@ Tools without cost warnings in their description are free to use as they only re
 
 import httpx
 import os
+import sys
 import base64
 from datetime import datetime
 from io import BytesIO
@@ -739,10 +740,10 @@ def play_audio(input_file_path: str) -> TextContent:
 
 
 def main():
-    print("Starting MCP server")
     """Run the MCP server"""
+    print("Starting MCP server", file=sys.stderr)
     mcp.run()
 
 
 if __name__ == "__main__":
-    main() 
+    main()

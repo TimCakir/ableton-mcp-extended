@@ -1,6 +1,11 @@
 """Ableton Live integration through the Model Context Protocol."""
 
-__version__ = "0.1.0"
+__version__ = "1.6.0"
 
-# Expose key classes and functions for easier imports
-from .server import AbletonConnection, get_ableton_connection
+from .transport import AbletonConnection
+
+
+def get_ableton_connection():
+    """Keep the public helper without importing the server before ``python -m``."""
+    from .server import get_ableton_connection as connect
+    return connect()

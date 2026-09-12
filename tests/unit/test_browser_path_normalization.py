@@ -126,6 +126,33 @@ def test_get_browser_items_at_path_normalizes_vst_alias_to_plugins():
     assert result["items"][0]["name"] == "MegaSynth"
 
 
+def test_find_browser_item_by_uri_searches_user_library():
+    electra = _FakeItem(
+        "AC Keys - Electra 88 Default.adv",
+        is_loadable=True,
+        uri="query:UserLibrary#ANOTHER%20COUPLE:Keys:Electra.adv",
+    )
+    keys = _FakeItem("Keys", children=[electra])
+    another_couple = _FakeItem("ANOTHER COUPLE", children=[keys])
+    browser = types.SimpleNamespace(
+        instruments=_FakeItem("Instruments"),
+        sounds=_FakeItem("Sounds"),
+        drums=_FakeItem("Drums"),
+        audio_effects=_FakeItem("Audio Effects"),
+        midi_effects=_FakeItem("MIDI Effects"),
+        plugins=_FakeItem("Plugins"),
+        user_library=_FakeItem("User Library", children=[another_couple]),
+    )
+    surface = _make_surface_with_browser(browser)
+
+    listing = surface.get_browser_items_at_path("user_library/ANOTHER COUPLE/Keys")
+    listed_uri = listing["items"][0]["uri"]
+    result = surface._find_browser_item_by_uri(browser, listed_uri)
+
+    assert listed_uri == electra.uri
+    assert result is electra
+
+
 def test_get_browser_tree_recurses_into_folder_children():
     # Tree should expose nested folders so callers can see structure, not just root.
     bass = _FakeItem("Bass")

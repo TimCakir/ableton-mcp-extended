@@ -1,12 +1,169 @@
 # Tooling backlog
 
+## Current implementation handoff — 2026-09-08
+
+Build `2026-09-08.8` / package `1.6.0` adds device latency reporting, guarded
+monitoring preview/apply/restore, and offline recorded-hit timing analysis.
+The full suite passed 1,196 tests. See [1.6.0 tools and limits](RELEASE-1.6.0.md)
+and the [TR/vocal/guitar guide](LATENCY-GUIDE.md). Physical calibration and listening
+acceptance depend on the actual connected input/output and monitoring paths.
+
+Real Live 12.4.5 workflow and restored-state save/reopen acceptance passed with
+155 discovered tools and matching final `.8` source hashes. See
+[1.6.0 acceptance](LIVE-ACCEPTANCE-1.6.0-2026-09-08.md). Live has loaded `.8`;
+Codex's existing MCP process still needs refreshing from `.4`. The Audio Settings
+UI had no input device selected, so new physical calibration remains open.
+
+## Verified 1.5.0 baseline
+
+Build `2026-09-08.7` / package `1.5.0` adds direct PCM WAV file placement to
+`build_arrangement`. Preview reserves a full-file arrangement span and an empty
+Session slot per placement. Apply stages and normalizes unwarped audio, verifies
+the copy, then removes its temporary Session clips. Retained plans prevent
+duplicate imports; ordinary file replacements, stale targets and expanded native
+clip geometry reject the operation. See [1.5.0 release notes](RELEASE-1.5.0.md).
+
+The full automated suite passed 1,031 tests. Actual Live 12.4.5 acceptance passed
+for one excerpt and one full WAV, including replay, cleanup, unchanged originals
+and save/unload/reopen persistence. See the
+[1.5.0 acceptance report](LIVE-ACCEPTANCE-1.5.0-2026-09-08.md).
+Live ran `.7` at that checkpoint; fresh acceptance servers matched the loaded
+build and source hashes. Codex's existing connection held `.4` and needed a host
+refresh. Remote CI and publication were not claimed.
+
+## Verified 1.4.0 baseline
+
+Build `2026-09-08.6` / package `1.4.0` adds optional
+`destination_track_handle` to `build_arrangement`. Session MIDI and audio clips
+can supply another compatible arrangement track. Same-track defaults, MIDI
+variations and audio ranges are preserved. Both track identities are rechecked;
+overlaps are destination-based, and new clips on either track are enumerated
+for verification and rollback. The full automated suite passed 896 tests.
+See [1.4.0 release notes](RELEASE-1.4.0.md).
+
+Actual Live 12.4.5 workflow and save/unload/reopen acceptance passed for one
+six-note chord variation and two audio excerpts on separate destinations.
+Only the three expected copies were added; Session sources and existing
+arrangement material stayed unchanged. See the
+[1.4.0 acceptance report](LIVE-ACCEPTANCE-1.4.0-2026-09-08.md).
+Live ran `.6`, and both acceptance phases used fresh stdio servers with matching
+build labels and source hashes. At that checkpoint Codex's existing connection
+still held `.4`. This historical baseline does not claim remote CI or publication.
+
+## Verified 1.3.0 baseline
+
+Build `2026-09-08.5` / package `1.3.0` adds whole-onset MIDI thinning through
+`variation.thin_by="onset"`. It keeps all notes sharing an exact start time,
+after pitch removal; offsets count surviving groups. Individual-note thinning
+remains the default. There is no timing tolerance or quantization. The full
+automated suite passed 829 tests. See [1.3.0 release notes](RELEASE-1.3.0.md).
+
+Both real Live 12.4.5 workflow and save/unload/reopen acceptance passed, verifying
+three copies with 18 notes in total and the unchanged 12-note source. See the
+[1.3.0 acceptance report](LIVE-ACCEPTANCE-1.3.0-2026-09-08.md). Live ran
+`.5`; the acceptance runner's fresh stdio servers matched build and hashes.
+At that checkpoint the existing Codex connection held `.4`; this historical
+baseline does not claim remote CI or publication.
+
+## Verified 1.2.0 baseline
+
+Build `2026-09-08.4` / package `1.2.0` extends `build_arrangement` with MIDI
+section variations and audio source-range placement. The tool count remains 152.
+The full automated suite passes 792 tests. The deployed build passed actual
+Live 12.4.5 workflow acceptance and saved-Set persistence checks. See
+[1.2.0 release notes](RELEASE-1.2.0.md) for supported inputs and limits and the
+[1.2.0 Live acceptance report](LIVE-ACCEPTANCE-1.2.0-2026-09-08.md) for evidence.
+
+The disposable Set now contains three verified MIDI variations and warped and
+unwarped audio excerpts at fractional beat positions. Preview/apply, retained-plan
+replay, overlap and invalid-input rejection, unchanged sources and stopped
+transport passed. All five placed clips passed verification after saving,
+unloading the Set and reopening it.
+
+Implemented in this build:
+
+- MIDI copies support pitch removal, deterministic thinning of individual notes
+  and transposition, in that order. Previews expose resulting notes; apply
+  preserves the source and verifies the copied values. Out-of-range pitches
+  reject the preview.
+- Audio copies support explicit source ranges in beats when warped and seconds
+  when unwarped, with fractional arrangement destinations. Source markers must
+  align with loop bounds. Unwarped sources require zero pitch offsets and fixed,
+  unautomated tempo with Link and tempo follower disabled.
+- Audio plans reserve the initial copy and intermediate trimming space as well
+  as the final excerpt. Apply checks source file identity metadata, audio
+  settings, warp markers and final bounds. File bytes are not hashed.
+- The existing stable identities, overlap checks, retained-plan replay and
+  operation-owned rollback apply to both workflows. Active Live or MCP
+  recording blocks previews and applies. Plans do not start playback or save.
+- Unwarped plans return `applying` until a later Live tick verifies all copied
+  content and final bounds. Poll the same plan's apply result; new plans are
+  blocked while it is pending. A failed finalizer rolls back only owned copies.
+
+The tested 1.1.0 baseline is committed as `d50b243` on
+`codex/arrangement-workflows`. Its [Live acceptance report](LIVE-ACCEPTANCE-2026-09-08.md)
+records bounce, two distinct measured stems, cancellation followed by a new
+capture, MIDI transpose/probability, stable track targeting, guarded MIDI copying
+and save/reopen persistence in Live 12.4.5. Its 586 tests passed with MCP 1.28.1
+and 1.30.0. Remote CI and a published release remain outstanding; this local
+acceptance does not establish either. Codex's subsequent restart verified all
+1.2.0 components matched build `.4` and their source hashes before 1.3.0 work.
+
+## Next work, in order
+
+1. **Recording preflight.** Build a preview that combines input availability,
+   arm states, monitoring routes and a short level measurement before Becky or
+   a guitar take. Report clipping and possible duplicate monitoring paths;
+   hardware Console feeds need confirmation outside the Live API.
+2. **Retained calibration records.** Store repeated capture evidence separately
+   for TR clock-driven patterns, MIDI-triggered notes, USB and analog returns.
+   Record interface, buffer, rate, kit and monitoring context, and flag changed
+   context before reusing values. Values must come from measurement; do not
+   turn an earlier clock adjustment into a universal latency preset.
+3. **Cue and tracking workflows.** Preview explicit headphone/cue routes and
+   repeatable performer inputs with a verified restore. Low-latency device-chain
+   alternatives need actual device parameter capability checks; simply switching
+   off an effect does not remove its compensation latency.
+4. **Complete distribution.** Include the Remote Script and installation helper
+   in a self-contained release artifact; current wheel/sdist packaging is focused
+   on the Python server. Run remote CI and publish only when authorized.
+5. **Extend arrangement coverage where needed.** File formats beyond integer
+   PCM WAV, grouping staggered notes and note-density generation remain outside
+   the current planner. Same-track and cross-track copies, pitch removal,
+   individual-note/whole-onset thinning and transposition are implemented;
+   direct PCM WAV placement passed 1.5.0 workflow and saved-Set acceptance.
+6. **Broader recording acceptance.** Exercise longer captures and the actual
+   hardware routing. Test freeze-style source deactivation and scene capture
+   independently; passing bounce tests does not establish these workflows.
+
+**Per-clip scale remains an API investigation, not a missing wrapper.** On
+September 8, `inspect_lom` against the acceptance Set's MIDI clip returned no
+members for either `scale` or `root` in Live 12.4.5. The current
+[Clip reference](https://docs.cycling74.com/apiref/lom/clip/) also lists neither.
+Do not implement guessed property writes; offline Set editing would be separate
+work with its own persistence checks.
+
+## Historical July/August observations
+
+The observations below retain the state and priorities from their original runs;
+they are not current outstanding tasks. In particular,
+`batch` now preserves each read result, and `_add_notes_extended` validates
+probability before destructive writes. Batch rebasing only changes named index
+fields; it does not decrement arbitrary numeric values such as beat positions.
+Note probability, two-track stem export and host refresh have since passed the
+September baseline acceptance checks. Section variations and same-track audio
+planning are implemented in 1.2.0 and have passed actual Live and saved-Set checks.
+Native Freeze, complete comping and SDK v2 migration remain open.
+
+---
+
 What still needs building or fixing in this integration, ordered by how much it
 blocks actual music work. See `LIVE-API-FACTS.md` for what is already verified
 and what is genuinely impossible.
 
 ---
 
-## START HERE — build 2026-07-26.20, five tools never executed
+## Historical handoff — build 2026-07-26.20, five tools then unexecuted
 
 Run `get_build_info` first. Live and the MCP host were last restarted at build
 `.18`; the repo is at `.20`, so **both need restarting** before any of the below
@@ -23,7 +180,7 @@ can be tested.
 
 | Tool | Status |
 |---|---|
-| `export_stems` (multi-track) | Failed twice, fixed twice. Single stem works. |
+| `export_stems` (multi-track) | **Worked 2026-09-11: 31 tracks, one pass, QA'd sample-exact.** Records at Live's Record bit depth; returns not sourceable. |
 | `freeze_track` | Shares the verified bounce path; deactivation untested. |
 | `capture_session_to_arrangement` | **Destructive.** Scratch scene only. |
 | `modify_clip_notes` | Repair reasoned from the error, never run. |
@@ -173,7 +330,25 @@ costs 16 bars. Worth wrapping only if something actually needs it.
 ## Known rough edges
 
 - `call_lom` truncates its "Available:" member list at 80 entries, which once made
-  a survey silently incomplete. Use `inspect_lom` for a full list.
+  a survey silently incomplete. Use `inspect_lom` for a full list. It truncates
+  **alphabetically**, so a member late in the alphabet looks absent: the list for
+  `Clip` stopped at `is_overdubbing`, and "`Clip` has no member `scale_name`" was
+  briefly accepted as proof when the list had simply not reached `s`.
+- **`batch` discards read results.** Eight `get_track_volume` commands returned only
+  "8/8 succeeded, 0 failed" with no values. Treat `batch` as write-only; any command
+  whose point is its return value has to be sent individually. Worth either
+  surfacing per-command results or documenting the limitation in the tool
+  description, because it silently wastes a round trip.
+- **`batch` param semantics bite on `position`.** `insert_device`'s tool-level
+  `position=0` means "append", but the wire command reads 0 as index 0, which for an
+  audio effect fails with "Insert audio effects after instruments. A valid index
+  would be 1." The tool description warns params differ; this is the concrete case.
+  Failure was clean (0/3 applied, stopped early), which is the right behaviour.
+- **`indices_are_one_based=False` is the safer mode for hand-built batches.** With it
+  false nothing is converted, so 0-based indices and real values (beats, times) pass
+  through untouched. With it true there is ambiguity about whether a non-index
+  numeric ≥ 1 gets converted — passing `destination_time` in beats through a
+  converting batch is a silent-misplacement risk.
 - `manage_clip_automation` (the original) can only create or clear an empty
   envelope — superseded by `write_clip_automation`, but still present.
 - Several batch-6 wrappers were written against `class_deltas.json` rather than a

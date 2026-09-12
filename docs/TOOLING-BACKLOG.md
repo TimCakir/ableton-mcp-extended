@@ -180,7 +180,7 @@ can be tested.
 
 | Tool | Status |
 |---|---|
-| `export_stems` (multi-track) | Failed twice, fixed twice. Single stem works. |
+| `export_stems` (multi-track) | **Worked 2026-09-11: 31 tracks, one pass, QA'd sample-exact.** Records at Live's Record bit depth; returns not sourceable. |
 | `freeze_track` | Shares the verified bounce path; deactivation untested. |
 | `capture_session_to_arrangement` | **Destructive.** Scratch scene only. |
 | `modify_clip_notes` | Repair reasoned from the error, never run. |

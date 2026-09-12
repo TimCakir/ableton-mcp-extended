@@ -542,6 +542,32 @@ file's level with `ffmpeg -af volumedetect`; then one `source="<track>"` bounce;
 Related: `song.back_to_arranger` cannot be cleared by setting it while the transport is
 stopped; `play_section` clears it as a side effect.
 
+**Update 2026-09-11 (I Miss You 2.0, Live 12.4.5): a 31-track `export_stems` pass worked.**
+Bars 1–169, every output `complete`, 312.24 s, non-silent; the 12 audio-source stems matched
+their source files at lag 0, corr 1.000. Pre-conditions that held: transport stopped,
+`back_to_arranger` False, loop off, every source track activated (a deactivated track would
+record silence — all 32 had been switched off in that morning's save). Facts learned:
+- Files are written at **Live's Record bit depth** (Preferences) — 16-bit AIF that day. Set 24
+  first; there is no parameter for it.
+- **Return tracks cannot be sources:** `No track named 'A-ROOM'`. Stems are dry.
+- The temporary `STEM <name>` tracks remain; delete them by 0-based index (next section).
+
+## `batch` → `delete_track` ignores `track_name` (2026-09-11)
+
+`{"command":"delete_track","params":{"track_index":0,"track_name":"STEM DRUMS"}}` deleted the
+Set's **first** track (DRUMS), then PERC, each reporting success with `deleted_track: <real name>`.
+One `undo_redo` restored both. Safe form: `call_lom path=song member=delete_track args=[i]`
+(0-based; also works inside `batch` with `indices_are_one_based=false`), highest index first,
+`tracks.<i>.name` read first.
+
+## Driving Live's menus without the API (2026-09-11)
+
+`osascript -e 'tell application "System Events" to tell process "Live" to click menu item
+"Collect All and Save" of menu "File" of menu bar 1'` works (Accessibility granted), as do
+`Save Live Set` and `New Live Set`. Live's own modal dialogs then show in
+`get_application_info` and are pressed with `dismiss_live_dialog`. `screencapture` fails
+without Screen Recording permission. Verify saves by `.als` mtime + a disk re-read.
+
 ## Turning warping OFF leaves `end_marker` in the old beat units (2026-09-04, live set)
 
 Importing a 432 s stem with `import_audio_file` auto-warps it; `set_clip_properties(warping=False)`
